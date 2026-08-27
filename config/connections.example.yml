@@ -1,0 +1,42 @@
+---
+connections:
+  direct:
+    type: direct
+    protocol: ssh
+
+  through-jump:
+    type: proxyjump
+    jump_host: jump.example.net
+    jump_credentials: terminal-tacacs
+
+  through-terminal:
+    type: nested
+    host: terminal.example.net
+    protocol: ssh
+    credentials: terminal-tacacs
+    next_protocol: ssh
+
+  legacy-direct:
+    type: direct
+    protocol: legacy_ssh
+    host_key_algorithms: [ssh-rsa]
+    kex_algorithms: [diffie-hellman-group14-sha1]
+    ciphers: [aes128-cbc]
+
+credentials:
+  network-tacacs:
+    backend: pass
+    entry: network/credentials/network-tacacs
+
+  terminal-tacacs:
+    backend: pass
+    entry: network/credentials/terminal-server
+
+platforms:
+  snr_29xx:
+    driver: cisco_ios
+    dialect: snr_29xx
+
+  snr_52xx:
+    driver: cisco_ios
+    dialect: snr_52xx

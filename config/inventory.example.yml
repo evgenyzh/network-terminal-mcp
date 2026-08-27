@@ -1,0 +1,19 @@
+---
+devices:
+  lab-cisco:
+    host: 192.0.2.10
+    platform: cisco_ios
+    credentials: network-tacacs
+    connection: direct
+    tags: [lab, cisco]
+
+  lab-snr-29xx:
+    host: 192.0.2.20
+    platform: snr_29xx
+    credentials: network-tacacs
+    connection: through-terminal
+    tags: [lab, snr, access]
+
+groups:
+  lab:
+    tags: [lab]

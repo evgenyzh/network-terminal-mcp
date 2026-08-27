@@ -1,0 +1,40 @@
+---
+defaults:
+  cli_help: allow
+  unknown_exec_command: ask
+  config_mode: ask
+  raw_input: deny
+  telnet: deny
+
+rules:
+  - id: common-read-only
+    action: allow
+    command_patterns:
+      - "show *"
+      - "display *"
+
+  - id: expensive-diagnostics
+    action: ask
+    command_patterns:
+      - "show tech-support*"
+      - "display diagnostic-information*"
+
+  - id: destructive
+    action: deny
+    command_patterns:
+      - "reload*"
+      - "reboot*"
+      - "erase*"
+      - "factory-reset*"
+      - "delete *"
+
+runtime:
+  session_idle_timeout: 300
+  session_max_lifetime: 1800
+  command_timeout: 60
+  max_inline_output_bytes: 65536
+  max_session_buffer_bytes: 1048576
+  max_open_sessions: 10
+  audit_file: ~/.local/state/network-terminal-mcp/audit.jsonl
+  output_dir: ~/.local/state/network-terminal-mcp/outputs
+  transcripts_enabled: false

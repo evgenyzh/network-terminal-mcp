@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Local and secret-bearing runtime configuration
+config/*.yml
+!config/*.example.yml
+.env
+*.log
+transcripts/
+outputs/
