@@ -48,7 +48,7 @@ _CONFIG_MODE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-def check_structural_safety(command: str) -> None:
+def check_structural_safety(command: str, *, tool: str = "run_command") -> None:
     """Reject command strings that are structurally dangerous.
 
     Raises :class:`PolicyError` if the command contains newlines, chaining
@@ -57,8 +57,19 @@ def check_structural_safety(command: str) -> None:
     for label, pattern in _FORBIDDEN_PATTERNS:
         if pattern.search(command):
             raise PolicyError(
-                f"command rejected: {label} not allowed in run_command"
+                f"command rejected: {label} not allowed in {tool}"
             )
+
+
+def check_cli_help_safety(line: str) -> None:
+    """Reject input that is unsafe or ambiguous for a non-executing help request."""
+    check_structural_safety(line, tool="cli_help")
+    if not line.strip():
+        raise PolicyError("CLI help line must not be empty")
+    if "?" in line:
+        raise PolicyError("CLI help line must not include '?'; the server appends it")
+    if any(ord(character) < 32 or ord(character) == 127 for character in line):
+        raise PolicyError("CLI help line must not contain control characters")
 
 
 def is_destructive(command: str) -> bool:
@@ -113,6 +124,11 @@ class PolicyEngine:
             return rule.action
 
         return self._policy.defaults.unknown_exec_command
+
+    def evaluate_cli_help(self, line: str) -> Action:
+        """Return the dedicated policy decision for a CLI help request."""
+        check_cli_help_safety(line)
+        return self._policy.defaults.cli_help
 
     def decision_label(self, command: str) -> str:
         """Human-readable decision for logging."""

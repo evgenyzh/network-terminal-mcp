@@ -5,11 +5,15 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from network_terminal_mcp.server import create_server
 from network_terminal_mcp.sessions import (
+    CliHelpResult,
     CommandResult,
+    ControlResult,
     OutputChunk,
+    ResponseResult,
     SessionInfo,
     SessionState,
 )
@@ -47,6 +51,24 @@ class FakeManager:
     def run_commands(self, session_id: str, commands: list[str]) -> list[CommandResult]:
         self.calls.append(("run_commands", (session_id, commands)))
         return [self.run_command(session_id, command) for command in commands]
+
+    def cli_help(self, session_id: str, line: str) -> CliHelpResult:
+        self.calls.append(("cli_help", (session_id, line)))
+        return CliHelpResult(
+            session_id=session_id,
+            line=line,
+            policy="allow",
+            executed=True,
+            output="completion",
+        )
+
+    def send_control(self, session_id: str, action: str) -> ControlResult:
+        self.calls.append(("send_control", (session_id, action)))
+        return ControlResult(session_id=session_id, action="space", output="next page")
+
+    def respond(self, session_id: str, response: str) -> ResponseResult:
+        self.calls.append(("respond", (session_id, response)))
+        return ResponseResult(session_id=session_id, response=response, output="continued")
 
     def read_output(self, session_id: str, *, offset: int, limit: int | None) -> OutputChunk:
         self.calls.append(("read_output", (session_id, offset, limit)))
@@ -107,6 +129,44 @@ async def test_command_and_status_tools() -> None:
     status = await server.call_tool("session_status", {"session_id": "session-1"})
     assert command.structured_content["executed"] is True
     assert status.structured_content["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_interactive_tools() -> None:
+    manager = FakeManager()
+    server = create_server(manager=manager)  # type: ignore[arg-type]
+
+    help_result = await server.call_tool(
+        "cli_help", {"session_id": "session-1", "line": "show "}
+    )
+    control = await server.call_tool(
+        "send_control", {"session_id": "session-1", "action": "space"}
+    )
+    response = await server.call_tool(
+        "respond", {"session_id": "session-1", "response": "y"}
+    )
+
+    assert help_result.structured_content["output"] == "completion"
+    assert control.structured_content["action"] == "space"
+    assert response.structured_content["output"] == "continued"
+    assert manager.calls == [
+        ("cli_help", ("session-1", "show ")),
+        ("send_control", ("session-1", "space")),
+        ("respond", ("session-1", "y")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_control_rejects_unknown_action_before_manager_dispatch() -> None:
+    manager = FakeManager()
+    server = create_server(manager=manager)  # type: ignore[arg-type]
+
+    with pytest.raises(ToolError, match="Input should be 'space', 'q' or 'ctrl-c'"):
+        await server.call_tool(
+            "send_control", {"session_id": "session-1", "action": "ctrl-u"}
+        )
+
+    assert manager.calls == []
 
 
 @pytest.mark.asyncio

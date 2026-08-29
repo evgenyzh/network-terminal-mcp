@@ -8,6 +8,7 @@ from network_terminal_mcp.config.models import PolicyConfig, PolicyRule
 from network_terminal_mcp.errors import PolicyError
 from network_terminal_mcp.policy.engine import (
     PolicyEngine,
+    check_cli_help_safety,
     check_structural_safety,
     is_config_mode_enter,
     is_destructive,
@@ -87,6 +88,17 @@ def test_structural_hazards_raise_policy_error(command: str) -> None:
 def test_check_structural_safety_accepts_plain_commands() -> None:
     check_structural_safety("show mac address-table")
     check_structural_safety("display current-configuration")
+
+
+def test_cli_help_uses_its_dedicated_default() -> None:
+    engine = _engine(cli_help="ask")
+    assert engine.evaluate_cli_help("show ") == "ask"
+
+
+@pytest.mark.parametrize("line", ["show ?", "show version\n", "show $(hostname)", "show\x00"])
+def test_cli_help_safety_rejects_ambiguous_and_control_input(line: str) -> None:
+    with pytest.raises(PolicyError):
+        check_cli_help_safety(line)
 
 
 @pytest.mark.parametrize(

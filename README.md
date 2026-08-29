@@ -6,15 +6,17 @@
 несколько команд в одной сессии и получить полный вывод без временных
 `sshpass`-команд и одноразовых скриптов.
 
-Статус: Этап 1 выполнен для direct SSH. Реализованы конфигурация, политика,
-аудит, credential backend, known_hosts, постоянные Netmiko-сессии и stdio MCP
-tools. Проверено на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Junos.
+Статус: Этапы 1 и 2 реализованы для direct SSH. Есть конфигурация, политика,
+аудит, credential backend, known_hosts, постоянные Netmiko-сессии, безопасный
+`cli_help`, pager/control state machine и stdio MCP tools. Direct SSH проверен
+на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Junos; интерактивный этап пока
+покрыт local scripted tests, но не hardware validation.
 
 Текущие ограничения: только direct SSH; terminal servers, ProxyJump, Telnet,
-`cli_help`, управляющие клавиши и config changes остаются следующими этапами.
-Команда с policy-решением `ask` возвращает `confirmation_required`, но пока не
-исполняется: отдельный механизм подтвержденных write/unknown действий появится
-после read-only интерактивного этапа.
+`raw_input` и config changes остаются следующими этапами. Команда с
+policy-решением `ask` возвращает `confirmation_required`, но не исполняется.
+`respond` отвечает только на уже распознанный prompt устройства и не является
+механизмом policy confirmation.
 
 ## Основные цели
 

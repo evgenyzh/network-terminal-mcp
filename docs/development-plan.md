@@ -43,13 +43,25 @@ OpenCode остается задачей Этапа 6.
 
 ## Этап 2. Исследование CLI
 
-- Реализовать `cli_help`, `send_control` и безопасный `respond`.
-- Добавить распознавание pager и неожиданных confirmation prompts.
-- Добавить dialect metadata для SNR 29xx/52xx.
-- Проверить D-Link и Eltex штатными драйверами.
+Статус: реализован и покрыт local scripted tests; hardware validation ожидает
+отдельного разрешения на точные targets и команды. Добавлены `cli_help`,
+`send_control`, `respond`, состояния `paging`/`awaiting_response` и bounded
+pager flow. SNR dialect metadata уже была добавлена в Этапе 1.
+
+- `cli_help` отправляет `<line>?` без Enter, затем отменяет незавершенную строку
+  через Ctrl-C и проверяет возврат prompt.
+- Pager требует явного `send_control(space)`; доступны `q` для pager и `ctrl-c`
+  для pager либо распознанного confirmation prompt.
+- `respond` принимает только `y`/`n` либо `yes`/`no`, если они были явно
+  распознаны в device prompt. Password/passphrase/secret prompts приводят к
+  failed session, без отправки ответа.
+- `ask` command policy по-прежнему не исполняется; `respond` не является
+  подтверждением policy.
 
 Критерий завершения: модель может найти неизвестную команду через `?`, очистить
-строку и выполнить найденную команду без переподключения.
+строку и выполнить найденную команду без переподключения. Для полного закрытия
+этапа еще нужны anonymized transcripts и read-only hardware validation pager/
+`cli_help` на согласованной цели.
 
 ## Этап 3. Маршруты доступа
 

@@ -9,7 +9,8 @@
 - Redaction паролей из ошибок и audit.
 - Command policy: allow, ask, deny, переносы строк и metacharacters.
 - Session state machine, locks, timeout и output limits.
-- Pager и confirmation prompt detection.
+- `cli_help` cleanup, pager/control transitions, confirmation allowlist и
+  отказ от secret prompt.
 - Host key store: strict unknown host, TOFU enrollment и nonstandard SSH port.
 - MCP tool registration, Pydantic input validation и worker-thread dispatch.
 
@@ -54,9 +55,10 @@ hostname, serial number или fingerprint в репозиторий.
 | Juniper Junos | `juniper_junos` | login, preparation, `show version` | пройден |
 
 Проверялся путь `MCPServer.call_tool`: `open_session` → `run_command` →
-`read_output` → `close_session`. Полноценный stdio client round-trip и OpenCode
-registration остаются задачей Этапа 6. Pager fallback, `cli_help`, terminal
-servers и Telnet не тестировались, потому что еще не реализованы.
+`read_output` → `close_session`. В Этапе 2 локальные scripted tests дополнительно
+проверяют contracts `cli_help`, `send_control` и `respond`. Полноценный stdio
+client round-trip и OpenCode registration остаются задачей Этапа 6. Pager,
+`cli_help` и device confirmation на реальном CLI еще не тестировались.
 
 ## Матрица приемки
 
@@ -66,7 +68,7 @@ servers и Telnet не тестировались, потому что еще н
 | --- | --- |
 | Login | prompt определен, секрет не залогирован |
 | Session preparation | paging отключен или включен fallback |
-| `cli_help` | Этап 2: подсказка прочитана, строка очищена |
+| `cli_help` | подсказка прочитана, строка отменена, prompt восстановлен |
 | Single command | вывод завершен по prompt |
 | Multiple commands | одна TCP/terminal session |
 | Long output | pager обработан, лимит соблюден |
@@ -94,4 +96,5 @@ uv sync
 uv run ruff check .
 uv run mypy src
 uv run pytest --cov=network_terminal_mcp
+uv build
 ```

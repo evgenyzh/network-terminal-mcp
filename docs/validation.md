@@ -1,4 +1,4 @@
-# Результаты проверок Этапа 1
+# Результаты проверок Этапов 1-2
 
 ## Scope
 
@@ -36,11 +36,19 @@ open_session -> run_command -> read_output -> close_session
 `known_hosts`. Последующие соединения выполняются с `ssh_strict=True` и
 передают этот файл Netmiko как `alt_key_file`.
 
+## Local validation Этапа 2
+
+Scripted tests покрывают `MCPServer.call_tool` contracts, `cli_help` без Enter
+и с Ctrl-C cleanup, pager continuation/abort/page limit, confirmation
+allowlist, отказ от password prompt и state-bound control actions. Они не
+заменяют transcript или hardware test реального CLI.
+
 ## Непроверенное
 
 - Полный MCP stdio round-trip с клиентом OpenCode.
-- Pager fallback при неуспешном `session_preparation`.
-- `cli_help`, control keys, interactive confirmations и raw input.
+- Pager fallback, `cli_help` и interactive confirmations на реальном устройстве.
+- Anonymized transcripts для platform-specific pager/prompt patterns.
+- `raw_input`.
 - ProxyJump, nested SSH/Telnet, console ports и Telnet.
 - BDCOM, EcoSGE, Eltex и PON adapters.
 - Per-device legacy algorithm override и DSA-only SSH.

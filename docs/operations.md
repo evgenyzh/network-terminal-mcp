@@ -1,16 +1,19 @@
-# Эксплуатация Этапа 1
+# Эксплуатация Этапов 1-2
 
 ## Границы текущей версии
 
 Сервер поддерживает постоянные direct SSH-сессии через Netmiko. Он не
 поддерживает ProxyJump, terminal server, nested SSH/Telnet, console ports,
-Telnet, `cli_help`, control keys или запись конфигурации.
+Telnet, `raw_input` или запись конфигурации.
 
 Реализованные MCP tools:
 
 - `open_session`
 - `run_command`
 - `run_commands`
+- `cli_help`
+- `send_control`
+- `respond`
 - `read_output`
 - `session_status`
 - `close_session`
@@ -75,7 +78,7 @@ connections:
 
 ## Read-only политика
 
-В Этапе 1 исполняются только команды с решением `allow`. Типовая policy:
+Исполняются только команды с решением `allow`. Типовая policy:
 
 ```yaml
 rules:
@@ -87,6 +90,23 @@ rules:
 Неизвестная команда возвращает `confirmation_required`; она не отправляется на
 оборудование. Destructive operations (`reload`, `erase`, `delete` и подобные),
 переносы строк, chaining и shell metacharacters запрещены.
+
+## Интерактивный read-only CLI
+
+`cli_help(session_id, line)` отправляет `<line>?` без Enter, читает completion
+и отменяет незавершенную строку Ctrl-C перед возвратом. Не передавайте в `line`
+символ `?`, перевод строки или control bytes.
+
+При pager `run_command` возвращает `pager_active: true` и состояние `paging`.
+Продолжайте только одной страницей: `send_control(session_id, "space")`.
+`q` или `ctrl-c` возвращают terminal к prompt; после `max_pager_pages` сервер
+сам отправляет `q` вместо новой страницы.
+
+При `response_required: true` вызывайте `respond` только одним token из
+`allowed_responses`. Это device confirmation, а не подтверждение policy: команда
+с `confirmation_required` по-прежнему не была отправлена. Password/passphrase/
+secret prompts не получают ответа; session становится `failed` и требует
+`close_session` с последующим новым подключением.
 
 ## Audit и вывод
 

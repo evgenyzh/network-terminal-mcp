@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from network_terminal_mcp.config.models import (
     PolicyConfig,
 )
 from network_terminal_mcp.credentials.pass_backend import Credentials
-from network_terminal_mcp.errors import PolicyError, SessionError
+from network_terminal_mcp.errors import PolicyError, SessionError, TransportError
 from network_terminal_mcp.host_keys import HostKeyStatus
 from network_terminal_mcp.sessions import SessionManager, SessionState
 
@@ -22,16 +23,48 @@ from network_terminal_mcp.sessions import SessionManager, SessionState
 class FakeConnection:
     def __init__(self) -> None:
         self.commands: list[str] = []
+        self.expect_patterns: list[str] = []
+        self.writes: list[str] = []
+        self.command_outputs: dict[str, str] = {}
+        self.read_outputs: list[str] = []
+        self.timing_output = ""
+        self.read_error: Exception | None = None
         self.disconnected = False
 
     def find_prompt(self) -> str:
         return "switch#"
 
-    def send_command(self, command_string: str, *, read_timeout: float) -> str:
+    def send_command(
+        self,
+        command_string: str,
+        *,
+        expect_string: str | None = None,
+        read_timeout: float,
+        strip_prompt: bool = True,
+        strip_command: bool = True,
+        cmd_verify: bool = True,
+    ) -> str:
         self.commands.append(command_string)
+        if expect_string is not None:
+            self.expect_patterns.append(expect_string)
+        if command_string in self.command_outputs:
+            return self.command_outputs[command_string]
         if command_string == "show long":
-            return "x" * 40
-        return f"output for {command_string}"
+            return "x" * 40 + "switch#"
+        return f"output for {command_string}switch#"
+
+    def write_channel(self, out_data: str) -> None:
+        self.writes.append(out_data)
+
+    def read_until_pattern(self, pattern: str, *, read_timeout: float) -> str:
+        if self.read_error is not None:
+            raise self.read_error
+        if self.read_outputs:
+            return self.read_outputs.pop(0)
+        return "switch#"
+
+    def read_channel_timing(self, *, last_read: float, read_timeout: float) -> str:
+        return self.timing_output
 
     def disconnect(self) -> None:
         self.disconnected = True
@@ -179,6 +212,190 @@ def test_run_commands_stops_at_first_unapproved_command() -> None:
     )
     assert [result.executed for result in results] == [True, False]
     assert connection.commands == ["show version"]
+
+
+def test_cli_help_reads_completion_and_cancels_unfinished_line() -> None:
+    connection = FakeConnection()
+    connection.timing_output = "  version  Show software version\n"
+    audit = FakeAudit()
+    manager = _manager(connection, audit)
+    info = manager.open_session("sw1")
+
+    result = manager.cli_help(info.session_id, "show ")
+
+    assert result.executed is True
+    assert result.output == "  version  Show software version\n"
+    assert connection.commands == []
+    assert connection.writes == ["show ?", "\x03"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+    assert audit.records[-1]["event"] == "cli_help"
+    assert audit.records[-1]["outcome"] == "completed"
+
+
+@pytest.mark.parametrize("line", ["show ?", "show version\n", "show $(hostname)"])
+def test_cli_help_rejects_unsafe_or_ambiguous_input(line: str) -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    with pytest.raises(PolicyError):
+        manager.cli_help(info.session_id, line)
+
+    assert connection.writes == []
+
+
+def test_cli_help_fails_the_session_when_cleanup_cannot_restore_prompt() -> None:
+    connection = FakeConnection()
+    connection.timing_output = "  version  Show software version\n"
+    connection.read_error = RuntimeError("prompt not received")
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    with pytest.raises(TransportError, match="prompt not received"):
+        manager.cli_help(info.session_id, "show ")
+
+    assert connection.writes == ["show ?", "\x03"]
+    assert manager.session_status(info.session_id).state is SessionState.FAILED
+
+
+def test_pager_requires_explicit_space_and_returns_to_ready() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show interfaces"] = "first page\n--More--"
+    connection.read_outputs = ["second page\nswitch#"]
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    first = manager.run_command(info.session_id, "show interfaces")
+
+    assert first.pager_active is True
+    assert first.output == "first page\n--More--"
+    assert re.search(connection.expect_patterns[-1], "first page\n--More--")
+    assert manager.session_status(info.session_id).state is SessionState.PAGING
+
+    second = manager.send_control(info.session_id, "space")
+
+    assert second.action == "space"
+    assert second.output == "second page\n"
+    assert second.pager_active is False
+    assert connection.writes == [" "]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_pager_limit_aborts_with_q() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show interfaces"] = "first page\n--More--"
+    manager = _manager(connection, FakeAudit(), max_pager_pages=1)
+    info = manager.open_session("sw1")
+    manager.run_command(info.session_id, "show interfaces")
+
+    result = manager.send_control(info.session_id, "space")
+
+    assert result.action == "q"
+    assert connection.writes == ["q"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_q_cancels_an_active_pager() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show interfaces"] = "first page\n--More--"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+    manager.run_command(info.session_id, "show interfaces")
+
+    result = manager.send_control(info.session_id, "q")
+
+    assert result.action == "q"
+    assert connection.writes == ["q"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_confirmation_only_accepts_detected_response_tokens() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show version"] = "Continue? [Y/N]"
+    connection.command_outputs["y"] = "continued\nswitch#"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    command = manager.run_command(info.session_id, "show version")
+
+    assert command.response_required is True
+    assert command.allowed_responses == ["y", "n"]
+    assert manager.session_status(info.session_id).state is SessionState.AWAITING_RESPONSE
+    with pytest.raises(PolicyError):
+        manager.respond(info.session_id, "yes")
+    assert connection.commands == ["show version"]
+
+    response = manager.respond(info.session_id, "Y")
+
+    assert response.response == "y"
+    assert response.output == "continued\n"
+    assert connection.commands == ["show version", "y"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_ctrl_c_cancels_a_pending_confirmation() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show version"] = "Continue? [Y/N]"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+    manager.run_command(info.session_id, "show version")
+
+    result = manager.send_control(info.session_id, "ctrl-c")
+
+    assert result.action == "ctrl-c"
+    assert connection.writes == ["\x03"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_plain_y_n_text_is_not_treated_as_a_confirmation_prompt() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show version"] = "answer column [Y/N]\nswitch#"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    result = manager.run_command(info.session_id, "show version")
+
+    assert result.response_required is False
+    assert result.output == "answer column [Y/N]\n"
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_unknown_confirmation_prompt_fails_without_sending_a_response() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show version"] = "Continue? [OK/CANCEL]"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    with pytest.raises(TransportError, match="did not end at a recognized prompt"):
+        manager.run_command(info.session_id, "show version")
+
+    assert connection.commands == ["show version"]
+    assert connection.writes == []
+    assert manager.session_status(info.session_id).state is SessionState.FAILED
+
+
+def test_secret_prompt_fails_session_without_sending_a_response() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show version"] = "Password:"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    with pytest.raises(TransportError, match="requested a password"):
+        manager.run_command(info.session_id, "show version")
+
+    assert connection.commands == ["show version"]
+    assert manager.session_status(info.session_id).state is SessionState.FAILED
+
+
+def test_control_is_rejected_when_no_pager_or_prompt_is_pending() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    with pytest.raises(SessionError, match="requires paging"):
+        manager.send_control(info.session_id, "space")
+
+    assert connection.writes == []
 
 
 def test_read_output_is_chunked() -> None:

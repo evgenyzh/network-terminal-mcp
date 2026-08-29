@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 from netmiko import ConnectHandler
 
@@ -22,8 +23,11 @@ from network_terminal_mcp.platforms import Platform, PlatformRegistry
 from network_terminal_mcp.policy.engine import PolicyEngine
 from network_terminal_mcp.redaction import Redactor
 from network_terminal_mcp.sessions.models import (
+    CliHelpResult,
     CommandResult,
+    ControlResult,
     OutputChunk,
+    ResponseResult,
     SessionInfo,
     SessionState,
 )
@@ -35,7 +39,22 @@ class TerminalConnection(Protocol):
 
     def find_prompt(self) -> str: ...
 
-    def send_command(self, command_string: str, *, read_timeout: float) -> str: ...
+    def send_command(
+        self,
+        command_string: str,
+        *,
+        expect_string: str | None = None,
+        read_timeout: float,
+        strip_prompt: bool = True,
+        strip_command: bool = True,
+        cmd_verify: bool = True,
+    ) -> str: ...
+
+    def write_channel(self, out_data: str) -> None: ...
+
+    def read_until_pattern(self, pattern: str, *, read_timeout: float) -> str: ...
+
+    def read_channel_timing(self, *, last_read: float, read_timeout: float) -> str: ...
 
     def disconnect(self) -> None: ...
 
@@ -49,6 +68,45 @@ class CredentialResolver(Protocol):
 ConnectionFactory = Callable[[dict[str, object]], TerminalConnection]
 Clock = Callable[[], float]
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_PAGER_END = re.compile(
+    r"(?:--more--|<--- more --->|---- more ----|press any key to continue)\s*\Z",
+    re.IGNORECASE,
+)
+_CONFIRMATION_END = re.compile(
+    r"(?:\b(?:continue|proceed|confirm|are you sure|do you want|really|overwrite|"
+    r"delete|save|reset|reboot|reload)\b[^\r\n]{0,160}"
+    r"(?:\[y/n\]|\(y/n\)|\[yes/no\]|\(yes/no\)))\s*\Z",
+    re.IGNORECASE,
+)
+_SECRET_END = re.compile(r"(?:password|passphrase|secret)\s*:\s*\Z", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class _PendingResponse:
+    prompt: str
+    allowed_responses: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _TerminalOutcome:
+    output: str
+    pager_active: bool = False
+    response_required: bool = False
+    device_prompt: str | None = None
+    allowed_responses: tuple[str, ...] = ()
+
+
+class _OutputFields(TypedDict):
+    output: str
+    truncated: bool
+    output_offset: int | None
+    next_output_offset: int | None
+    pager_active: bool
+    response_required: bool
+    device_prompt: str | None
+    allowed_responses: list[str]
+
 
 def _netmiko_connection_factory(params: dict[str, object]) -> TerminalConnection:
     return cast(TerminalConnection, ConnectHandler(**params))
@@ -61,6 +119,7 @@ class _ManagedSession:
     platform: Platform
     connection: TerminalConnection
     prompt: str
+    raw_prompt: str
     warnings: list[str]
     redactor: Redactor
     created_at: datetime
@@ -71,6 +130,8 @@ class _ManagedSession:
     output: str = ""
     output_start: int = 0
     output_truncated: bool = False
+    pager_pages: int = 0
+    pending_response: _PendingResponse | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -156,6 +217,7 @@ class SessionManager:
             platform=platform,
             connection=connection,
             prompt=redactor.redact(prompt),
+            raw_prompt=prompt,
             warnings=warnings,
             redactor=redactor,
             created_at=wall_now,
@@ -201,39 +263,30 @@ class SessionManager:
 
             self._audit_command(session, command, decision, "started")
             try:
-                raw_output = session.connection.send_command(
-                    command,
-                    read_timeout=float(self._config.policy.runtime.command_timeout),
+                outcome = self._consume_terminal_output(
+                    session, self._send_command_until_terminal(session, command)
                 )
             except Exception as exc:
-                session.state = SessionState.FAILED
+                self._fail_session(session)
                 message = session.redactor.redact(str(exc))
                 self._audit_command(session, command, decision, "failed", error=message)
                 raise TransportError(f"command failed in session {session_id}: {message}") from exc
 
-            output = session.redactor.redact(raw_output)
-            offset = self._append_output(session, output)
-            inline, truncated = _truncate_utf8(
-                output, self._config.policy.runtime.max_inline_output_bytes
-            )
+            output_fields = self._record_terminal_output(session, outcome)
             self._touch(session)
             self._audit_command(
                 session,
                 command,
                 decision,
-                "completed",
-                output_bytes=len(output.encode()),
+                self._terminal_outcome_label(outcome),
+                output_bytes=self._output_bytes(session, outcome.output),
             )
-            next_offset = offset + len(output) if truncated else None
             return CommandResult(
                 session_id=session_id,
                 command=session.redactor.redact(command),
                 policy=decision,
                 executed=True,
-                output=inline,
-                truncated=truncated,
-                output_offset=offset,
-                next_output_offset=next_offset,
+                **output_fields,
             )
 
     def run_commands(self, session_id: str, commands: list[str]) -> list[CommandResult]:
@@ -244,9 +297,142 @@ class SessionManager:
             for command in commands:
                 result = self.run_command(session_id, command)
                 results.append(result)
-                if not result.executed:
+                if not result.executed or result.pager_active or result.response_required:
                     break
             return results
+
+    def cli_help(self, session_id: str, line: str) -> CliHelpResult:
+        """Read completion help, then cancel the unfinished line before returning."""
+        session = self._get_session(session_id)
+        with session.lock:
+            self._require_ready(session)
+            decision = self._policy.evaluate_cli_help(line)
+            if decision != "allow":
+                self._audit_interaction(
+                    session,
+                    "cli_help",
+                    "not_executed",
+                    line=line,
+                    policy=decision,
+                )
+                if decision == "deny":
+                    raise PolicyError("CLI help is denied by policy")
+                return CliHelpResult(
+                    session_id=session_id,
+                    line=session.redactor.redact(line),
+                    policy=decision,
+                    executed=False,
+                    confirmation_required=True,
+                )
+
+            self._audit_interaction(
+                session, "cli_help", "started", line=line, policy=decision
+            )
+            try:
+                session.connection.write_channel(f"{line}?")
+                raw_output = session.connection.read_channel_timing(
+                    last_read=0.2,
+                    read_timeout=float(self._config.policy.runtime.command_timeout),
+                )
+                self._return_to_prompt(session)
+                if self._ends_with_pager(raw_output):
+                    raise SessionError("CLI help reached a pager and was cancelled")
+                if self._ends_with_secret_prompt(raw_output):
+                    raise SessionError("device requested a secret during CLI help")
+            except Exception as exc:
+                self._fail_session(session)
+                message = session.redactor.redact(str(exc))
+                self._audit_interaction(
+                    session, "cli_help", "failed", line=line, policy=decision, error=message
+                )
+                raise TransportError(f"CLI help failed in session {session_id}: {message}") from exc
+
+            outcome = _TerminalOutcome(output=raw_output)
+            output_fields = self._record_terminal_output(session, outcome)
+            self._touch(session)
+            self._audit_interaction(
+                session,
+                "cli_help",
+                "completed",
+                line=line,
+                policy=decision,
+                output_bytes=self._output_bytes(session, raw_output),
+            )
+            return CliHelpResult(
+                session_id=session_id,
+                line=session.redactor.redact(line),
+                policy=decision,
+                executed=True,
+                **output_fields,
+            )
+
+    def send_control(self, session_id: str, action: str) -> ControlResult:
+        """Continue or cancel a pager, or cancel a recognized device prompt."""
+        session = self._get_session(session_id)
+        with session.lock:
+            if action == "space":
+                self._require_state(session, SessionState.PAGING, action)
+                return self._continue_pager(session, action)
+            if action == "q":
+                self._require_state(session, SessionState.PAGING, action)
+                return self._cancel_interaction(session, action, "pager")
+            if action == "ctrl-c":
+                if session.state not in (SessionState.PAGING, SessionState.AWAITING_RESPONSE):
+                    raise SessionError(
+                        f"control {action!r} is not allowed while session "
+                        f"{session.session_id} is {session.state.value}"
+                    )
+                return self._cancel_interaction(session, action, "interactive prompt")
+            raise SessionError(f"unsupported control action: {action!r}")
+
+    def respond(self, session_id: str, response: str) -> ResponseResult:
+        """Send one allowlisted response to the pending device confirmation prompt."""
+        session = self._get_session(session_id)
+        with session.lock:
+            self._require_state(session, SessionState.AWAITING_RESPONSE, "respond")
+            pending = session.pending_response
+            if pending is None:
+                self._fail_session(session)
+                raise SessionError("session lost its pending response metadata")
+            normalized = response.lower()
+            if normalized not in pending.allowed_responses:
+                self._audit_interaction(
+                    session,
+                    "respond",
+                    "denied",
+                    response=response,
+                    allowed_responses=list(pending.allowed_responses),
+                )
+                raise PolicyError("response is not allowed by the pending device prompt")
+
+            self._audit_interaction(session, "respond", "started", response=normalized)
+            try:
+                outcome = self._consume_terminal_output(
+                    session,
+                    self._send_command_until_terminal(session, normalized, cmd_verify=False),
+                )
+            except Exception as exc:
+                self._fail_session(session)
+                message = session.redactor.redact(str(exc))
+                self._audit_interaction(
+                    session, "respond", "failed", response=normalized, error=message
+                )
+                raise TransportError(f"response failed in session {session_id}: {message}") from exc
+
+            output_fields = self._record_terminal_output(session, outcome)
+            self._touch(session)
+            self._audit_interaction(
+                session,
+                "respond",
+                self._terminal_outcome_label(outcome),
+                response=normalized,
+                output_bytes=self._output_bytes(session, outcome.output),
+            )
+            return ResponseResult(
+                session_id=session_id,
+                response=normalized,
+                **output_fields,
+            )
 
     def read_output(
         self, session_id: str, *, offset: int = 0, limit: int | None = None
@@ -314,6 +500,264 @@ class SessionManager:
                 session_id=session_id,
             )
             return self._session_info(session)
+
+    def _continue_pager(self, session: _ManagedSession, action: str) -> ControlResult:
+        if session.pager_pages >= self._config.policy.runtime.max_pager_pages:
+            self._audit_interaction(
+                session,
+                "send_control",
+                "started",
+                action="q",
+                reason="pager_page_limit",
+            )
+            try:
+                output = self._send_control_until_prompt(session, "q")
+            except Exception as exc:
+                self._fail_session(session)
+                message = session.redactor.redact(str(exc))
+                self._audit_interaction(
+                    session,
+                    "send_control",
+                    "failed",
+                    action="q",
+                    error=message,
+                )
+                raise TransportError(
+                    f"pager abort failed in session {session.session_id}: {message}"
+                ) from exc
+            outcome = _TerminalOutcome(output=output)
+            output_fields = self._record_terminal_output(session, outcome)
+            self._touch(session)
+            self._audit_interaction(
+                session,
+                "send_control",
+                "pager_limit_reached",
+                action="q",
+                output_bytes=self._output_bytes(session, output),
+            )
+            return ControlResult(session_id=session.session_id, action="q", **output_fields)
+
+        self._audit_interaction(session, "send_control", "started", action=action)
+        try:
+            session.connection.write_channel(" ")
+            outcome = self._consume_terminal_output(
+                session, self._read_until_terminal(session)
+            )
+        except Exception as exc:
+            self._fail_session(session)
+            message = session.redactor.redact(str(exc))
+            self._audit_interaction(
+                session, "send_control", "failed", action=action, error=message
+            )
+            raise TransportError(
+                f"pager continuation failed in session {session.session_id}: {message}"
+            ) from exc
+
+        output_fields = self._record_terminal_output(session, outcome)
+        self._touch(session)
+        self._audit_interaction(
+            session,
+            "send_control",
+            self._terminal_outcome_label(outcome),
+            action=action,
+            output_bytes=self._output_bytes(session, outcome.output),
+        )
+        return ControlResult(session_id=session.session_id, action="space", **output_fields)
+
+    def _cancel_interaction(
+        self, session: _ManagedSession, action: str, description: str
+    ) -> ControlResult:
+        self._audit_interaction(session, "send_control", "started", action=action)
+        try:
+            output = self._send_control_until_prompt(
+                session, "q" if action == "q" else "\x03"
+            )
+        except Exception as exc:
+            self._fail_session(session)
+            message = session.redactor.redact(str(exc))
+            self._audit_interaction(
+                session, "send_control", "failed", action=action, error=message
+            )
+            raise TransportError(
+                f"failed to cancel {description} in session {session.session_id}: {message}"
+            ) from exc
+
+        outcome = _TerminalOutcome(output=output)
+        output_fields = self._record_terminal_output(session, outcome)
+        self._touch(session)
+        self._audit_interaction(
+            session,
+            "send_control",
+            "completed",
+            action=action,
+            output_bytes=self._output_bytes(session, output),
+        )
+        return ControlResult(
+            session_id=session.session_id,
+            action=cast(Literal["space", "q", "ctrl-c"], action),
+            **output_fields,
+        )
+
+    def _send_command_until_terminal(
+        self, session: _ManagedSession, command: str, *, cmd_verify: bool = True
+    ) -> str:
+        return session.connection.send_command(
+            command,
+            expect_string=self._terminal_end_pattern(session),
+            read_timeout=float(self._config.policy.runtime.command_timeout),
+            strip_prompt=False,
+            strip_command=True,
+            cmd_verify=cmd_verify,
+        )
+
+    def _read_until_terminal(self, session: _ManagedSession) -> str:
+        return session.connection.read_until_pattern(
+            self._terminal_end_pattern(session),
+            read_timeout=float(self._config.policy.runtime.command_timeout),
+        )
+
+    def _return_to_prompt(self, session: _ManagedSession) -> None:
+        self._send_control_until_prompt(session, "\x03")
+
+    def _send_control_until_prompt(self, session: _ManagedSession, control: str) -> str:
+        session.connection.write_channel(control)
+        output = session.connection.read_until_pattern(
+            self._prompt_end_pattern(session),
+            read_timeout=float(self._config.policy.runtime.command_timeout),
+        )
+        session.state = SessionState.READY
+        session.pending_response = None
+        session.pager_pages = 0
+        return self._strip_prompt(session, output)
+
+    def _consume_terminal_output(
+        self, session: _ManagedSession, raw_output: str
+    ) -> _TerminalOutcome:
+        visible = _visible_terminal_text(raw_output)
+        if self._ends_with_secret_prompt(visible):
+            raise SessionError("device requested a password, passphrase, or secret")
+        if self._ends_with_pager(visible):
+            session.state = SessionState.PAGING
+            session.pending_response = None
+            session.pager_pages += 1
+            return _TerminalOutcome(output=raw_output, pager_active=True)
+        if self._ends_with_confirmation(visible):
+            prompt = _last_terminal_line(raw_output)
+            allowed_responses = _allowed_responses(visible)
+            session.state = SessionState.AWAITING_RESPONSE
+            session.pager_pages = 0
+            session.pending_response = _PendingResponse(prompt, allowed_responses)
+            return _TerminalOutcome(
+                output=raw_output,
+                response_required=True,
+                device_prompt=prompt,
+                allowed_responses=allowed_responses,
+            )
+        if not self._ends_with_prompt(session, visible):
+            raise SessionError("terminal output did not end at a recognized prompt")
+
+        session.state = SessionState.READY
+        session.pending_response = None
+        session.pager_pages = 0
+        return _TerminalOutcome(output=self._strip_prompt(session, raw_output))
+
+    def _record_terminal_output(
+        self, session: _ManagedSession, outcome: _TerminalOutcome
+    ) -> _OutputFields:
+        output = session.redactor.redact(outcome.output)
+        offset = self._append_output(session, output)
+        inline, truncated = _truncate_utf8(
+            output, self._config.policy.runtime.max_inline_output_bytes
+        )
+        return {
+            "output": inline,
+            "truncated": truncated,
+            "output_offset": offset,
+            "next_output_offset": offset + len(output) if truncated else None,
+            "pager_active": outcome.pager_active,
+            "response_required": outcome.response_required,
+            "device_prompt": (
+                session.redactor.redact(outcome.device_prompt)
+                if outcome.device_prompt is not None
+                else None
+            ),
+            "allowed_responses": list(outcome.allowed_responses),
+        }
+
+    @staticmethod
+    def _output_bytes(session: _ManagedSession, output: str) -> int:
+        return len(session.redactor.redact(output).encode())
+
+    @staticmethod
+    def _terminal_outcome_label(outcome: _TerminalOutcome) -> str:
+        if outcome.pager_active:
+            return "paging"
+        if outcome.response_required:
+            return "awaiting_response"
+        return "completed"
+
+    @staticmethod
+    def _require_state(
+        session: _ManagedSession, expected: SessionState, action: str
+    ) -> None:
+        if session.state != expected:
+            raise SessionError(
+                f"control {action!r} requires {expected.value}; session "
+                f"{session.session_id} is {session.state.value}"
+            )
+
+    @staticmethod
+    def _fail_session(session: _ManagedSession) -> None:
+        session.state = SessionState.FAILED
+        session.pending_response = None
+        session.pager_pages = 0
+
+    def _terminal_end_pattern(self, session: _ManagedSession) -> str:
+        return (
+            rf"(?:{self._prompt_end_pattern(session)}|(?i:{_PAGER_END.pattern})|"
+            rf"(?i:{_CONFIRMATION_END.pattern})|(?i:{_SECRET_END.pattern}))"
+        )
+
+    @staticmethod
+    def _prompt_end_pattern(session: _ManagedSession) -> str:
+        return rf"{re.escape(session.raw_prompt)}\s*\Z"
+
+    @staticmethod
+    def _ends_with_pager(output: str) -> bool:
+        return _PAGER_END.search(output) is not None
+
+    @staticmethod
+    def _ends_with_confirmation(output: str) -> bool:
+        return _CONFIRMATION_END.search(output) is not None
+
+    @staticmethod
+    def _ends_with_secret_prompt(output: str) -> bool:
+        return _SECRET_END.search(output) is not None
+
+    @staticmethod
+    def _ends_with_prompt(session: _ManagedSession, output: str) -> bool:
+        return re.search(SessionManager._prompt_end_pattern(session), output) is not None
+
+    @staticmethod
+    def _strip_prompt(session: _ManagedSession, output: str) -> str:
+        return re.sub(SessionManager._prompt_end_pattern(session), "", output)
+
+    def _audit_interaction(
+        self,
+        session: _ManagedSession,
+        event: str,
+        outcome: str,
+        **details: object,
+    ) -> None:
+        self._audit_event(
+            event,
+            target=session.target,
+            platform=session.platform,
+            outcome=outcome,
+            redactor=session.redactor,
+            session_id=session.session_id,
+            **details,
+        )
 
     def _direct_profile(self, target: Target) -> DirectConnection:
         profile = self._config.connections.connections[target.connection]
@@ -506,3 +950,24 @@ def _keep_utf8_tail(text: str, max_bytes: int) -> tuple[str, int]:
         return text, 0
     kept = encoded[-max_bytes:].decode(errors="ignore")
     return kept, len(text) - len(kept)
+
+
+def _visible_terminal_text(output: str) -> str:
+    """Remove ANSI styling before matching a terminal marker at output end."""
+    return _ANSI_ESCAPE.sub("", output).replace("\r", "").replace("\x08", "")
+
+
+def _last_terminal_line(output: str) -> str:
+    """Return the last non-empty terminal line for a pending prompt result."""
+    for line in reversed(_visible_terminal_text(output).splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _allowed_responses(output: str) -> tuple[str, ...]:
+    """Return the exact finite response set represented by a matched prompt."""
+    normalized = output.lower()
+    if "yes/no" in normalized:
+        return ("yes", "no")
+    return ("y", "n")

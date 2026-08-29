@@ -6,6 +6,7 @@ import logging
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 import anyio
 from mcp.server import MCPServer
@@ -13,8 +14,11 @@ from mcp.server import MCPServer
 from network_terminal_mcp.config.loader import load_config
 from network_terminal_mcp.errors import TargetError
 from network_terminal_mcp.sessions import (
+    CliHelpResult,
     CommandResult,
+    ControlResult,
     OutputChunk,
+    ResponseResult,
     SessionInfo,
     SessionManager,
 )
@@ -71,6 +75,23 @@ def create_server(
     async def run_commands(session_id: str, commands: list[str]) -> list[CommandResult]:
         """Execute commands serially, stopping at the first unapproved command."""
         return await _run_sync(session_manager.run_commands, session_id, commands)
+
+    @server.tool()
+    async def cli_help(session_id: str, line: str) -> CliHelpResult:
+        """Read CLI completion help without executing ``line`` or pressing Enter."""
+        return await _run_sync(session_manager.cli_help, session_id, line)
+
+    @server.tool()
+    async def send_control(
+        session_id: str, action: Literal["space", "q", "ctrl-c"]
+    ) -> ControlResult:
+        """Send a control key only when the session is in a compatible state."""
+        return await _run_sync(session_manager.send_control, session_id, action)
+
+    @server.tool()
+    async def respond(session_id: str, response: str) -> ResponseResult:
+        """Reply only with a token allowed by the current device confirmation prompt."""
+        return await _run_sync(session_manager.respond, session_id, response)
 
     @server.tool()
     async def read_output(

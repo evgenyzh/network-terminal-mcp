@@ -144,6 +144,7 @@ class RuntimeConfig(StrictModel):
     max_inline_output_bytes: int = 65536
     max_session_buffer_bytes: int = 1048576
     max_open_sessions: int = 10
+    max_pager_pages: int = Field(default=32, ge=1)
     audit_file: Path = Path("~/.local/state/network-terminal-mcp/audit.jsonl")
     output_dir: Path = Path("~/.local/state/network-terminal-mcp/outputs")
     known_hosts_file: Path = Path("~/.local/state/network-terminal-mcp/known_hosts")

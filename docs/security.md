@@ -34,7 +34,7 @@ authorization. Предпочтительна отдельная read-only AAA-�
 
 Результат проверки: `allow`, `ask` или `deny`.
 
-- В Этапе 1 `run_command` исполняет только `allow`.
+- `run_command` исполняет только `allow`.
 - Диагностические `show`, `display` и эквиваленты разрешаются platform policy.
 - Неизвестные exec-команды и config mode получают `ask`, но пока не исполняются.
 - Перезагрузка, factory reset, удаление конфигурации и файлов запрещены.
@@ -42,14 +42,23 @@ authorization. Предпочтительна отдельная read-only AAA-�
 - Переносы строк, command chaining и shell metacharacters запрещены в
   `run_command`.
 
-Политика проверяет полную строку до отправки Enter. `cli_help`, control keys и
-generic `raw_input` еще не реализованы; последний останется отключенным по
-умолчанию и после добавления.
+Политика проверяет полную строку до отправки Enter. `cli_help` имеет отдельный
+default policy и не принимает `?`, control characters или structural hazards.
+Он не нажимает Enter и всегда отменяет набранную строку Ctrl-C до возврата
+результата. Generic `raw_input` остается отключенным.
 
 ## Интерактивные вопросы
 
-Интерактивные confirmation prompts и `respond` относятся к Этапу 2. В Этапе 1
-policy не дает исполнять команды, которые обычно приводят к таким вопросам.
+`respond` не является generic input и не подтверждает policy `ask`. Он доступен
+только для текущего распознанного device confirmation с конечным allowlist
+`y`/`n` или `yes`/`no`. Prompt должен содержать явный текст действия и marker
+`[Y/N]`, `(Y/N)`, `[yes/no]` или `(yes/no)`; unknown prompts не получают
+ответа. Password, passphrase и secret prompts переводят session в `failed` без
+отправки token.
+
+`send_control` не принимает произвольные управляющие последовательности:
+`space`, `q` и `ctrl-c` разрешены только в совместимых состояниях pager/prompt.
+После page limit сервер отправляет `q`, а не продолжает неограниченный вывод.
 
 ## Аудит
 
@@ -59,7 +68,7 @@ policy не дает исполнять команды, которые обыч�
 - логическое имя устройства и адрес;
 - connection profile и platform;
 - пользователя AAA, но не пароль;
-- event/tool и команду;
+- event/tool, команду, help line, control action или allowlisted response;
 - решение policy, outcome и размер вывода для выполненной команды;
 - ошибки после redaction.
 

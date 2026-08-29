@@ -38,7 +38,7 @@ platform registry
 Реализован только direct SSH. ProxyJump, nested SSH/Telnet, TCP console и
 OpenSSH PTY fallback остаются отдельными transport backends следующих этапов.
 
-## MCP-инструменты Этапа 1
+## MCP-инструменты Этапов 1-2
 
 ### `open_session`
 
@@ -54,13 +54,37 @@ platform, dialect, prompt и transport warnings. Перед соединение
 
 Проверяет полную строку политикой, отправляет ее с Enter и читает до prompt или
 таймаута. В этой версии исполняются только решения `allow`; `ask` возвращает
-`confirmation_required`, а `deny` возвращает ошибку политики. MCP не изменяет
-синтаксис команды.
+`confirmation_required`, а `deny` возвращает ошибку политики. При известном
+pager command возвращает первый фрагмент в состоянии `paging`, а при
+распознанном device confirmation - `response_required` и allowlist ответов.
+MCP не изменяет синтаксис команды.
 
 ### `run_commands`
 
 Последовательно исполняет массив команд под одним session lock и
-останавливается на первой неисполненной команде или ошибке.
+останавливается на первой неисполненной команде, pager или device prompt.
+
+### `cli_help`
+
+Проверяет отдельную policy `defaults.cli_help`, отправляет `<line>?` без Enter,
+читает completion output, затем отправляет Ctrl-C и ожидает исходный prompt.
+Вход не может содержать `?`, control characters или structural command
+hazards. Если cleanup не вернул prompt, session переводится в `failed`.
+
+### `send_control`
+
+Не принимает произвольные bytes. В `paging` разрешены `space` (следующая
+страница), `q` и `ctrl-c` (отмена); для `awaiting_response` разрешен только
+`ctrl-c`. После `max_pager_pages` сервер вместо следующей `space` безопасно
+отправляет `q` и ожидает prompt.
+
+### `respond`
+
+Доступен только в `awaiting_response`. Сервер распознает ограниченный набор
+confirmation prompts с явным текстом действия и `[Y/N]`, `(Y/N)`, `[yes/no]`
+или `(yes/no)`, затем принимает только соответствующий token. Password,
+passphrase и secret prompts не получают автоматического ответа и переводят
+session в `failed`.
 
 ### `read_output`, `session_status`, `close_session`
 
@@ -70,16 +94,18 @@ platform, dialect, prompt и transport warnings. Перед соединение
 
 ### Инструменты следующих этапов
 
-`cli_help`, `respond`, `send_control` и отключенный по умолчанию `raw_input`
-появятся в Этапе 2 после реализации безопасной интерактивной state machine.
+`raw_input` остается отключенным по умолчанию. Policy-confirmation workflow
+для команд с решением `ask` не реализован и не использует `respond`.
 
 ## Жизненный цикл сессии
 
 ```text
-connecting -> ready -> closing -> closed
-     |          |
-     v          v
-   failed      failed
+connecting -> ready -> paging ------------+
+     |          |       |                 |
+     |          |       +-> awaiting_response
+     |          |                 |
+     v          v                 v
+   failed <-----+-----------------+-----> closing -> closed
 ```
 
 Каждая сессия имеет reentrant lock: одновременно выполняется одна операция или
@@ -99,8 +125,10 @@ connecting -> ready -> closing -> closed
 `redispatch(..., session_prep=True)`. Поэтому подготовка выполняется именно на
 конечном устройстве.
 
-Этап 1 использует штатный `session_preparation` Netmiko. Распознавание pager и
-fallback через `space`/`q`/`ctrl-c` еще не реализованы и относятся к Этапу 2.
+Этап 2 добавляет консервативное распознавание распространенных pager markers.
+Pager не продолжается автоматически: tool возвращает первый фрагмент и
+`paging`, после чего модель явно выбирает `space`, `q` или `ctrl-c`. Каждая
+страница пишется в bounded output buffer; page limit прерывается `q`.
 
 ## Платформы и диалекты
 
@@ -139,4 +167,6 @@ Netmiko распространяется под MIT. Проект использ
 `connections.yml`. Локальные драйверы будут наследоваться от ближайшего
 штатного класса; в Этапе 1 local adapters пока возвращают понятную ошибку.
 Версия Netmiko ограничена major-версией 4, потому что драйверы используют часть
-его protected API. Обновление выполняется только после тестов transcript replay.
+его protected API. Interactive flow использует только public `send_command`,
+`write_channel`, `read_until_pattern` и `read_channel_timing`. Обновление
+выполняется только после tests transcript replay.

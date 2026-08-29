@@ -1,6 +1,6 @@
 # Конфигурация
 
-Формат ниже реализован Pydantic-схемой Этапа 1. Неизвестные поля отклоняются,
+Формат ниже реализован Pydantic-схемой Этапов 1-2. Неизвестные поля отклоняются,
 а ссылки устройства на credential/connection profiles проверяются при загрузке.
 
 ## Разделение файлов
@@ -119,6 +119,7 @@ runtime:
   max_inline_output_bytes: 65536
   max_session_buffer_bytes: 1048576
   max_open_sessions: 10
+  max_pager_pages: 32
   audit_file: ~/.local/state/network-terminal-mcp/audit.jsonl
   output_dir: ~/.local/state/network-terminal-mcp/outputs
   known_hosts_file: ~/.local/state/network-terminal-mcp/known_hosts
@@ -132,6 +133,10 @@ runtime:
 
 `transcripts_enabled` зарезервирован для следующего этапа и пока не включает
 сохранение full transcript.
+
+`max_pager_pages` ограничивает количество страниц, которые можно запросить
+через `send_control(..., action="space")` в одной операции. После лимита сервер
+отправляет `q`, ожидает prompt и переводит session в `ready`.
 
 ## Проверка конфигурации
 
