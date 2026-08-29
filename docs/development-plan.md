@@ -20,6 +20,11 @@
 
 ## Этап 1. Прямой SSH и постоянные сессии
 
+Статус: выполнен для direct SSH. Проверены Cisco IOS (включая legacy
+`group1`/`ssh-rsa`), SNR old/eNOS через `cisco_ios`, D-Link через `dlink_ds`,
+Huawei VRP и Juniper Junos. Первичная регистрация host key требует явного
+`host_key_policy: accept_new`; последующие соединения используют `strict`.
+
 - Реализовать `pass` credential backend.
 - Добавить session manager с timeout, lock и ограничением вывода.
 - Реализовать `open_session`, `run_command`, `run_commands`, `session_status`,

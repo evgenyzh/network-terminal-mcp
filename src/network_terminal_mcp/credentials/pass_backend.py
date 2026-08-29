@@ -4,11 +4,9 @@ Secrets live in GPG-encrypted ``pass`` entries, never in MCP arguments or
 results. The server shells out to ``pass`` without interpolation, so the entry
 name is always taken from local configuration rather than model input.
 
-The entry format is line based:
-
-- first line: the password;
-- ``username: ...`` — the AAA username;
-- ``secret: ...`` — an optional enable secret.
+The entry's first line is the password. The non-secret AAA username belongs to
+the local credential profile, so it can be changed independently of the
+password-store entry.
 """
 
 from __future__ import annotations
@@ -29,7 +27,6 @@ class Credentials:
 
     username: str
     password: str
-    secret: str | None = None
 
 
 def require_pass_binary() -> str:
@@ -40,28 +37,12 @@ def require_pass_binary() -> str:
     return binary
 
 
-def parse_entry(content: str) -> Credentials:
+def parse_entry(content: str) -> str:
+    """Return the password from a ``pass`` entry's first line."""
     lines = content.splitlines()
     if not lines or not lines[0]:
         raise CredentialError("pass entry is empty: expected password on first line")
-    password = lines[0]
-    username: str | None = None
-    secret: str | None = None
-    for line in lines[1:]:
-        key, sep, value = line.partition(":")
-        if not sep:
-            continue
-        key = key.strip().lower()
-        value = value.strip()
-        if key == "username":
-            username = value
-        elif key == "secret":
-            secret = value
-    if not username:
-        raise CredentialError(
-            "pass entry has no 'username:' field; expected password then username"
-        )
-    return Credentials(username=username, password=password, secret=secret)
+    return lines[0]
 
 
 class PassBackend:
@@ -92,7 +73,7 @@ class PassBackend:
                 f"pass could not show entry {profile.entry!r}"
             )
         try:
-            return parse_entry(completed.stdout)
+            return Credentials(username=profile.username, password=parse_entry(completed.stdout))
         except CredentialError as exc:
             raise CredentialError(
                 f"invalid pass entry {profile.entry!r}: {exc}"

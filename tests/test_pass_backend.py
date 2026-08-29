@@ -15,22 +15,8 @@ from network_terminal_mcp.credentials.pass_backend import (
 from network_terminal_mcp.errors import CredentialError
 
 
-def test_parse_entry_password_username_and_secret() -> None:
-    entry = "hunter2\nusername: operator\nsecret: enable-secret\n"
-    credentials = parse_entry(entry)
-    assert credentials == Credentials(
-        username="operator", password="hunter2", secret="enable-secret"
-    )
-
-
-def test_parse_entry_without_secret() -> None:
-    credentials = parse_entry("hunter2\nusername: operator\n")
-    assert credentials.secret is None
-
-
-def test_parse_entry_missing_username_raises() -> None:
-    with pytest.raises(CredentialError, match="username"):
-        parse_entry("hunter2\n")
+def test_parse_entry_returns_first_line_password() -> None:
+    assert parse_entry("hunter2\nusername: ignored\n") == "hunter2"
 
 
 def test_parse_entry_empty_raises() -> None:
@@ -41,13 +27,15 @@ def test_parse_entry_empty_raises() -> None:
 def test_pass_backend_resolves_via_binary(tmp_path: Path) -> None:
     fake_pass = tmp_path / "pass"
     fake_pass.write_text(
-        "#!/bin/sh\nprintf 'hunter2\\nusername: operator\\n'\n",
+        "#!/bin/sh\nprintf 'hunter2\\n'\n",
         encoding="utf-8",
     )
     fake_pass.chmod(0o755)
 
     backend = PassBackend(binary=str(fake_pass))
-    profile = CredentialProfile.model_validate({"entry": "network/credentials/net"})
+    profile = CredentialProfile.model_validate(
+        {"entry": "network/credentials/net", "username": "operator"}
+    )
     assert backend.resolve(profile) == Credentials(
         username="operator", password="hunter2"
     )
@@ -60,17 +48,21 @@ def test_pass_backend_failure_raises(tmp_path: Path) -> None:
 
     backend = PassBackend(binary=str(fake_pass))
     with pytest.raises(CredentialError, match="could not show"):
-        backend.resolve(CredentialProfile.model_validate({"entry": "missing"}))
+        backend.resolve(
+            CredentialProfile.model_validate({"entry": "missing", "username": "operator"})
+        )
 
 
-def test_pass_backend_rejects_bad_entry_format(tmp_path: Path) -> None:
+def test_pass_backend_rejects_empty_entry(tmp_path: Path) -> None:
     fake_pass = tmp_path / "pass"
-    fake_pass.write_text("#!/bin/sh\nprintf 'hunter2\\nno-username-line\\n'\n")
+    fake_pass.write_text("#!/bin/sh\nprintf '\\n'\n")
     fake_pass.chmod(0o755)
 
     backend = PassBackend(binary=str(fake_pass))
     with pytest.raises(CredentialError, match="invalid pass entry"):
-        backend.resolve(CredentialProfile.model_validate({"entry": "x"}))
+        backend.resolve(
+            CredentialProfile.model_validate({"entry": "x", "username": "operator"})
+        )
 
 
 def test_require_pass_binary_missing_path(monkeypatch: pytest.MonkeyPatch) -> None:

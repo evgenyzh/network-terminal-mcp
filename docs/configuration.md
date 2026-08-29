@@ -37,6 +37,7 @@ connections:
   direct:
     type: direct
     protocol: ssh
+    host_key_policy: strict
 
   through-jump:
     type: proxyjump
@@ -68,13 +69,17 @@ credentials:
   network-tacacs:
     backend: pass
     entry: network/credentials/network-tacacs
+    username: operator
 
   terminal-tacacs:
     backend: pass
     entry: network/credentials/terminal-server
+    username: operator
 ```
 
-Поле `entry` не принимается из MCP-вызова.
+Поля `entry` и `username` не принимаются из MCP-вызова. Пароль всегда берется
+из `pass`; username не считается секретом и задается отдельно, чтобы не
+дублировать его в password store.
 
 ## Platform aliases
 
@@ -105,5 +110,11 @@ runtime:
   max_open_sessions: 10
   audit_file: ~/.local/state/network-terminal-mcp/audit.jsonl
   output_dir: ~/.local/state/network-terminal-mcp/outputs
+  known_hosts_file: ~/.local/state/network-terminal-mcp/known_hosts
   transcripts_enabled: false
 ```
+
+`host_key_policy` по умолчанию равен `strict`: target подключается только при
+совпадении ключа с `known_hosts_file`. Значение `accept_new` допускается только
+для явной первичной регистрации ключа (TOFU); после нее профиль следует вернуть
+в `strict`.

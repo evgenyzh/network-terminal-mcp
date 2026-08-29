@@ -78,9 +78,12 @@ def test_connection_rejects_unknown_type() -> None:
         )
 
 
-def test_credential_profile_requires_entry() -> None:
-    profile = CredentialProfile.model_validate({"backend": "pass", "entry": "a/b"})
+def test_credential_profile_requires_entry_and_username() -> None:
+    profile = CredentialProfile.model_validate(
+        {"backend": "pass", "entry": "a/b", "username": "operator"}
+    )
     assert profile.entry == "a/b"
+    assert profile.username == "operator"
     with pytest.raises(ValidationError):
         CredentialProfile.model_validate({"backend": "pass"})
 
@@ -122,7 +125,11 @@ def test_load_full_config(config_dir: Path) -> None:
     _write(
         config_dir,
         "credentials.yml",
-        {"credentials": {"net": {"backend": "pass", "entry": "n/c"}}},
+        {
+            "credentials": {
+                "net": {"backend": "pass", "entry": "n/c", "username": "operator"}
+            }
+        },
     )
     _write(config_dir, "policy.yml", {"defaults": {"unknown_exec_command": "ask"}})
 

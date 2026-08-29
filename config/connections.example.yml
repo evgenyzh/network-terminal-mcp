@@ -3,6 +3,7 @@ connections:
   direct:
     type: direct
     protocol: ssh
+    host_key_policy: strict
 
   through-jump:
     type: proxyjump

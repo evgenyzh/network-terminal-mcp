@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 Action = Literal["allow", "ask", "deny"]
 Protocol = Literal["ssh", "telnet", "legacy_ssh"]
+HostKeyPolicy = Literal["strict", "accept_new"]
 
 
 class StrictModel(BaseModel):
@@ -55,6 +56,7 @@ class InventoryConfig(StrictModel):
 class DirectConnection(StrictModel):
     type: Literal["direct"] = "direct"
     protocol: Protocol = "ssh"
+    host_key_policy: HostKeyPolicy = "strict"
     port: int | None = None
     host_key_algorithms: list[str] | None = None
     kex_algorithms: list[str] | None = None
@@ -109,6 +111,7 @@ class ConnectionsConfig(StrictModel):
 class CredentialProfile(StrictModel):
     backend: Literal["pass"] = "pass"
     entry: str
+    username: str
 
 
 class CredentialsConfig(StrictModel):
@@ -143,9 +146,10 @@ class RuntimeConfig(StrictModel):
     max_open_sessions: int = 10
     audit_file: Path = Path("~/.local/state/network-terminal-mcp/audit.jsonl")
     output_dir: Path = Path("~/.local/state/network-terminal-mcp/outputs")
+    known_hosts_file: Path = Path("~/.local/state/network-terminal-mcp/known_hosts")
     transcripts_enabled: bool = False
 
-    @field_validator("audit_file", "output_dir", mode="before")
+    @field_validator("audit_file", "output_dir", "known_hosts_file", mode="before")
     @classmethod
     def _expand_user(cls, value: object) -> object:
         if isinstance(value, str):

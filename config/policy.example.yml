@@ -37,4 +37,5 @@ runtime:
   max_open_sessions: 10
   audit_file: ~/.local/state/network-terminal-mcp/audit.jsonl
   output_dir: ~/.local/state/network-terminal-mcp/outputs
+  known_hosts_file: ~/.local/state/network-terminal-mcp/known_hosts
   transcripts_enabled: false

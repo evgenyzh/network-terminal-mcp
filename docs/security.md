@@ -23,11 +23,11 @@ authorization. Предпочтительна отдельная read-only AAA-�
 
 ```text
 <password on first line>
-username: operator
-secret: optional-enable-secret
 ```
 
-Имя записи выбирается только из локальной конфигурации, а не из аргумента модели.
+Имя записи и AAA username выбираются только из локального credential profile, а
+не из аргумента модели. Username не является секретом; отдельный enable secret,
+если понадобится, будет храниться в отдельной записи `pass`.
 
 ## Политика команд
 
@@ -78,7 +78,10 @@ secret: optional-enable-secret
 изменять глобальный `~/.ssh/config` шаблоном `Host *`.
 
 Каждое legacy-соединение возвращает предупреждение и отмечается в audit. Host
-key checking остается включенным, насколько это позволяет устройство.
+key checking остается включенным: default `host_key_policy: strict` сверяет
+ключ с локальным `known_hosts`. Для первичной регистрации допускается только
+явный `accept_new` (TOFU), который сохраняет fingerprint в аудит; затем профиль
+нужно вернуть в `strict`.
 
 Локальный OpenSSH 10.2 поддерживает `ssh-rsa`, SHA1 KEX и CBC, но не предлагает
 `ssh-dss`. DSA-only оборудование потребует отдельного изолированного решения или

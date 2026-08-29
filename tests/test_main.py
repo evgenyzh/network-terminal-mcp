@@ -44,7 +44,11 @@ def _base_config(config_dir: Path) -> None:
     _write(
         config_dir,
         "credentials.yml",
-        {"credentials": {"net": {"backend": "pass", "entry": "n/c"}}},
+        {
+            "credentials": {
+                "net": {"backend": "pass", "entry": "n/c", "username": "operator"}
+            }
+        },
     )
 
 

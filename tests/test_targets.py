@@ -20,7 +20,10 @@ from network_terminal_mcp.targets.resolver import TargetResolver
 def _config(**inventory: object) -> AppConfig:
     devices = inventory.get("devices", {})
     connections = inventory.get("connections", {"direct": {"type": "direct", "protocol": "ssh"}})
-    credentials = inventory.get("credentials", {"net": {"backend": "pass", "entry": "n/c"}})
+    credentials = inventory.get(
+        "credentials",
+        {"net": {"backend": "pass", "entry": "n/c", "username": "operator"}},
+    )
     return AppConfig(
         inventory=InventoryConfig.model_validate({"devices": devices}),
         connections=ConnectionsConfig.model_validate(
