@@ -10,6 +10,9 @@
 
 ## Этап 0. Каркас проекта
 
+Статус: выполнен. Добавлены strict Pydantic-схемы, loader четырех YAML-файлов,
+pass credential backend, policy, audit/redaction, target resolver и unit tests.
+
 - Уточнить схемы конфигурации и MCP tool contracts.
 - Добавить Pydantic-модели, загрузчик YAML и структурированные ошибки.
 - Настроить Ruff, mypy и pytest.
@@ -20,7 +23,9 @@
 
 ## Этап 1. Прямой SSH и постоянные сессии
 
-Статус: выполнен для direct SSH. Проверены Cisco IOS (включая legacy
+Статус: выполнен для direct SSH. Реализованы Netmiko session manager, output
+buffer, idle/hard lifetime, JSONL audit, `known_hosts` и шесть stdio MCP tools.
+Через зарегистрированные MCP tools проверены Cisco IOS (включая legacy
 `group1`/`ssh-rsa`), SNR old/eNOS через `cisco_ios`, D-Link через `dlink_ds`,
 Huawei VRP и Juniper Junos. Первичная регистрация host key требует явного
 `host_key_policy: accept_new`; последующие соединения используют `strict`.
@@ -32,8 +37,9 @@ Huawei VRP и Juniper Junos. Первичная регистрация host key 
 - Подключить Cisco IOS, Huawei VRP и Juniper Junos через Netmiko.
 - Проверить автоматический session preparation и paging.
 
-Критерий завершения: OpenCode выполняет несколько диагностических команд в
-одной сессии на трех тестовых платформах, не получая пароль.
+Критерий завершения: MCP tools выполняют несколько диагностических команд в
+одной сессии на трех тестовых платформах, не получая пароль. Регистрация MCP в
+OpenCode остается задачей Этапа 6.
 
 ## Этап 2. Исследование CLI
 
@@ -56,6 +62,11 @@ Huawei VRP и Juniper Junos. Первичная регистрация host key 
 terminal-server целей.
 
 ## Этап 4. Legacy SSH и Telnet
+
+Наблюдение Этапа 1: проверенный Cisco IOS использует только
+`diffie-hellman-group1-sha1`, `ssh-rsa`, `3des-cbc` и `hmac-sha1`. Paramiko 4.0
+поддержал их без отдельного oldssh. Per-profile algorithm overrides и Telnet
+по-прежнему не реализованы.
 
 - Реализовать host-scoped SSH algorithm profiles.
 - Проверить `ssh-rsa`, SHA1 KEX и CBC на лабораторной цели.

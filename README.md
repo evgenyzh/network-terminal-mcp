@@ -55,12 +55,14 @@ tools. Проверено на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Ju
 - [Архитектура](docs/architecture.md)
 - [План разработки](docs/development-plan.md)
 - [Модель безопасности](docs/security.md)
-- [Черновик конфигурации](docs/configuration.md)
+- [Конфигурация](docs/configuration.md)
+- [Эксплуатация](docs/operations.md)
+- [Результаты проверок](docs/validation.md)
 - [Разработка адаптеров](docs/adapters.md)
 - [Стратегия тестирования](docs/testing.md)
 - [Открытые вопросы](docs/open-questions.md)
 
-## Планируемый запуск
+## Запуск
 
 Локальный MCP запускается OpenCode через `stdio`, без прослушивания TCP-порта:
 
@@ -78,3 +80,13 @@ tools. Проверено на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Ju
 
 Перед запуском нужны локальные конфигурационные файлы в
 `~/.config/network-terminal-mcp/`; они не входят в git.
+
+Проверка локальной конфигурации до запуска:
+
+```bash
+uv sync
+uv run python -m network_terminal_mcp check
+```
+
+Подробный порядок первичной регистрации SSH host key и запуска через OpenCode
+описан в [руководстве эксплуатации](docs/operations.md).

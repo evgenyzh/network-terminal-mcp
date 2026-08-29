@@ -23,85 +23,68 @@ MCP tools
   +-- policy engine ---------- allow / ask / deny
   +-- session manager -------- lifetime, locking, output limits
   +-- audit logger ----------- JSONL, fail-closed
+  +-- host key store --------- strict known_hosts or explicit TOFU
   |
   v
-connection backends
-  +-- Netmiko SSH/Telnet
-  +-- OpenSSH PTY fallback for legacy cases
-  +-- terminal-server hops and redispatch
-  +-- console-port sessions
+connection backend (implemented)
+  +-- Netmiko direct SSH
   |
   v
-platform adapters
-  +-- stock Netmiko drivers
-  +-- local BDCOM/EcoSGE/PON adapters
+platform registry
+  +-- stock Netmiko drivers and configured aliases
+  +-- local BDCOM/EcoSGE/PON adapters (planned)
 ```
 
-## MCP-инструменты
+Реализован только direct SSH. ProxyJump, nested SSH/Telnet, TCP console и
+OpenSSH PTY fallback остаются отдельными transport backends следующих этапов.
+
+## MCP-инструменты Этапа 1
 
 ### `open_session`
 
-Открывает соединение и возвращает непрозрачный `session_id`, platform, prompt,
-режим и предупреждения транспорта. При необходимости выполняет несколько
-переходов через терминальные серверы.
+Открывает direct SSH-соединение и возвращает непрозрачный `session_id`,
+platform, dialect, prompt и transport warnings. Перед соединением ключ
+проверяется через локальный `known_hosts`.
 
 Цель задается именем из инвентаря или одноразовым описанием `host`, `platform`,
-`credential_profile`, `connection_profile`. Одноразовая цель не содержит пароль.
+`credentials`, `connection`, `port`. Одноразовая цель не содержит пароль и
+может ссылаться только на локальные profiles.
 
 ### `run_command`
 
-Проверяет полную строку политикой, отправляет ее с Enter и читает до prompt,
-интерактивного вопроса или таймаута. MCP не изменяет синтаксис команды.
+Проверяет полную строку политикой, отправляет ее с Enter и читает до prompt или
+таймаута. В этой версии исполняются только решения `allow`; `ask` возвращает
+`confirmation_required`, а `deny` возвращает ошибку политики. MCP не изменяет
+синтаксис команды.
 
 ### `run_commands`
 
-Последовательно исполняет массив команд в одной сессии. Останавливается на
-первой ошибке политики, неожиданном интерактивном prompt или потере сессии.
-
-### `cli_help`
-
-Отправляет префикс команды и `?` без Enter, читает подсказку, затем очищает
-незавершенную строку через подходящий для платформы control sequence. Этот
-инструмент позволяет исследовать неизвестный CLI без исполнения префикса.
-
-### `respond`
-
-Отвечает только на уже распознанный интерактивный prompt. Сессия хранит тип
-ожидаемого ответа и допустимые значения. Произвольный raw-ввод через этот
-инструмент запрещен.
-
-### `send_control`
-
-Поддерживает ограниченный набор: `ctrl-c`, `ctrl-u`, `ctrl-z`, `space`, `q`.
-Политика зависит от состояния сессии. Например, `space` автоматически допустим
-в pager, а `ctrl-z` может потребовать подтверждения.
+Последовательно исполняет массив команд под одним session lock и
+останавливается на первой неисполненной команде или ошибке.
 
 ### `read_output`, `session_status`, `close_session`
 
-Возвращают накопленный вывод, состояние либо закрывают соединение. Большой
-вывод сохраняется в защищенный runtime-каталог и читается частями.
+Возвращают накопленный вывод частями, состояние либо закрывают соединение.
+Вывод хранится в ограниченном session buffer; при превышении лимита старые данные
+вытесняются, а `oldest_offset` сообщает доступную начальную позицию.
 
-### `raw_input`
+### Инструменты следующих этапов
 
-Резервный инструмент для неизвестных интерактивных протоколов. По умолчанию
-отключен. Включается только отдельной политикой и всегда требует подтверждения.
+`cli_help`, `respond`, `send_control` и отключенный по умолчанию `raw_input`
+появятся в Этапе 2 после реализации безопасной интерактивной state machine.
 
 ## Жизненный цикл сессии
 
 ```text
-created -> connecting -> preparing -> ready
-                                  |      |
-                                  |      +-> waiting_for_response
-                                  |      +-> paging
-                                  |      +-> busy
-                                  v
-                               failed
-
-ready/busy/waiting -> closing -> closed
+connecting -> ready -> closing -> closed
+     |          |
+     v          v
+   failed      failed
 ```
 
-Каждая сессия имеет lock: одновременно выполняется только одна операция. Для
-сессий задаются idle timeout, hard lifetime и максимальный объем буфера.
+Каждая сессия имеет reentrant lock: одновременно выполняется одна операция или
+один пакет `run_commands`. Для сессий задаются idle timeout, hard lifetime и
+максимальный объем буфера.
 
 ## Подготовка терминала и paging
 
@@ -116,9 +99,8 @@ ready/busy/waiting -> closing -> closed
 `redispatch(..., session_prep=True)`. Поэтому подготовка выполняется именно на
 конечном устройстве.
 
-Адаптер также задает pager patterns. Если отключение paging не удалось, session
-manager распознает pager и отправляет `space`; при превышении лимита пытается
-корректно выйти через `q` или `ctrl-c`.
+Этап 1 использует штатный `session_preparation` Netmiko. Распознавание pager и
+fallback через `space`/`q`/`ctrl-c` еще не реализованы и относятся к Этапу 2.
 
 ## Платформы и диалекты
 
@@ -139,10 +121,11 @@ BDCOM делится как минимум на `bdcom_huawei_like` и `bdcom_ci
 
 ## Транспортные маршруты
 
-- `direct`: прямой SSH или Telnet.
-- `proxyjump`: TCP-переход через OpenSSH ProxyJump/ProxyCommand.
-- `nested`: shell терминального сервера, затем SSH/Telnet внутри него.
-- `console`: соединение с выделенным TCP-портом либо команда выбора консоли.
+- `direct` SSH: реализован; `legacy_ssh` использует Paramiko/Netmiko.
+- `direct` Telnet: запланирован, пока отвергается явно.
+- `proxyjump`: запланирован.
+- `nested`: запланирован.
+- `console`: запланирован.
 
 Маршруты состоят только из заранее определенных connection profiles. Модель не
 может передать произвольную shell-команду перехода.
@@ -152,7 +135,8 @@ BDCOM делится как минимум на `bdcom_huawei_like` и `bdcom_ci
 Netmiko распространяется под MIT. Проект использует его как зависимость и не
 изменяет установленный пакет.
 
-Локальные драйверы наследуются от ближайшего штатного класса. Собственный
-registry создает стандартный `ConnectHandler` либо локальный класс напрямую.
+Собственный registry разрешает штатный `device_type` либо alias из
+`connections.yml`. Локальные драйверы будут наследоваться от ближайшего
+штатного класса; в Этапе 1 local adapters пока возвращают понятную ошибку.
 Версия Netmiko ограничена major-версией 4, потому что драйверы используют часть
 его protected API. Обновление выполняется только после тестов transcript replay.

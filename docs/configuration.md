@@ -1,7 +1,7 @@
 # Конфигурация
 
-Формат ниже является черновиком v0. Он уточняется до начала реализации, после
-чего фиксируется Pydantic-схемой.
+Формат ниже реализован Pydantic-схемой Этапа 1. Неизвестные поля отклоняются,
+а ссылки устройства на credential/connection profiles проверяются при загрузке.
 
 ## Разделение файлов
 
@@ -39,6 +39,11 @@ connections:
     protocol: ssh
     host_key_policy: strict
 
+  direct-enroll:
+    type: direct
+    protocol: ssh
+    host_key_policy: accept_new
+
   through-jump:
     type: proxyjump
     jump_host: jump.example.net
@@ -59,8 +64,14 @@ connections:
     ciphers: [aes128-cbc]
 ```
 
-Сложные nested-профили в дальнейшем будут описываться массивом typed hops, а не
-shell-строкой.
+В Этапе 1 поддерживается только `direct` с protocol `ssh` или `legacy_ssh`.
+`proxyjump`, `nested`, `console` и Telnet уже описаны схемой, но сервер их
+отвергает до реализации соответствующего transport backend. Сложные nested-
+профили в дальнейшем будут описываться массивом typed hops, а не shell-строкой.
+
+`legacy_ssh` сейчас передается Paramiko/Netmiko. Явные списки KEX/ciphers/key
+types сохраняются в профиле для будущего per-device override, но еще не меняют
+настройки Paramiko автоматически.
 
 ## Credential profile
 
@@ -118,3 +129,16 @@ runtime:
 совпадении ключа с `known_hosts_file`. Значение `accept_new` допускается только
 для явной первичной регистрации ключа (TOFU); после нее профиль следует вернуть
 в `strict`.
+
+`transcripts_enabled` зарезервирован для следующего этапа и пока не включает
+сохранение full transcript.
+
+## Проверка конфигурации
+
+```bash
+uv run python -m network_terminal_mcp check
+uv run python -m network_terminal_mcp check --device access-snr-01
+```
+
+Эти команды валидируют YAML и ссылки между профилями, не открывая сетевое
+соединение и не читая password entry из `pass`.

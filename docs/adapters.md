@@ -17,6 +17,10 @@
 Например, SNR 29xx и 52xx могут использовать Cisco IOS driver, даже если
 команды MAC/VLAN отличаются. Разницу исследует модель через `cli_help`.
 
+Этап 1 подтвердил этот подход на SNR old и SNR eNOS: обе линейки прошли login,
+session preparation и `show version` через `cisco_ios`. Имена `snr_29xx` и
+`snr_52xx` остаются dialect metadata; отдельный Netmiko driver не требуется.
+
 ## Реализация
 
 Локальный класс наследуется от ближайшего Netmiko-драйвера и переопределяет

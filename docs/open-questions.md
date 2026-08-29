@@ -5,11 +5,12 @@
 
 ## Оборудование
 
-- Точные модели и версии ПО SNR 29xx/52xx.
+- SNR old и eNOS проверены через `cisco_ios`; собрать transcripts перед
+  добавлением platform-specific исключений.
 - Какие семейства BDCOM используют Huawei-like и Cisco-like CLI.
-- Модели Huawei, Eltex, SNR и BDCOM PON.
+- Модели Eltex, SNR и BDCOM PON.
 - Версия EcoSGE и пример login/prompt/paging.
-- Есть ли DSA-only SSH или достаточно `ssh-rsa` и старых KEX/ciphers.
+- Есть ли DSA-only SSH; проверенный Cisco работает через Paramiko legacy stack.
 
 ## Терминальные серверы
 
@@ -20,12 +21,13 @@
 
 ## AAA и политика
 
-- Один ли TACACS username используется для всех групп.
+- Для текущего тестового профиля задан отдельный AAA username; подтвердить,
+  нужен ли отдельный credential profile для других групп.
 - Есть ли отдельный enable secret.
 - Ограничивает ли TACACS набор команд или только аутентифицирует.
 - Какие диагностические команды считаются слишком тяжелыми.
-- Нужно ли автоматически разрешать все `show/display` или оставлять часть в
-  режиме `ask`.
+- Какие additional read-only prefixes, кроме `show`/`display`, разрешать
+  автоматически.
 
 ## Runtime
 

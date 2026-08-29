@@ -10,6 +10,8 @@
 - Command policy: allow, ask, deny, переносы строк и metacharacters.
 - Session state machine, locks, timeout и output limits.
 - Pager и confirmation prompt detection.
+- Host key store: strict unknown host, TOFU enrollment и nonstandard SSH port.
+- MCP tool registration, Pydantic input validation и worker-thread dispatch.
 
 ### Transcript replay
 
@@ -37,6 +39,25 @@
 - никаких production config transitions без отдельного разрешения;
 - после теста проверить отсутствие зависших sessions.
 
+## Выполненная проверка Этапа 1
+
+Проведена только после явного разрешения пользователя и без добавления IP,
+hostname, serial number или fingerprint в репозиторий.
+
+| Семейство | Driver | Проверенный путь | Статус |
+| --- | --- | --- | --- |
+| Cisco IOS, legacy SSH | `cisco_ios` | TOFU, strict reconnect, `show version` | пройден |
+| SNR old | `cisco_ios` + `snr_29xx` dialect | login, preparation, `show version` | пройден |
+| SNR eNOS | `cisco_ios` + `snr_52xx` dialect | login, preparation, `show version` | пройден |
+| D-Link DES | `dlink_ds` | login, preparation, `show switch` | пройден |
+| Huawei VRP | `huawei_vrp` | login, preparation, `display version` | пройден |
+| Juniper Junos | `juniper_junos` | login, preparation, `show version` | пройден |
+
+Проверялся путь `MCPServer.call_tool`: `open_session` → `run_command` →
+`read_output` → `close_session`. Полноценный stdio client round-trip и OpenCode
+registration остаются задачей Этапа 6. Pager fallback, `cli_help`, terminal
+servers и Telnet не тестировались, потому что еще не реализованы.
+
 ## Матрица приемки
 
 Для каждой платформы фиксируются:
@@ -45,7 +66,7 @@
 | --- | --- |
 | Login | prompt определен, секрет не залогирован |
 | Session preparation | paging отключен или включен fallback |
-| `cli_help` | подсказка прочитана, строка очищена |
+| `cli_help` | Этап 2: подсказка прочитана, строка очищена |
 | Single command | вывод завершен по prompt |
 | Multiple commands | одна TCP/terminal session |
 | Long output | pager обработан, лимит соблюден |
@@ -66,7 +87,7 @@
 
 ## Команды проверки
 
-После появления реализации:
+Текущий набор проверки:
 
 ```bash
 uv sync
