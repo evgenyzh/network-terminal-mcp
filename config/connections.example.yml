@@ -5,6 +5,13 @@ connections:
     protocol: ssh
     host_key_policy: strict
 
+  # Weak trust, opt-in per profile, for platforms that rotate host keys on
+  # every boot (e.g. some SNR). Do not use for devices with stable keys.
+  direct-snr:
+    type: direct
+    protocol: ssh
+    host_key_policy: accept_changed
+
   through-jump:
     type: proxyjump
     jump_host: jump.example.net
@@ -32,3 +39,8 @@ platforms:
   snr_52xx:
     driver: cisco_ios
     dialect: snr_52xx
+
+  dlink_ds:
+    driver: dlink_ds
+    dialect: dlink_ds
+    cli_help_requires_enter: true

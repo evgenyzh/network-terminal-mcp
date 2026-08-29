@@ -113,7 +113,7 @@ class MutableClock:
         return self.value
 
 
-def _config(**runtime: object) -> AppConfig:
+def _config(*, help_enter: bool = False, **runtime: object) -> AppConfig:
     return AppConfig(
         inventory=InventoryConfig.model_validate(
             {
@@ -133,7 +133,11 @@ def _config(**runtime: object) -> AppConfig:
                     "direct": {"type": "direct", "protocol": "ssh"}
                 },
                 "platforms": {
-                    "snr_29xx": {"driver": "cisco_ios", "dialect": "snr_29xx"}
+                    "snr_29xx": {
+                        "driver": "cisco_ios",
+                        "dialect": "snr_29xx",
+                        "cli_help_requires_enter": help_enter,
+                    }
                 },
             }
         ),
@@ -158,10 +162,12 @@ def _manager(
     connection: FakeConnection,
     audit: FakeAudit,
     clock: MutableClock | None = None,
+    *,
+    help_enter: bool = False,
     **runtime: object,
 ) -> SessionManager:
     return SessionManager(
-        _config(**runtime),
+        _config(help_enter=help_enter, **runtime),
         connection_factory=lambda params: connection,
         credential_resolver=FakeCredentials(),
         audit_logger=audit,  # type: ignore[arg-type]
@@ -249,6 +255,21 @@ def test_cli_help_rejects_unsafe_or_ambiguous_input(line: str) -> None:
         manager.cli_help(info.session_id, line)
 
     assert connection.writes == []
+
+
+def test_cli_help_with_enter_platform_sends_enter_and_skips_ctrl_c() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show ?"] = "Command list\nswitch#"
+    manager = _manager(connection, FakeAudit(), help_enter=True)
+    info = manager.open_session("sw1")
+
+    result = manager.cli_help(info.session_id, "show ")
+
+    assert result.executed is True
+    assert result.output == "Command list\n"
+    assert connection.commands == ["show ?"]
+    assert connection.writes == []
+    assert manager.session_status(info.session_id).state is SessionState.READY
 
 
 def test_cli_help_fails_the_session_when_cleanup_cannot_restore_prompt() -> None:

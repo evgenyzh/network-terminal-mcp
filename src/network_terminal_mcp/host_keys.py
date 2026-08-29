@@ -28,6 +28,8 @@ class HostKeyStatus:
     algorithm: str
     fingerprint: str
     enrolled: bool
+    changed: bool = False
+    previous_fingerprint: str | None = None
 
 
 def fingerprint_sha256(key: PKey) -> str:
@@ -85,8 +87,14 @@ class HostKeyStore:
         ``strict`` never contacts an unknown host and reports the missing key.
         ``accept_new`` retrieves and writes a key only when the host has no
         existing entry. Existing keys are never replaced.
+
+        ``accept_changed`` is a weak-trust, per-profile opt-in for platforms
+        known to rotate host keys on every boot (e.g. some SNR). It always
+        probes the live key, keeps an unchanged key untouched, and replaces a
+        changed or missing key. The change is returned so callers can audit and
+        warn. Never use it for devices with stable keys.
         """
-        if policy not in {"strict", "accept_new"}:
+        if policy not in {"strict", "accept_new", "accept_changed"}:
             raise TransportError(f"unsupported host key policy {policy!r}")
         host_name = _known_host_name(host, port)
         with self._lock:
@@ -94,13 +102,37 @@ class HostKeyStore:
             known = keys.lookup(host_name)
             if known:
                 key_type, key = next(iter(known.items()))
-                return HostKeyStatus(
-                    host=host,
-                    port=port,
-                    algorithm=key_type,
-                    fingerprint=fingerprint_sha256(key),
-                    enrolled=False,
-                )
+                if policy == "strict":
+                    return HostKeyStatus(
+                        host=host,
+                        port=port,
+                        algorithm=key_type,
+                        fingerprint=fingerprint_sha256(key),
+                        enrolled=False,
+                    )
+                if policy == "accept_changed":
+                    live_key = self._probe(host, port, timeout)
+                    live_fingerprint = fingerprint_sha256(live_key)
+                    if key.asbytes() == live_key.asbytes():
+                        return HostKeyStatus(
+                            host=host,
+                            port=port,
+                            algorithm=live_key.get_name(),
+                            fingerprint=live_fingerprint,
+                            enrolled=False,
+                        )
+                    previous = fingerprint_sha256(key)
+                    keys.add(host_name, live_key.get_name(), live_key)
+                    self._save(keys)
+                    return HostKeyStatus(
+                        host=host,
+                        port=port,
+                        algorithm=live_key.get_name(),
+                        fingerprint=live_fingerprint,
+                        enrolled=True,
+                        changed=True,
+                        previous_fingerprint=previous,
+                    )
             if policy == "strict":
                 raise TransportError(
                     f"unknown host key for {host_name}; enroll it explicitly "

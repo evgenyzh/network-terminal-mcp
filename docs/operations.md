@@ -99,11 +99,13 @@ rules:
 Ожидание ответа ограничено `runtime.cli_help_timeout` (по умолчанию 5 секунд),
 как и ожидание prompt после Ctrl-C, а не общим таймаутом команды.
 
-Проверено на оборудовании: `cli_help` надежен на Cisco IOS и SNR (Cisco-подобный
-CLI). На Junos, Huawei VRP и D-Link помощь не возвращает prompt после Ctrl-C за
-`cli_help_timeout`; сессия безопасно переводится в `failed` и закрывается без
-исполнения строки. Для этих платформ используйте `run_command` для
-диагностики; поддержка `cli_help` потребует transcript-тестов и другого cleanup.
+Проверено на оборудовании: `cli_help` работает на Cisco IOS и SNR eNOS
+(Cisco-подобный CLI). Для CLI, где помощь показывается только после Enter
+(например, D-Link), задайте платформе `cli_help_requires_enter: true` в
+`connections.yml`; тогда сервер отправит `<line>?` и Enter, `?` в конце не даст
+строке выполниться. На SNR old, Junos и Huawei VRP помощь пока не возвращает
+prompt за `cli_help_timeout`: сессия безопасно переводится в `failed` и
+закрывается без исполнения строки.
 
 При pager `run_command` возвращает `pager_active: true` и состояние `paging`.
 Продолжайте только одной страницей: `send_control(session_id, "space")`.

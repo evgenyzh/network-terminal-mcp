@@ -44,15 +44,15 @@ Read-only проверки через `MCPServer.call_tool` на реально�
 | --- | --- | --- | --- |
 | Cisco IOS | работает | работает | `show ?` возвращает подсказку, Ctrl-C восстанавливает prompt |
 | SNR eNOS | работает | работает | корректная форма `show interface ?` / `show interface brief` |
+| D-Link DES | работает | работает | через `cli_help_requires_enter: true` — `show ?` + Enter показывают подсказку |
+| SNR old | fail-safe | работает | host key меняется при каждой загрузке; профиль `direct-snr` с `accept_changed` |
 | Huawei VRP | fail-safe | работает | после `display ?` Ctrl-C не возвращает prompt за таймаут; команды не выполнялись |
 | Juniper Junos | fail-safe | работает | после `show ?` Ctrl-C не возвращает prompt за таймаут; команды не выполнялись |
-| D-Link DES | fail-safe | работает | после `show ?` Ctrl-C не возвращает prompt за таймаут; команды не выполнялись |
 
 Во всех fail-safe случаях сессия переводится в `failed` и закрывается без
 исполнения неполной строки; зависание не продолжается дольше `cli_help_timeout`.
-`cli_help` надежен только на Cisco-подобных CLI; на остальных нужны
-anonymized transcripts и другой cleanup (например, `q`/pager handling) до
-поддержки.
+На Junos/Huawei нужны anonymized transcripts и другой cleanup
+(например, `q`/pager handling) до поддержки `cli_help`.
 
 Pager на проверенных устройствах не встречался: штатный `session_preparation`
 его отключает. Вывод больших команд (`show interfaces`, `display interface
@@ -72,7 +72,7 @@ allowlist, отказ от password prompt и state-bound control actions. От�
 ## Непроверенное
 
 - Полный MCP stdio round-trip с клиентом OpenCode.
-- `cli_help` и interactive confirmations на Junos/Huawei/D-Link.
+- `cli_help` и interactive confirmations на Junos/Huawei.
 - Pager continuation на реальном устройстве (session preparation его отключает).
 - Anonymized transcripts для platform-specific pager/prompt patterns.
 - `raw_input`.

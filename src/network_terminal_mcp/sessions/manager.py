@@ -328,21 +328,23 @@ class SessionManager:
             self._audit_interaction(
                 session, "cli_help", "started", line=line, policy=decision
             )
-            help_timeout = float(self._config.policy.runtime.cli_help_timeout)
             try:
-                session.connection.write_channel(f"{line}?")
-                try:
-                    raw_output = session.connection.read_channel_timing(
-                        last_read=0.2,
-                        read_timeout=help_timeout,
+                if session.platform.cli_help_requires_enter:
+                    # Some CLIs (e.g. D-Link) only render the help list after
+                    # Enter. The appended '?' keeps the request non-executing.
+                    outcome = self._consume_terminal_output(
+                        session,
+                        self._send_command_until_terminal(
+                            session, f"{line}?", cmd_verify=False
+                        ),
                     )
-                finally:
-                    # The line is not safe to reuse after a failed read either.
-                    self._return_to_prompt(session, timeout=help_timeout)
-                if self._ends_with_pager(raw_output):
-                    raise SessionError("CLI help reached a pager and was cancelled")
-                if self._ends_with_secret_prompt(raw_output):
-                    raise SessionError("device requested a secret during CLI help")
+                else:
+                    raw_output = self._read_help(session, line)
+                    if self._ends_with_pager(raw_output):
+                        raise SessionError("CLI help reached a pager and was cancelled")
+                    if self._ends_with_secret_prompt(raw_output):
+                        raise SessionError("device requested a secret during CLI help")
+                    outcome = _TerminalOutcome(output=raw_output)
             except Exception as exc:
                 self._fail_session(session)
                 message = session.redactor.redact(str(exc))
@@ -351,7 +353,6 @@ class SessionManager:
                 )
                 raise TransportError(f"CLI help failed in session {session_id}: {message}") from exc
 
-            outcome = _TerminalOutcome(output=raw_output)
             output_fields = self._record_terminal_output(session, outcome)
             self._touch(session)
             self._audit_interaction(
@@ -360,7 +361,7 @@ class SessionManager:
                 "completed",
                 line=line,
                 policy=decision,
-                output_bytes=self._output_bytes(session, raw_output),
+                output_bytes=self._output_bytes(session, outcome.output),
             )
             return CliHelpResult(
                 session_id=session_id,
@@ -620,6 +621,19 @@ class SessionManager:
             read_timeout=float(self._config.policy.runtime.command_timeout),
         )
 
+    def _read_help(self, session: _ManagedSession, line: str) -> str:
+        """Send a non-Enter help request and always restore the prompt."""
+        help_timeout = float(self._config.policy.runtime.cli_help_timeout)
+        session.connection.write_channel(f"{line}?")
+        try:
+            return session.connection.read_channel_timing(
+                last_read=0.2,
+                read_timeout=help_timeout,
+            )
+        finally:
+            # The line is not safe to reuse after a failed read either.
+            self._return_to_prompt(session, timeout=help_timeout)
+
     def _return_to_prompt(self, session: _ManagedSession, *, timeout: float | None = None) -> None:
         self._send_control_until_prompt(session, "\x03", timeout=timeout)
 
@@ -820,6 +834,12 @@ class SessionManager:
     @staticmethod
     def _host_key_warnings(status: HostKeyStatus) -> list[str]:
         if status.enrolled:
+            if status.changed:
+                return [
+                    "host key CHANGED and auto-accepted under accept_changed policy: "
+                    f"{status.previous_fingerprint} -> {status.fingerprint}; "
+                    "verify out of band if this is unexpected"
+                ]
             return [
                 "host key enrolled with TOFU: "
                 f"{status.algorithm} {status.fingerprint}; switch the profile to strict"

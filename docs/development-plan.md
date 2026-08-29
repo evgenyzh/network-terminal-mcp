@@ -48,10 +48,14 @@ OpenCode остается задачей Этапа 6.
 `paging`/`awaiting_response` и bounded pager flow. SNR dialect metadata уже была
 добавлена в Этапе 1.
 
-Hardware finding: `cli_help` работает на Cisco IOS и SNR; на Junos, Huawei VRP и
-D-Link помощь не возвращает prompt после Ctrl-C за `cli_help_timeout`, и сессия
-безопасно падает. Нужны anonymized transcripts и platform-specific cleanup
-(например, `q` для pager-подобного help) перед поддержкой этих платформ.
+Hardware findings:
+- `cli_help` работает на Cisco IOS и SNR eNOS; D-Link поддержан через
+  `cli_help_requires_enter: true` (`<line>?` + Enter).
+- На SNR old, Junos и Huawei VRP помощь не возвращает prompt после Ctrl-C за
+  `cli_help_timeout`, и сессия безопасно падает. Нужны anonymized transcripts и
+  platform-specific cleanup (например, `q` для pager-подобного help).
+- SNR old меняет host key при каждой загрузке; добавлена per-profile политика
+  `host_key_policy: accept_changed` с аудитом old→new fingerprint.
 
 - `cli_help` отправляет `<line>?` без Enter, затем отменяет незавершенную строку
   через Ctrl-C и проверяет возврат prompt.

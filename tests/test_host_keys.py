@@ -53,6 +53,49 @@ def test_accept_new_enrolls_and_strict_reuses_key(tmp_path: Path) -> None:
     assert calls == 1
 
 
+def test_accept_changed_enrolls_unknown_host(tmp_path: Path) -> None:
+    key = paramiko.RSAKey.generate(1024)
+    store = HostKeyStore(tmp_path / "known_hosts", probe=lambda *_: key)
+    status = store.ensure("192.0.2.1", policy="accept_changed")
+    assert status.enrolled is True
+    assert status.changed is False
+    assert status.previous_fingerprint is None
+
+
+def test_accept_changed_keeps_unchanged_key(tmp_path: Path) -> None:
+    key = paramiko.RSAKey.generate(1024)
+    store = HostKeyStore(tmp_path / "known_hosts", probe=lambda *_: key)
+    store.ensure("192.0.2.1", policy="accept_new")
+    before = (tmp_path / "known_hosts").read_text()
+    status = store.ensure("192.0.2.1", policy="accept_changed")
+    assert status.enrolled is False
+    assert status.changed is False
+    assert (tmp_path / "known_hosts").read_text() == before
+
+
+def test_accept_changed_replaces_a_changed_key(tmp_path: Path) -> None:
+    first = paramiko.RSAKey.generate(1024)
+    second = paramiko.RSAKey.generate(1024)
+    from network_terminal_mcp.host_keys import fingerprint_sha256
+
+    store = HostKeyStore(tmp_path / "known_hosts", probe=lambda *_: first)
+    store.ensure("192.0.2.1", policy="accept_new")
+    probe = [second]
+
+    def rotate(host: str, port: int, timeout: float) -> paramiko.PKey:
+        return probe[0]
+
+    rotating = HostKeyStore(tmp_path / "known_hosts", probe=rotate)
+    status = rotating.ensure("192.0.2.1", policy="accept_changed")
+    assert status.enrolled is True
+    assert status.changed is True
+    assert status.fingerprint == fingerprint_sha256(second)
+    assert status.previous_fingerprint == fingerprint_sha256(first)
+    again = rotating.ensure("192.0.2.1", policy="accept_changed")
+    assert again.enrolled is False
+    assert again.changed is False
+
+
 def test_nonstandard_port_uses_bracketed_known_hosts_name(tmp_path: Path) -> None:
     key = paramiko.ECDSAKey.generate(bits=256)
     store = HostKeyStore(tmp_path / "known_hosts", probe=lambda *_: key)

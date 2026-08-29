@@ -44,6 +44,11 @@ connections:
     protocol: ssh
     host_key_policy: accept_new
 
+  direct-snr:
+    type: direct
+    protocol: ssh
+    host_key_policy: accept_changed
+
   through-jump:
     type: proxyjump
     jump_host: jump.example.net
@@ -104,10 +109,21 @@ platforms:
     driver: cisco_ios
     dialect: snr_52xx
 
+  dlink_ds:
+    driver: dlink_ds
+    dialect: dlink_ds
+    cli_help_requires_enter: true
+
   bdcom-new:
     driver: local:bdcom_huawei_like
     dialect: bdcom_huawei_like
 ```
+
+`cli_help_requires_enter` включает режим подсказки, в котором `cli_help`
+отправляет `<line>?` и Enter. Нужен для CLI (например, D-Link), где список
+подсказки показывается только после Enter; `?` в конце не позволяет выполнить
+строку. По умолчанию `false`: обычные CLI (Cisco, SNR) показывают помощь без
+Enter, и сервер отменяет строку Ctrl-C.
 
 ## Runtime defaults
 
@@ -131,6 +147,14 @@ runtime:
 совпадении ключа с `known_hosts_file`. Значение `accept_new` допускается только
 для явной первичной регистрации ключа (TOFU); после нее профиль следует вернуть
 в `strict`.
+
+`accept_changed` — слабый доверительный режим, opt-in для конкретного профиля.
+Используется только для платформ, у которых host key заведомо меняется при
+каждой загрузке (например, некоторые SNR). При каждом подключении сервер
+сверяет живой ключ с сохраненным: совпадает — оставляет без изменений,
+изменился или отсутствует — заменяет и пишет в audit предупреждение со
+старым и новым fingerprint. Для устройств со стабильными ключами этот режим
+недопустим: он снимает защиту от MITM.
 
 `transcripts_enabled` зарезервирован для следующего этапа и пока не включает
 сохранение full transcript.

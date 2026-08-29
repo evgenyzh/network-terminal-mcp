@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 Action = Literal["allow", "ask", "deny"]
 Protocol = Literal["ssh", "telnet", "legacy_ssh"]
-HostKeyPolicy = Literal["strict", "accept_new"]
+HostKeyPolicy = Literal["strict", "accept_new", "accept_changed"]
 
 
 class StrictModel(BaseModel):
@@ -96,6 +96,7 @@ ConnectionProfile = Annotated[
 class PlatformAlias(StrictModel):
     driver: str
     dialect: str | None = None
+    cli_help_requires_enter: bool = False
 
 
 class ConnectionsConfig(StrictModel):

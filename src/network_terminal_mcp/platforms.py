@@ -28,6 +28,7 @@ class Platform:
     name: str
     driver: str
     dialect: str
+    cli_help_requires_enter: bool = False
 
 
 class PlatformRegistry:
@@ -50,4 +51,11 @@ class PlatformRegistry:
             raise TransportError(
                 f"unsupported platform {name!r}: Netmiko driver {driver!r} is unavailable"
             )
-        return Platform(name=name, driver=driver, dialect=dialect)
+        return Platform(
+            name=name,
+            driver=driver,
+            dialect=dialect,
+            cli_help_requires_enter=(
+                bool(alias.cli_help_requires_enter) if alias is not None else False
+            ),
+        )

@@ -29,6 +29,24 @@ def test_alias_carries_driver_and_dialect() -> None:
     assert platform.dialect == "snr_29xx"
 
 
+def test_alias_carries_cli_help_requires_enter() -> None:
+    registry = PlatformRegistry(
+        ConnectionsConfig.model_validate(
+            {
+                "platforms": {
+                    "dlink_ds": {
+                        "driver": "dlink_ds",
+                        "dialect": "dlink_ds",
+                        "cli_help_requires_enter": True,
+                    }
+                }
+            }
+        )
+    )
+    assert registry.resolve("dlink_ds").cli_help_requires_enter is True
+    assert registry.resolve("cisco_ios").cli_help_requires_enter is False
+
+
 def test_local_adapter_is_deferred() -> None:
     registry = PlatformRegistry(
         ConnectionsConfig.model_validate(
