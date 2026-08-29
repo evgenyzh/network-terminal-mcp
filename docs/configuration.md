@@ -116,6 +116,7 @@ runtime:
   session_idle_timeout: 300
   session_max_lifetime: 1800
   command_timeout: 60
+  cli_help_timeout: 5
   max_inline_output_bytes: 65536
   max_session_buffer_bytes: 1048576
   max_open_sessions: 10
@@ -137,6 +138,11 @@ runtime:
 `max_pager_pages` ограничивает количество страниц, которые можно запросить
 через `send_control(..., action="space")` в одной операции. После лимита сервер
 отправляет `q`, ожидает prompt и переводит session в `ready`.
+
+`cli_help_timeout` ограничивает ожидание подсказки отдельно от обычной команды.
+После любого результата или таймаута сервер отправляет Ctrl-C и ожидает prompt;
+оба ожидания ограничены этим значением. Невернувшаяся подсказка переводит
+session в `failed`.
 
 ## Проверка конфигурации
 

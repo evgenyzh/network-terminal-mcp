@@ -141,6 +141,7 @@ class RuntimeConfig(StrictModel):
     session_idle_timeout: int = 300
     session_max_lifetime: int = 1800
     command_timeout: int = 60
+    cli_help_timeout: int = Field(default=5, ge=1)
     max_inline_output_bytes: int = 65536
     max_session_buffer_bytes: int = 1048576
     max_open_sessions: int = 10

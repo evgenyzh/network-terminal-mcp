@@ -36,17 +36,44 @@ open_session -> run_command -> read_output -> close_session
 `known_hosts`. Последующие соединения выполняются с `ssh_strict=True` и
 передают этот файл Netmiko как `alt_key_file`.
 
+## Hardware validation Этапа 2
+
+Read-only проверки через `MCPServer.call_tool` на реальном оборудовании.
+
+| Устройство | `cli_help` | `run_command` | Примечание |
+| --- | --- | --- | --- |
+| Cisco IOS | работает | работает | `show ?` возвращает подсказку, Ctrl-C восстанавливает prompt |
+| SNR eNOS | работает | работает | корректная форма `show interface ?` / `show interface brief` |
+| Huawei VRP | fail-safe | работает | после `display ?` Ctrl-C не возвращает prompt за таймаут; команды не выполнялись |
+| Juniper Junos | fail-safe | работает | после `show ?` Ctrl-C не возвращает prompt за таймаут; команды не выполнялись |
+| D-Link DES | fail-safe | работает | после `show ?` Ctrl-C не возвращает prompt за таймаут; команды не выполнялись |
+
+Во всех fail-safe случаях сессия переводится в `failed` и закрывается без
+исполнения неполной строки; зависание не продолжается дольше `cli_help_timeout`.
+`cli_help` надежен только на Cisco-подобных CLI; на остальных нужны
+anonymized transcripts и другой cleanup (например, `q`/pager handling) до
+поддержки.
+
+Pager на проверенных устройствах не встречался: штатный `session_preparation`
+его отключает. Вывод больших команд (`show interfaces`, `display interface
+brief`, `show interface brief`) получается целиком.
+
+Проверка `respond` на реальном оборудовании не проводилась: confirmation
+prompts обычно предшествуют write/destructive действиям.
+
 ## Local validation Этапа 2
 
 Scripted tests покрывают `MCPServer.call_tool` contracts, `cli_help` без Enter
 и с Ctrl-C cleanup, pager continuation/abort/page limit, confirmation
-allowlist, отказ от password prompt и state-bound control actions. Они не
-заменяют transcript или hardware test реального CLI.
+allowlist, отказ от password prompt и state-bound control actions. Отдельные
+тесты фиксируют короткий `cli_help_timeout` и гарантированный Ctrl-C cleanup
+даже при ошибке чтения.
 
 ## Непроверенное
 
 - Полный MCP stdio round-trip с клиентом OpenCode.
-- Pager fallback, `cli_help` и interactive confirmations на реальном устройстве.
+- `cli_help` и interactive confirmations на Junos/Huawei/D-Link.
+- Pager continuation на реальном устройстве (session preparation его отключает).
 - Anonymized transcripts для platform-specific pager/prompt patterns.
 - `raw_input`.
 - ProxyJump, nested SSH/Telnet, console ports и Telnet.

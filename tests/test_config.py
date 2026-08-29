@@ -92,6 +92,7 @@ def test_runtime_expands_user_home() -> None:
     runtime = RuntimeConfig.model_validate({"audit_file": "~/x/audit.jsonl"})
     assert str(runtime.audit_file) == str(Path("~/x/audit.jsonl").expanduser())
     assert runtime.session_idle_timeout == 300
+    assert runtime.cli_help_timeout == 5
     assert runtime.max_pager_pages == 32
     with pytest.raises(ValidationError):
         RuntimeConfig.model_validate({"max_pager_pages": 0})

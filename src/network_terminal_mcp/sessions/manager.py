@@ -328,13 +328,17 @@ class SessionManager:
             self._audit_interaction(
                 session, "cli_help", "started", line=line, policy=decision
             )
+            help_timeout = float(self._config.policy.runtime.cli_help_timeout)
             try:
                 session.connection.write_channel(f"{line}?")
-                raw_output = session.connection.read_channel_timing(
-                    last_read=0.2,
-                    read_timeout=float(self._config.policy.runtime.command_timeout),
-                )
-                self._return_to_prompt(session)
+                try:
+                    raw_output = session.connection.read_channel_timing(
+                        last_read=0.2,
+                        read_timeout=help_timeout,
+                    )
+                finally:
+                    # The line is not safe to reuse after a failed read either.
+                    self._return_to_prompt(session, timeout=help_timeout)
                 if self._ends_with_pager(raw_output):
                     raise SessionError("CLI help reached a pager and was cancelled")
                 if self._ends_with_secret_prompt(raw_output):
@@ -616,14 +620,20 @@ class SessionManager:
             read_timeout=float(self._config.policy.runtime.command_timeout),
         )
 
-    def _return_to_prompt(self, session: _ManagedSession) -> None:
-        self._send_control_until_prompt(session, "\x03")
+    def _return_to_prompt(self, session: _ManagedSession, *, timeout: float | None = None) -> None:
+        self._send_control_until_prompt(session, "\x03", timeout=timeout)
 
-    def _send_control_until_prompt(self, session: _ManagedSession, control: str) -> str:
+    def _send_control_until_prompt(
+        self, session: _ManagedSession, control: str, *, timeout: float | None = None
+    ) -> str:
         session.connection.write_channel(control)
         output = session.connection.read_until_pattern(
             self._prompt_end_pattern(session),
-            read_timeout=float(self._config.policy.runtime.command_timeout),
+            read_timeout=(
+                timeout
+                if timeout is not None
+                else float(self._config.policy.runtime.command_timeout)
+            ),
         )
         session.state = SessionState.READY
         session.pending_response = None

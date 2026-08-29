@@ -29,6 +29,9 @@ class FakeConnection:
         self.read_outputs: list[str] = []
         self.timing_output = ""
         self.read_error: Exception | None = None
+        self.timing_error: Exception | None = None
+        self.read_timeouts: list[float] = []
+        self.timing_timeouts: list[float] = []
         self.disconnected = False
 
     def find_prompt(self) -> str:
@@ -57,6 +60,7 @@ class FakeConnection:
         self.writes.append(out_data)
 
     def read_until_pattern(self, pattern: str, *, read_timeout: float) -> str:
+        self.read_timeouts.append(read_timeout)
         if self.read_error is not None:
             raise self.read_error
         if self.read_outputs:
@@ -64,6 +68,9 @@ class FakeConnection:
         return "switch#"
 
     def read_channel_timing(self, *, last_read: float, read_timeout: float) -> str:
+        self.timing_timeouts.append(read_timeout)
+        if self.timing_error is not None:
+            raise self.timing_error
         return self.timing_output
 
     def disconnect(self) -> None:
@@ -254,6 +261,21 @@ def test_cli_help_fails_the_session_when_cleanup_cannot_restore_prompt() -> None
     with pytest.raises(TransportError, match="prompt not received"):
         manager.cli_help(info.session_id, "show ")
 
+    assert connection.writes == ["show ?", "\x03"]
+    assert manager.session_status(info.session_id).state is SessionState.FAILED
+
+
+def test_cli_help_cancels_input_after_a_read_timeout() -> None:
+    connection = FakeConnection()
+    connection.timing_error = RuntimeError("help read timed out")
+    manager = _manager(connection, FakeAudit(), cli_help_timeout=3)
+    info = manager.open_session("sw1")
+
+    with pytest.raises(TransportError, match="help read timed out"):
+        manager.cli_help(info.session_id, "show ")
+
+    assert connection.timing_timeouts == [3.0]
+    assert connection.read_timeouts == [3.0]
     assert connection.writes == ["show ?", "\x03"]
     assert manager.session_status(info.session_id).state is SessionState.FAILED
 

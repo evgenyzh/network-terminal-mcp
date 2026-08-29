@@ -43,10 +43,15 @@ OpenCode остается задачей Этапа 6.
 
 ## Этап 2. Исследование CLI
 
-Статус: реализован и покрыт local scripted tests; hardware validation ожидает
-отдельного разрешения на точные targets и команды. Добавлены `cli_help`,
-`send_control`, `respond`, состояния `paging`/`awaiting_response` и bounded
-pager flow. SNR dialect metadata уже была добавлена в Этапе 1.
+Статус: реализован, покрыт local scripted tests и частично проверен на
+оборудовании. Добавлены `cli_help`, `send_control`, `respond`, состояния
+`paging`/`awaiting_response` и bounded pager flow. SNR dialect metadata уже была
+добавлена в Этапе 1.
+
+Hardware finding: `cli_help` работает на Cisco IOS и SNR; на Junos, Huawei VRP и
+D-Link помощь не возвращает prompt после Ctrl-C за `cli_help_timeout`, и сессия
+безопасно падает. Нужны anonymized transcripts и platform-specific cleanup
+(например, `q` для pager-подобного help) перед поддержкой этих платформ.
 
 - `cli_help` отправляет `<line>?` без Enter, затем отменяет незавершенную строку
   через Ctrl-C и проверяет возврат prompt.

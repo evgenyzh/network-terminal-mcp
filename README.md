@@ -9,8 +9,10 @@
 Статус: Этапы 1 и 2 реализованы для direct SSH. Есть конфигурация, политика,
 аудит, credential backend, known_hosts, постоянные Netmiko-сессии, безопасный
 `cli_help`, pager/control state machine и stdio MCP tools. Direct SSH проверен
-на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Junos; интерактивный этап пока
-покрыт local scripted tests, но не hardware validation.
+на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Junos. `cli_help` подтвержден
+на Cisco IOS и SNR; на Junos/Huawei/D-Link он безопасно завершается с ошибкой
+(help не возвращает prompt за таймаут), подробности в
+[результатах проверок](docs/validation.md).
 
 Текущие ограничения: только direct SSH; terminal servers, ProxyJump, Telnet,
 `raw_input` и config changes остаются следующими этапами. Команда с

@@ -96,6 +96,14 @@ rules:
 `cli_help(session_id, line)` отправляет `<line>?` без Enter, читает completion
 и отменяет незавершенную строку Ctrl-C перед возвратом. Не передавайте в `line`
 символ `?`, перевод строки или control bytes.
+Ожидание ответа ограничено `runtime.cli_help_timeout` (по умолчанию 5 секунд),
+как и ожидание prompt после Ctrl-C, а не общим таймаутом команды.
+
+Проверено на оборудовании: `cli_help` надежен на Cisco IOS и SNR (Cisco-подобный
+CLI). На Junos, Huawei VRP и D-Link помощь не возвращает prompt после Ctrl-C за
+`cli_help_timeout`; сессия безопасно переводится в `failed` и закрывается без
+исполнения строки. Для этих платформ используйте `run_command` для
+диагностики; поддержка `cli_help` потребует transcript-тестов и другого cleanup.
 
 При pager `run_command` возвращает `pager_active: true` и состояние `paging`.
 Продолжайте только одной страницей: `send_control(session_id, "space")`.
