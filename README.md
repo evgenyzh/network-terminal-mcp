@@ -10,8 +10,8 @@
 аудит, credential backend, known_hosts, постоянные Netmiko-сессии, безопасный
 `cli_help`, pager/control state machine и stdio MCP tools. Direct SSH проверен
 на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Junos. `cli_help` подтвержден
-на Cisco IOS и SNR; на Junos/Huawei/D-Link он безопасно завершается с ошибкой
-(help не возвращает prompt за таймаут), подробности в
+на всех этих платформах: SNR old поддерживает `space`/`q` pager flow, а
+Junos/Huawei очищают оставшуюся help-строку Ctrl-C и Ctrl-U. Подробности в
 [результатах проверок](docs/validation.md).
 
 Текущие ограничения: только direct SSH; terminal servers, ProxyJump, Telnet,

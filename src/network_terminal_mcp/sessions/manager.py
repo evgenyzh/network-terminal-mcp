@@ -70,7 +70,8 @@ Clock = Callable[[], float]
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _PAGER_END = re.compile(
-    r"(?:--more--|<--- more --->|---- more ----|press any key to continue)\s*\Z",
+    r"(?:--more--|<--- more --->|---- more ----|press any key to continue|"
+    r"---\s*\(\s*more\s+\d+\s*%?\s*\)\s*---)\s*\Z",
     re.IGNORECASE,
 )
 _CONFIRMATION_END = re.compile(
@@ -131,6 +132,7 @@ class _ManagedSession:
     output_start: int = 0
     output_truncated: bool = False
     pager_pages: int = 0
+    pager_is_help: bool = False
     pending_response: _PendingResponse | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -328,6 +330,7 @@ class SessionManager:
             self._audit_interaction(
                 session, "cli_help", "started", line=line, policy=decision
             )
+            help_timeout = float(self._config.policy.runtime.cli_help_timeout)
             try:
                 if session.platform.cli_help_requires_enter:
                     # Some CLIs (e.g. D-Link) only render the help list after
@@ -340,11 +343,23 @@ class SessionManager:
                     )
                 else:
                     raw_output = self._read_help(session, line)
-                    if self._ends_with_pager(raw_output):
-                        raise SessionError("CLI help reached a pager and was cancelled")
-                    if self._ends_with_secret_prompt(raw_output):
+                    visible = _visible_terminal_text(raw_output)
+                    if self._ends_with_pager(visible):
+                        session.state = SessionState.PAGING
+                        session.pending_response = None
+                        session.pager_pages = 1
+                        session.pager_is_help = True
+                        outcome = _TerminalOutcome(output=raw_output, pager_active=True)
+                    elif self._ends_with_secret_prompt(visible):
                         raise SessionError("device requested a secret during CLI help")
-                    outcome = _TerminalOutcome(output=raw_output)
+                    elif self._ends_with_help_prompt(session, visible):
+                        self._clear_help_tail(session)
+                        outcome = _TerminalOutcome(
+                            output=self._strip_help_prompt(session, raw_output)
+                        )
+                    else:
+                        self._return_to_prompt(session, timeout=help_timeout)
+                        outcome = _TerminalOutcome(output=raw_output)
             except Exception as exc:
                 self._fail_session(session)
                 message = session.redactor.redact(str(exc))
@@ -358,7 +373,7 @@ class SessionManager:
             self._audit_interaction(
                 session,
                 "cli_help",
-                "completed",
+                self._terminal_outcome_label(outcome),
                 line=line,
                 policy=decision,
                 output_bytes=self._output_bytes(session, outcome.output),
@@ -516,7 +531,11 @@ class SessionManager:
                 reason="pager_page_limit",
             )
             try:
-                output = self._send_control_until_prompt(session, "q")
+                if session.pager_is_help:
+                    session.connection.write_channel("q")
+                    output = self._finalize_help_pager(session)
+                else:
+                    output = self._send_control_until_prompt(session, "q")
             except Exception as exc:
                 self._fail_session(session)
                 message = session.redactor.redact(str(exc))
@@ -545,9 +564,11 @@ class SessionManager:
         self._audit_interaction(session, "send_control", "started", action=action)
         try:
             session.connection.write_channel(" ")
-            outcome = self._consume_terminal_output(
-                session, self._read_until_terminal(session)
-            )
+            raw_output = self._read_until_terminal(session)
+            if session.pager_is_help:
+                outcome = self._page_help(session, raw_output)
+            else:
+                outcome = self._consume_terminal_output(session, raw_output)
         except Exception as exc:
             self._fail_session(session)
             message = session.redactor.redact(str(exc))
@@ -569,14 +590,46 @@ class SessionManager:
         )
         return ControlResult(session_id=session.session_id, action="space", **output_fields)
 
+    def _page_help(self, session: _ManagedSession, raw_output: str) -> _TerminalOutcome:
+        """Classify one help pager page and finalize on the last one."""
+        visible = _visible_terminal_text(raw_output)
+        if self._ends_with_pager(visible):
+            session.state = SessionState.PAGING
+            session.pager_pages += 1
+            return _TerminalOutcome(output=raw_output, pager_active=True)
+        if self._ends_with_secret_prompt(visible):
+            raise SessionError("device requested a password, passphrase, or secret")
+        if self._ends_with_help_prompt(session, visible):
+            self._finalize_help_pager(session, prompt_already_seen=True)
+            return _TerminalOutcome(output=self._strip_help_prompt(session, raw_output))
+        raise SessionError("help pager did not return to a recognized prompt")
+
+    def _finalize_help_pager(
+        self, session: _ManagedSession, *, prompt_already_seen: bool = False
+    ) -> str:
+        """Wait for the help prompt tail, then clear the residual typed line."""
+        help_timeout = float(self._config.policy.runtime.cli_help_timeout)
+        output = ""
+        if not prompt_already_seen:
+            output = session.connection.read_until_pattern(
+                self._help_prompt_tail_pattern(session),
+                read_timeout=help_timeout,
+            )
+        self._clear_help_tail(session)
+        return self._strip_help_prompt(session, output)
+
     def _cancel_interaction(
         self, session: _ManagedSession, action: str, description: str
     ) -> ControlResult:
         self._audit_interaction(session, "send_control", "started", action=action)
         try:
-            output = self._send_control_until_prompt(
-                session, "q" if action == "q" else "\x03"
-            )
+            if session.pager_is_help:
+                session.connection.write_channel("q" if action == "q" else "\x03")
+                output = self._finalize_help_pager(session)
+            else:
+                output = self._send_control_until_prompt(
+                    session, "q" if action == "q" else "\x03"
+                )
         except Exception as exc:
             self._fail_session(session)
             message = session.redactor.redact(str(exc))
@@ -622,7 +675,11 @@ class SessionManager:
         )
 
     def _read_help(self, session: _ManagedSession, line: str) -> str:
-        """Send a non-Enter help request and always restore the prompt."""
+        """Send a non-Enter help request and read the first screen.
+
+        The caller decides whether the output is paged. A failed read still
+        tries to restore the prompt because the line is unsafe to reuse.
+        """
         help_timeout = float(self._config.policy.runtime.cli_help_timeout)
         session.connection.write_channel(f"{line}?")
         try:
@@ -630,12 +687,23 @@ class SessionManager:
                 last_read=0.2,
                 read_timeout=help_timeout,
             )
-        finally:
-            # The line is not safe to reuse after a failed read either.
+        except Exception:
             self._return_to_prompt(session, timeout=help_timeout)
+            raise
 
     def _return_to_prompt(self, session: _ManagedSession, *, timeout: float | None = None) -> None:
         self._send_control_until_prompt(session, "\x03", timeout=timeout)
+
+    @staticmethod
+    def _clear_help_tail(session: _ManagedSession) -> None:
+        """Cancel a line after its prompt has already been observed."""
+        session.connection.write_channel("\x03")
+        # Junos retains the line after Ctrl-C; Ctrl-U clears it without Enter.
+        session.connection.write_channel("\x15")
+        session.state = SessionState.READY
+        session.pending_response = None
+        session.pager_pages = 0
+        session.pager_is_help = False
 
     def _send_control_until_prompt(
         self, session: _ManagedSession, control: str, *, timeout: float | None = None
@@ -652,6 +720,7 @@ class SessionManager:
         session.state = SessionState.READY
         session.pending_response = None
         session.pager_pages = 0
+        session.pager_is_help = False
         return self._strip_prompt(session, output)
 
     def _consume_terminal_output(
@@ -735,16 +804,26 @@ class SessionManager:
         session.state = SessionState.FAILED
         session.pending_response = None
         session.pager_pages = 0
+        session.pager_is_help = False
 
     def _terminal_end_pattern(self, session: _ManagedSession) -> str:
+        prompt = self._prompt_end_pattern(session)
+        if session.pager_is_help:
+            # During help paging the device returns to the prompt with the
+            # unfinished line still typed (e.g. "switch>show "). Match it.
+            prompt = rf"(?:{prompt}|{self._help_prompt_tail_pattern(session)})"
         return (
-            rf"(?:{self._prompt_end_pattern(session)}|(?i:{_PAGER_END.pattern})|"
+            rf"(?:{prompt}|(?i:{_PAGER_END.pattern})|"
             rf"(?i:{_CONFIRMATION_END.pattern})|(?i:{_SECRET_END.pattern}))"
         )
 
     @staticmethod
     def _prompt_end_pattern(session: _ManagedSession) -> str:
         return rf"{re.escape(session.raw_prompt)}\s*\Z"
+
+    @staticmethod
+    def _help_prompt_tail_pattern(session: _ManagedSession) -> str:
+        return rf"{re.escape(session.raw_prompt)}\s*[^\r\n]*\Z"
 
     @staticmethod
     def _ends_with_pager(output: str) -> bool:
@@ -761,6 +840,14 @@ class SessionManager:
     @staticmethod
     def _ends_with_prompt(session: _ManagedSession, output: str) -> bool:
         return re.search(SessionManager._prompt_end_pattern(session), output) is not None
+
+    @staticmethod
+    def _ends_with_help_prompt(session: _ManagedSession, output: str) -> bool:
+        return re.search(SessionManager._help_prompt_tail_pattern(session), output) is not None
+
+    @staticmethod
+    def _strip_help_prompt(session: _ManagedSession, output: str) -> str:
+        return re.sub(SessionManager._help_prompt_tail_pattern(session), "", output)
 
     @staticmethod
     def _strip_prompt(session: _ManagedSession, output: str) -> str:

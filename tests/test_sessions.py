@@ -245,6 +245,20 @@ def test_cli_help_reads_completion_and_cancels_unfinished_line() -> None:
     assert audit.records[-1]["outcome"] == "completed"
 
 
+def test_cli_help_clears_a_recognized_prompt_tail_without_waiting_for_output() -> None:
+    connection = FakeConnection()
+    connection.timing_output = "  version  Show software version\nswitch#show    \x08\x08\x08"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    result = manager.cli_help(info.session_id, "show ")
+
+    assert result.output == "  version  Show software version\n"
+    assert connection.read_timeouts == []
+    assert connection.writes == ["show ?", "\x03", "\x15"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
 @pytest.mark.parametrize("line", ["show ?", "show version\n", "show $(hostname)"])
 def test_cli_help_rejects_unsafe_or_ambiguous_input(line: str) -> None:
     connection = FakeConnection()
@@ -299,6 +313,82 @@ def test_cli_help_cancels_input_after_a_read_timeout() -> None:
     assert connection.read_timeouts == [3.0]
     assert connection.writes == ["show ?", "\x03"]
     assert manager.session_status(info.session_id).state is SessionState.FAILED
+
+
+def test_cli_help_detects_paged_help_and_stays_in_paging() -> None:
+    connection = FakeConnection()
+    connection.timing_output = "  show usage\n---(more 35%)---"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    result = manager.cli_help(info.session_id, "show ")
+
+    assert result.executed is True
+    assert result.pager_active is True
+    assert result.output == "  show usage\n---(more 35%)---"
+    assert connection.writes == ["show ?"]
+    assert manager.session_status(info.session_id).state is SessionState.PAGING
+
+
+def test_cli_help_pager_pages_through_to_ready_and_clears_residual_line() -> None:
+    connection = FakeConnection()
+    connection.timing_output = "page1\n--More--"
+    connection.read_outputs = ["page2\n--More--", "page3\nswitch#show "]
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+    manager.cli_help(info.session_id, "show ")
+
+    first = manager.send_control(info.session_id, "space")
+    second = manager.send_control(info.session_id, "space")
+
+    assert first.pager_active is True
+    assert first.output == "page2\n--More--"
+    assert second.pager_active is False
+    assert second.output == "page3\n"
+    assert connection.writes == ["show ?", " ", " ", "\x03", "\x15"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_cli_help_pager_q_abort_clears_residual_line() -> None:
+    connection = FakeConnection()
+    connection.timing_output = "page1\n--More--"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+    manager.cli_help(info.session_id, "show ")
+
+    result = manager.send_control(info.session_id, "q")
+
+    assert result.action == "q"
+    assert connection.writes == ["show ?", "q", "\x03", "\x15"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_cli_help_pager_page_limit_aborts_with_q() -> None:
+    connection = FakeConnection()
+    connection.timing_output = "page1\n--More--"
+    manager = _manager(connection, FakeAudit(), max_pager_pages=1)
+    info = manager.open_session("sw1")
+    manager.cli_help(info.session_id, "show ")
+
+    result = manager.send_control(info.session_id, "space")
+
+    assert result.action == "q"
+    assert connection.writes == ["show ?", "q", "\x03", "\x15"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_command_pager_q_abort_does_not_send_extra_ctrl_c() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show interfaces"] = "page1\n--More--"
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+    manager.run_command(info.session_id, "show interfaces")
+
+    result = manager.send_control(info.session_id, "q")
+
+    assert result.action == "q"
+    assert connection.writes == ["q"]
+    assert manager.session_status(info.session_id).state is SessionState.READY
 
 
 def test_pager_requires_explicit_space_and_returns_to_ready() -> None:

@@ -43,22 +43,25 @@ OpenCode остается задачей Этапа 6.
 
 ## Этап 2. Исследование CLI
 
-Статус: реализован, покрыт local scripted tests и частично проверен на
-оборудовании. Добавлены `cli_help`, `send_control`, `respond`, состояния
+Статус: реализован, покрыт local scripted tests и проверен на оборудовании.
+Добавлены `cli_help`, `send_control`, `respond`, состояния
 `paging`/`awaiting_response` и bounded pager flow. SNR dialect metadata уже была
 добавлена в Этапе 1.
 
 Hardware findings:
 - `cli_help` работает на Cisco IOS и SNR eNOS; D-Link поддержан через
   `cli_help_requires_enter: true` (`<line>?` + Enter).
-- На SNR old, Junos и Huawei VRP помощь не возвращает prompt после Ctrl-C за
-  `cli_help_timeout`, и сессия безопасно падает. Нужны anonymized transcripts и
-  platform-specific cleanup (например, `q` для pager-подобного help).
+- SNR old возвращает настоящий help-pager; `space` листает, `q` возвращает к
+  prompt, после чего Ctrl-C и Ctrl-U очищают неполную строку.
+- Netmiko отключает pager на проверенных Junos/Huawei. Их help заканчивается
+  `prompt + набранная строка`; Ctrl-C и Ctrl-U очищают её без нового вывода,
+  после чего следующая команда проходит в той же сессии.
 - SNR old меняет host key при каждой загрузке; добавлена per-profile политика
   `host_key_policy: accept_changed` с аудитом old→new fingerprint.
 
-- `cli_help` отправляет `<line>?` без Enter, затем отменяет незавершенную строку
-  через Ctrl-C и проверяет возврат prompt.
+- `cli_help` отправляет `<line>?` без Enter. После распознанного prompt с
+  неполной строкой очищает её Ctrl-C и Ctrl-U; нераспознанный pager возврат
+  остаётся fail-safe.
 - Pager требует явного `send_control(space)`; доступны `q` для pager и `ctrl-c`
   для pager либо распознанного confirmation prompt.
 - `respond` принимает только `y`/`n` либо `yes`/`no`, если они были явно
@@ -68,9 +71,9 @@ Hardware findings:
   подтверждением policy.
 
 Критерий завершения: модель может найти неизвестную команду через `?`, очистить
-строку и выполнить найденную команду без переподключения. Для полного закрытия
-этапа еще нужны anonymized transcripts и read-only hardware validation pager/
-`cli_help` на согласованной цели.
+строку и выполнить найденную команду без переподключения. Read-only hardware
+validation выполнена; anonymized transcripts нужны при добавлении новых
+platform-specific pager/prompt patterns.
 
 ## Этап 3. Маршруты доступа
 

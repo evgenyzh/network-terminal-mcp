@@ -93,19 +93,28 @@ rules:
 
 ## Интерактивный read-only CLI
 
-`cli_help(session_id, line)` отправляет `<line>?` без Enter, читает completion
-и отменяет незавершенную строку Ctrl-C перед возвратом. Не передавайте в `line`
-символ `?`, перевод строки или control bytes.
-Ожидание ответа ограничено `runtime.cli_help_timeout` (по умолчанию 5 секунд),
-как и ожидание prompt после Ctrl-C, а не общим таймаутом команды.
+`cli_help(session_id, line)` отправляет `<line>?` без Enter и читает completion.
+Не передавайте в `line` символ `?`, перевод строки или control bytes. Если CLI
+уже вернул `prompt + остаток строки`, сервер очищает line buffer Ctrl-C и
+Ctrl-U, не нажимая Enter. Для остальных непостраничных случаев ожидание prompt
+после Ctrl-C ограничено `runtime.cli_help_timeout` (по умолчанию 5 секунд), а
+не общим таймаутом команды.
 
 Проверено на оборудовании: `cli_help` работает на Cisco IOS и SNR eNOS
 (Cisco-подобный CLI). Для CLI, где помощь показывается только после Enter
 (например, D-Link), задайте платформе `cli_help_requires_enter: true` в
 `connections.yml`; тогда сервер отправит `<line>?` и Enter, `?` в конце не даст
-строке выполниться. На SNR old, Junos и Huawei VRP помощь пока не возвращает
-prompt за `cli_help_timeout`: сессия безопасно переводится в `failed` и
-закрывается без исполнения строки.
+строке выполниться.
+
+На SNR old help идёт через pager: `cli_help` возвращает первый экран с
+`pager_active: true`, дальше листайте `send_control("space")` и выходите `q`.
+После выхода сервер ждёт prompt с остатком строки и очищает её Ctrl-C и Ctrl-U.
+Надёжная клавиша выхода из help-pager — `q`; при нераспознанном возврате к
+prompt сессия безопасно переводится в `failed`.
+
+Netmiko `session_preparation` отключает pager на проверенных Junos и Huawei
+VRP. Их help возвращается одним ответом, но оставляет набранную строку; сервер
+очищает её последовательностью Ctrl-C, Ctrl-U перед следующей командой.
 
 При pager `run_command` возвращает `pager_active: true` и состояние `paging`.
 Продолжайте только одной страницей: `send_control(session_id, "space")`.

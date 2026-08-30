@@ -45,35 +45,34 @@ Read-only проверки через `MCPServer.call_tool` на реально�
 | Cisco IOS | работает | работает | `show ?` возвращает подсказку, Ctrl-C восстанавливает prompt |
 | SNR eNOS | работает | работает | корректная форма `show interface ?` / `show interface brief` |
 | D-Link DES | работает | работает | через `cli_help_requires_enter: true` — `show ?` + Enter показывают подсказку |
-| SNR old | fail-safe | работает | host key меняется при каждой загрузке; профиль `direct-snr` с `accept_changed` |
-| Huawei VRP | fail-safe | работает | после `display ?` Ctrl-C не возвращает prompt за таймаут; команды не выполнялись |
-| Juniper Junos | fail-safe | работает | после `show ?` Ctrl-C не возвращает prompt за таймаут; команды не выполнялись |
+| SNR old | работает | работает | help-pager поддерживает `space`/`q`; host key меняется при каждой загрузке, профиль `direct-snr` использует `accept_changed` |
+| Huawei VRP | работает | работает | `session_preparation` отключает pager; help возвращает `prompt + display `, Ctrl-C + Ctrl-U очищают строку |
+| Juniper Junos | работает | работает | `session_preparation` отключает pager; help возвращает `prompt + show ` с backspace bytes, Ctrl-C + Ctrl-U очищают строку |
 
-Во всех fail-safe случаях сессия переводится в `failed` и закрывается без
-исполнения неполной строки; зависание не продолжается дольше `cli_help_timeout`.
-На Junos/Huawei нужны anonymized transcripts и другой cleanup
-(например, `q`/pager handling) до поддержки `cli_help`.
+На SNR old проверен flow `cli_help -> space -> q -> run_command` в одной
+сессии. На Junos/Huawei проверен `cli_help -> run_command` в одной сессии после
+silent Ctrl-C/Ctrl-U cleanup. Если help-pager не возвращает распознанный prompt,
+сессия всё ещё безопасно переводится в `failed`.
 
-Pager на проверенных устройствах не встречался: штатный `session_preparation`
-его отключает. Вывод больших команд (`show interfaces`, `display interface
-brief`, `show interface brief`) получается целиком.
+Netmiko `session_preparation` отключает pager на проверенных Junos и Huawei,
+но SNR old сохраняет его для help и больших команд (`show interface`).
 
 Проверка `respond` на реальном оборудовании не проводилась: confirmation
 prompts обычно предшествуют write/destructive действиям.
 
 ## Local validation Этапа 2
 
-Scripted tests покрывают `MCPServer.call_tool` contracts, `cli_help` без Enter
-и с Ctrl-C cleanup, pager continuation/abort/page limit, confirmation
-allowlist, отказ от password prompt и state-bound control actions. Отдельные
-тесты фиксируют короткий `cli_help_timeout` и гарантированный Ctrl-C cleanup
-даже при ошибке чтения.
+Scripted tests покрывают `MCPServer.call_tool` contracts, `cli_help` без Enter,
+prompt-tail cleanup Ctrl-C/Ctrl-U, pager continuation/abort/page limit,
+confirmation allowlist, отказ от password prompt и state-bound control actions.
+Отдельные тесты фиксируют короткий `cli_help_timeout` и гарантированный Ctrl-C
+cleanup даже при ошибке чтения.
 
 ## Непроверенное
 
 - Полный MCP stdio round-trip с клиентом OpenCode.
-- `cli_help` и interactive confirmations на Junos/Huawei.
-- Pager continuation на реальном устройстве (session preparation его отключает).
+- Interactive confirmations на Junos/Huawei.
+- Continuation большого обычного command pager на реальном устройстве.
 - Anonymized transcripts для platform-specific pager/prompt patterns.
 - `raw_input`.
 - ProxyJump, nested SSH/Telnet, console ports и Telnet.

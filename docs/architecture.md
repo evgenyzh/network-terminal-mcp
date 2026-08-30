@@ -66,10 +66,23 @@ MCP не изменяет синтаксис команды.
 
 ### `cli_help`
 
-Проверяет отдельную policy `defaults.cli_help`, отправляет `<line>?` без Enter,
-читает completion output, затем отправляет Ctrl-C и ожидает исходный prompt.
-Вход не может содержать `?`, control characters или structural command
-hazards. Если cleanup не вернул prompt, session переводится в `failed`.
+Проверяет отдельную policy `defaults.cli_help`, отправляет `<line>?` без Enter и
+читает completion output. Вход не может содержать `?`, control characters или
+structural command hazards.
+
+Если помощь попадает в pager (`--More--`, `---- More ----`,
+`---(more N%)---`), `cli_help` возвращает первый экран с `pager_active: true`
+и не отправляет control bytes. Модель продолжает страницами через
+`send_control(space)` либо выходит `q`. После `q` сервер ждёт распознанный
+`prompt + остаток строки`, затем посылает Ctrl-C и Ctrl-U, не нажимая Enter.
+Если pager не вернулся к известному prompt, session переводится в `failed`.
+
+После непостраничной помощи CLI может либо ждать Ctrl-C и вернуть чистый
+prompt, либо уже показать `prompt + остаток строки` (Junos/Huawei). Во втором
+случае сервер распознаёт этот хвост, посылает Ctrl-C и Ctrl-U без ожидания
+нового вывода: эти платформы очищают line buffer молча. Для CLI, показывающих
+помощь только после Enter (D-Link), используется `cli_help_requires_enter`
+(`<line>?` + Enter).
 
 ### `send_control`
 
@@ -125,10 +138,13 @@ connecting -> ready -> paging ------------+
 `redispatch(..., session_prep=True)`. Поэтому подготовка выполняется именно на
 конечном устройстве.
 
-Этап 2 добавляет консервативное распознавание распространенных pager markers.
-Pager не продолжается автоматически: tool возвращает первый фрагмент и
-`paging`, после чего модель явно выбирает `space`, `q` или `ctrl-c`. Каждая
-страница пишется в bounded output buffer; page limit прерывается `q`.
+Этап 2 добавляет консервативное распознавание распространенных pager markers
+(включая Junos `---(more N%)---`). Pager не продолжается автоматически: tool
+возвращает первый фрагмент и `paging`, после чего модель явно выбирает
+`space`, `q` или `ctrl-c`. Каждая страница пишется в bounded output buffer;
+page limit прерывается `q`. В help-flow совпадение prompt допускает хвост
+(`prompt + остаток строки`) только для `cli_help`; этот хвост очищается
+Ctrl-C и Ctrl-U без Enter. Вне help-flow совпадение prompt строгое.
 
 ## Платформы и диалекты
 
