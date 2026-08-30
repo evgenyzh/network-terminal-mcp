@@ -76,28 +76,40 @@ connections:
     ciphers: [aes128-cbc]
 ```
 
-Поддерживаются `direct` с protocol `ssh` или `legacy_ssh`, один SSH-only
-`proxyjump` hop и один SSH-only `nested` hop. ProxyJump аутентифицируется на
+Поддерживаются `direct` с protocol `ssh`, `legacy_ssh` или `telnet`, один
+SSH-only `proxyjump` hop, один `nested` hop (`next_protocol: ssh` или
+`telnet`) и TCP `console` profile. ProxyJump аутентифицируется на
 `jump_host`, открывает `direct-tcpip` channel к final target и передаёт его
 Netmiko как socket. `jump_port` относится к bastion; final target использует
 `Device.port` или ad-hoc `port`, затем fallback profile `port`, затем 22.
 
 Nested подключается к `host` через `generic_termserver`, затем из shell
-промежуточного хоста выполняет `ssh` до final target с credentials целевого
-устройства и переключает драйвер `redispatch` на платформу цели. Inner SSH
+промежуточного хоста выполняет `ssh` (или `telnet`, если
+`next_protocol: telnet`) до final target с credentials целевого устройства и
+переключает драйвер `redispatch` на платформу цели. Inner SSH
 использует SSH-клиент промежуточного хоста: host key цели проверяется им, а не
-локальным `known_hosts_file`.
+локальным `known_hosts_file`. Inner Telnet вообще не проверяет host key цели.
+
+`console` profile подключается к TCP console port терминального сервера
+(`port` обязателен) через Telnet-драйвер платформы. Поле `connect_command`
+намеренно не поддерживается: произвольная shell-строка противоречит модели
+безопасности. Console требует того же gating, что и Telnet.
 
 Ключи jump host и final target проверяются раздельно в одном dedicated
 `known_hosts_file`: `jump_host_key_policy` относится к bastion, а
 `host_key_policy` — к final target (для `nested` — к intermediate host).
-Literal `ProxyCommand`, несколько hops, `console` и Telnet не поддерживаются.
-Сложные nested-профили в дальнейшем будут описываться массивом typed hops, а не
-shell-строкой.
+Literal `ProxyCommand` и несколько hops не поддерживаются. Сложные nested-профили
+в дальнейшем будут описываться массивом typed hops, а не shell-строкой.
 
-`legacy_ssh` сейчас передается Paramiko/Netmiko. Явные списки KEX/ciphers/key
-types сохраняются в профиле для будущего per-device override, но еще не меняют
-настройки Paramiko автоматически.
+`legacy_ssh` и явные списки KEX/ciphers/key types выполняют per-profile
+algorithm override: категории, перечисленные в профиле, ограничиваются
+allowlist, остальные сохраняют значения Paramiko по умолчанию. Списки не
+применяются глобально и не отключают host key checking.
+
+Telnet и console требуют двойного gating: `allow_telnet: true` на устройстве
+**и** `defaults.telnet: allow` в policy. По умолчанию `telnet: deny`, поэтому
+случайно включить Telnet нельзя. Telnet не проверяет host key и передаёт
+трафик и учётные данные открытым текстом; сессия всегда возвращает warning.
 
 ## Credential profile
 
@@ -145,6 +157,7 @@ platforms:
     driver: dlink_ds
     dialect: dlink_ds
     cli_help_requires_enter: true
+    telnet_driver: dlink_ds_telnet
 
   bdcom-new:
     driver: local:bdcom_huawei_like
@@ -156,6 +169,11 @@ platforms:
 подсказки показывается только после Enter; `?` в конце не позволяет выполнить
 строку. По умолчанию `false`: обычные CLI (Cisco, SNR) показывают помощь без
 Enter, и сервер отменяет строку Ctrl-C.
+
+`telnet_driver` задаёт Netmiko-драйвер для Telnet/console соединений платформы.
+По умолчанию используется `<driver>_telnet` (например, `cisco_ios_telnet`);
+для платформ, где такого класса нет, задайте его явно или оставьте `null`,
+тогда Telnet/console для платформы будут недоступны.
 
 ## Runtime defaults
 

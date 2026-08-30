@@ -6,8 +6,10 @@
 несколько команд в одной сессии и получить полный вывод без временных
 `sshpass`-команд и одноразовых скриптов.
 
-Статус: Этапы 1, 2, 3 и 6 реализованы; Этап 3 поддерживает один SSH-only
-ProxyJump hop и один SSH-only Nested hop (`generic_termserver` + `redispatch`).
+Статус: Этапы 1, 2, 3, 4 и 6 реализованы; Этап 3 поддерживает один SSH-only
+ProxyJump hop и один Nested hop (`generic_termserver` + `redispatch`), а
+Этап 4 — per-profile legacy SSH algorithm overrides, прямой Telnet, Nested
+Telnet и TCP console profiles.
 Есть конфигурация, политика,
 аудит, credential backend, known_hosts, постоянные Netmiko-сессии, безопасный
 `cli_help`, pager/control state machine и stdio MCP tools. Direct SSH проверен
@@ -19,11 +21,13 @@ password bastion до SNR old. Current local OpenCode profile подключён
 через stdio MCP и прошёл read-only round-trip. Подробности в
 [результатах проверок](docs/validation.md).
 
-Текущие ограничения: Telnet, `raw_input` и config
+Текущие ограничения: `raw_input` и config
 changes остаются следующими этапами. Команда с
 policy-решением `ask` возвращает `confirmation_required`, но не исполняется.
 `respond` отвечает только на уже распознанный prompt устройства и не является
-механизмом policy confirmation.
+механизмом policy confirmation. Telnet и console требуют двойного gating
+(`allow_telnet` на устройстве и `defaults.telnet: allow`) и проверены только
+unit-тестами, без hardware-подтверждения.
 
 ## Основные цели
 

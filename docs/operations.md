@@ -1,11 +1,10 @@
-# Эксплуатация Этапов 1-3
+# Эксплуатация Этапов 1-4
 
 ## Границы текущей версии
 
 Сервер поддерживает постоянные direct SSH-сессии, один configured SSH-only
-ProxyJump hop и один configured SSH-only Nested hop. Он не поддерживает
-terminal server, Nested Telnet, console ports, Telnet, `raw_input` или запись
-конфигурации.
+ProxyJump hop, один configured Nested hop (SSH или Telnet) и TCP console
+profiles. Он не поддерживает `raw_input` или запись конфигурации.
 
 Для ProxyJump нужны локальные connection и credential profiles для final target
 и bastion. Обе host key проверяются независимо; bastion должен разрешать
@@ -17,6 +16,21 @@ host и final target. Сервер подключается к intermediate host
 `redispatch` на платформу цели. Host key intermediate host проверяется локально;
 inner SSH использует SSH-клиент intermediate host, поэтому host key final target
 проверяется им. При ошибке connection закрывается.
+
+## Telnet и console
+
+Прямой Telnet, Nested Telnet (`next_protocol: telnet`) и `console` profiles
+(ТСP console port терминального сервера) включаются только двойным gating:
+`allow_telnet: true` на устройстве **и** `defaults.telnet: allow` в policy.
+По умолчанию `telnet: deny`, поэтому Telnet выключен, пока не разрешён явно.
+Telnet передаёт учётные данные и трафик открытым текстом и не проверяет host
+key; каждая сессия возвращает warning. Nested Telnet выполняет `telnet` из
+shell промежуточного хоста, поэтому host key цели также не проверяется.
+`console` требует заданный `port`; `connect_command` не поддерживается.
+
+Telnet-драйвер платформы берётся из `telnet_driver` в platform alias, иначе
+выводится как `<driver>_telnet`; если такого класса нет, Telnet/console для
+платформы недоступны.
 
 Реализованные MCP tools:
 

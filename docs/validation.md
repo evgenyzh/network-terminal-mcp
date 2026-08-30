@@ -1,4 +1,4 @@
-# Результаты проверок Этапов 1, 2, 3 и 6
+# Результаты проверок Этапов 1, 2, 3, 4 и 6
 
 ## Scope
 
@@ -102,11 +102,31 @@ final target с credentials целевого устройства, затем `r
 использует SSH-клиент промежуточного хоста, поэтому host key final target
 проверяется им, а не локальным store.
 
+## Этап 4 validation
+
+Legacy SSH overrides, Telnet и console проверены unit-тестами:
+- Per-profile allowlist превращается в Paramiko `disabled_algorithms` как
+  дополнение полного набора алгоритмов; категории вне allowlist не трогаются,
+  host key checking остаётся включенным.
+- Прямой Telnet требует `allow_telnet: true` на устройстве и
+  `defaults.telnet: allow`; при нарушении любого из условий сессия не
+  открывается. Telnet использует `telnet_driver` платформы, не проверяет host
+  key и возвращает cleartext warning.
+- Nested Telnet (`next_protocol: telnet`) выполняет `telnet` из shell
+  промежуточного хоста и тоже требует двойного gating.
+- `console` profile требует заданный `port`, использует Telnet-драйвер и не
+  поддерживает `connect_command`.
+
+Hardware-проверка Telnet/console на реальном устройстве не выполнялась.
+
 ## Непроверенное
 
 - Interactive confirmations на Junos/Huawei.
 - Anonymized transcripts для platform-specific pager/prompt patterns.
 - `raw_input`.
-- Nested Telnet, console ports и Telnet.
+- Telnet (прямой и nested) и console на реальном оборудовании — только
+  unit-тесты; hardware-проверка не выполнялась.
 - BDCOM, EcoSGE, Eltex и PON adapters.
-- Per-device legacy algorithm override и DSA-only SSH.
+- DSA-only SSH.
+- Per-device legacy algorithm override на реальной лабораторной цели (логика
+  покрыта unit-тестами через `disabled_algorithms`).

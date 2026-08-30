@@ -61,3 +61,34 @@ def test_unknown_driver_rejected() -> None:
     registry = PlatformRegistry(ConnectionsConfig())
     with pytest.raises(TransportError, match="unsupported platform"):
         registry.resolve("not-a-driver")
+
+
+def test_telnet_driver_derived_from_the_stock_driver() -> None:
+    registry = PlatformRegistry(ConnectionsConfig())
+    assert registry.resolve("cisco_ios").telnet_driver == "cisco_ios_telnet"
+
+
+def test_telnet_driver_explicit_override_wins() -> None:
+    registry = PlatformRegistry(
+        ConnectionsConfig.model_validate(
+            {
+                "platforms": {
+                    "snr_29xx": {"driver": "cisco_ios", "telnet_driver": "huawei_telnet"}
+                }
+            }
+        )
+    )
+    assert registry.resolve("snr_29xx").telnet_driver == "huawei_telnet"
+
+
+def test_telnet_driver_is_none_when_no_telnet_class_exists() -> None:
+    registry = PlatformRegistry(
+        ConnectionsConfig.model_validate(
+            {
+                "platforms": {
+                    "snr_29xx": {"driver": "cisco_ios", "telnet_driver": "not-a-telnet-driver"}
+                }
+            }
+        )
+    )
+    assert registry.resolve("snr_29xx").telnet_driver is None

@@ -188,9 +188,22 @@ def _config(
     proxyjump: bool = False,
     jump_key: bool = False,
     nested: bool = False,
+    nested_telnet: bool = False,
+    telnet: bool = False,
+    allow_telnet: bool = False,
+    console: bool = False,
     **runtime: object,
 ) -> AppConfig:
-    connection_name = "through-jump" if proxyjump else "nested-term" if nested else "direct"
+    if proxyjump:
+        connection_name = "through-jump"
+    elif nested or nested_telnet:
+        connection_name = "nested-term"
+    elif console:
+        connection_name = "console"
+    elif telnet:
+        connection_name = "direct-telnet"
+    else:
+        connection_name = "direct"
     connections: dict[str, object] = {
         "direct": {"type": "direct", "protocol": "ssh"}
     }
@@ -216,31 +229,49 @@ def _config(
                 "username": "jump-operator",
             }
         )
-    if nested:
+    if nested or nested_telnet:
         connections["nested-term"] = {
             "type": "nested",
             "host": "192.0.2.254",
             "protocol": "ssh",
             "credentials": "intermediate",
-            "next_protocol": "ssh",
+            "next_protocol": "telnet" if nested_telnet else "ssh",
         }
         credentials["intermediate"] = {
             "backend": "pass",
             "entry": "network/intermediate",
             "username": "term-operator",
         }
+    if telnet:
+        connections["direct-telnet"] = {
+            "type": "direct",
+            "protocol": "telnet",
+            "host_key_policy": "strict",
+        }
+    if console:
+        connections["console"] = {
+            "type": "console",
+            "port": 2002,
+        }
+    inventory_devices = {
+        "sw1": {
+            "host": "192.0.2.1",
+            "platform": "snr_29xx",
+            "credentials": "net",
+            "connection": connection_name,
+        }
+    }
+    if allow_telnet:
+        inventory_devices["sw1"]["allow_telnet"] = True  # type: ignore[index]
+    policy_data: dict[str, object] = {
+        "rules": [{"id": "show", "action": "allow", "command_patterns": ["show *"]}],
+        "runtime": runtime,
+    }
+    if telnet or nested_telnet or console:
+        policy_data["defaults"] = {"telnet": "allow"}
     return AppConfig(
         inventory=InventoryConfig.model_validate(
-            {
-                "devices": {
-                    "sw1": {
-                        "host": "192.0.2.1",
-                        "platform": "snr_29xx",
-                        "credentials": "net",
-                        "connection": connection_name,
-                    }
-                }
-            }
+            {"devices": inventory_devices}
         ),
         connections=ConnectionsConfig.model_validate(
             {
@@ -259,12 +290,7 @@ def _config(
                 "credentials": credentials
             }
         ),
-        policy=PolicyConfig.model_validate(
-            {
-                "rules": [{"id": "show", "action": "allow", "command_patterns": ["show *"]}],
-                "runtime": runtime,
-            }
-        ),
+        policy=PolicyConfig.model_validate(policy_data),
         config_dir=Path("."),
     )
 
@@ -275,10 +301,19 @@ def _manager(
     clock: MutableClock | None = None,
     *,
     help_enter: bool = False,
+    allow_telnet: bool = False,
+    telnet: bool = False,
+    console: bool = False,
     **runtime: object,
 ) -> SessionManager:
     return SessionManager(
-        _config(help_enter=help_enter, **runtime),
+        _config(
+            help_enter=help_enter,
+            allow_telnet=allow_telnet,
+            telnet=telnet,
+            console=console,
+            **runtime,
+        ),
         connection_factory=lambda params: connection,
         credential_resolver=FakeCredentials(),
         audit_logger=audit,  # type: ignore[arg-type]
@@ -326,6 +361,7 @@ def _nested_manager(
     connection_error: Exception | None = None,
     host_keys: FakeHostKeys | None = None,
     clock: MutableClock | None = None,
+    nested_telnet: bool = False,
 ) -> tuple[SessionManager, FakeHostKeys, list[dict[str, object]], list[str]]:
     resolved_host_keys = host_keys or FakeHostKeys()
     params: list[dict[str, object]] = []
@@ -341,7 +377,7 @@ def _nested_manager(
         redispatched.append(device_type)
 
     manager = SessionManager(
-        _config(nested=True),
+        _config(nested=True, nested_telnet=nested_telnet, allow_telnet=True),
         connection_factory=factory,
         credential_resolver=FakeCredentials(),
         audit_logger=audit,  # type: ignore[arg-type]
@@ -533,7 +569,266 @@ def test_nested_login_sends_the_ssh_command_and_target_password() -> None:
     assert connection.read_timeouts == [60.0]
 
 
-def test_nested_checks_the_intermediate_host_key_before_connecting() -> None:
+def test_nested_telnet_login_sends_telnet_command_and_credentials() -> None:
+    connection = FakeConnection()
+    manager, _, _, _ = _nested_manager(connection, FakeAudit(), nested_telnet=True)
+
+    info = manager.open_session("sw1")
+
+    assert connection.writes == [
+        "telnet 192.0.2.1\n",
+        "operator\n",
+        "hunter2\n",
+    ]
+    assert connection.read_timeouts == [60.0, 60.0]
+    assert any(
+        "nested Telnet transmits credentials and traffic in cleartext"
+        for warning in info.warnings
+    )
+
+
+def test_direct_telnet_requires_allow_telnet_on_the_device() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit(), telnet=True, allow_telnet=False)
+
+    with pytest.raises(TransportError, match="allow_telnet"):
+        manager.open_session("sw1")
+    assert connection.disconnected is False
+
+
+def test_direct_telnet_requires_policy_allow() -> None:
+    connections = ConnectionsConfig.model_validate(
+        {
+            "connections": {
+                "direct-telnet": {"type": "direct", "protocol": "telnet"}
+            },
+            "platforms": {"snr_29xx": {"driver": "cisco_ios"}},
+        }
+    )
+    manager = SessionManager(
+        AppConfig(
+            inventory=InventoryConfig.model_validate(
+                {
+                    "devices": {
+                        "sw1": {
+                            "host": "192.0.2.1",
+                            "platform": "snr_29xx",
+                            "credentials": "net",
+                            "connection": "direct-telnet",
+                            "allow_telnet": True,
+                        }
+                    }
+                }
+            ),
+            connections=connections,
+            credentials=CredentialsConfig.model_validate(
+                {
+                    "credentials": {
+                        "net": {"backend": "pass", "entry": "network/net",
+                                 "username": "operator"},
+                    }
+                }
+            ),
+            policy=PolicyConfig.model_validate({}),
+            config_dir=Path("."),
+        ),
+        credential_resolver=FakeCredentials(),
+        audit_logger=FakeAudit(),  # type: ignore[arg-type]
+        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(TransportError, match="Telnet is denied"):
+        manager.open_session("sw1")
+
+
+def test_direct_telnet_uses_the_telnet_driver_without_host_key_check() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    host_keys = FakeHostKeys()
+    params: list[dict[str, object]] = []
+
+    def factory(connection_params: dict[str, object]) -> FakeConnection:
+        params.append(connection_params)
+        return connection
+
+    manager = SessionManager(
+        _config(telnet=True, allow_telnet=True),
+        connection_factory=factory,
+        credential_resolver=FakeCredentials(),
+        audit_logger=audit,  # type: ignore[arg-type]
+        host_keys=host_keys,  # type: ignore[arg-type]
+    )
+
+    info = manager.open_session("sw1")
+
+    assert params[0]["device_type"] == "cisco_ios_telnet"
+    assert params[0]["port"] == 23
+    assert params[0]["password"] == "hunter2"
+    assert "ssh_strict" not in params[0]
+    assert "alt_key_file" not in params[0]
+    assert "sock" not in params[0]
+    assert host_keys.calls == []
+    assert info.prompt == "switch#"
+    assert any("Telnet transmits credentials and traffic in cleartext"
+               for warning in info.warnings)
+    assert audit.records[0]["route"] == "telnet"
+
+    manager.close_session(info.session_id)
+    assert connection.disconnected is True
+
+
+def test_direct_telnet_uses_a_custom_port() -> None:
+    connection = FakeConnection()
+    params: list[dict[str, object]] = []
+
+    def factory(connection_params: dict[str, object]) -> FakeConnection:
+        params.append(connection_params)
+        return connection
+
+    connections = ConnectionsConfig.model_validate(
+        {
+            "connections": {
+                "direct-telnet": {"type": "direct", "protocol": "telnet", "port": 2002}
+            },
+            "platforms": {"snr_29xx": {"driver": "cisco_ios"}},
+        }
+    )
+    manager = SessionManager(
+        AppConfig(
+            inventory=InventoryConfig.model_validate(
+                {
+                    "devices": {
+                        "sw1": {
+                            "host": "192.0.2.1",
+                            "platform": "snr_29xx",
+                            "credentials": "net",
+                            "connection": "direct-telnet",
+                            "allow_telnet": True,
+                        }
+                    }
+                }
+            ),
+            connections=connections,
+            credentials=CredentialsConfig.model_validate(
+                {
+                    "credentials": {
+                        "net": {"backend": "pass", "entry": "network/net",
+                                 "username": "operator"},
+                    }
+                }
+            ),
+            policy=PolicyConfig.model_validate({"defaults": {"telnet": "allow"}}),
+            config_dir=Path("."),
+        ),
+        connection_factory=factory,
+        credential_resolver=FakeCredentials(),
+        audit_logger=FakeAudit(),  # type: ignore[arg-type]
+        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
+    )
+
+    manager.open_session("sw1")
+
+    assert params[0]["port"] == 2002
+
+
+def test_console_requires_allow_telnet_and_uses_the_telnet_driver() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    params: list[dict[str, object]] = []
+
+    def factory(connection_params: dict[str, object]) -> FakeConnection:
+        params.append(connection_params)
+        return connection
+
+    manager = SessionManager(
+        _config(console=True, allow_telnet=True),
+        connection_factory=factory,
+        credential_resolver=FakeCredentials(),
+        audit_logger=audit,  # type: ignore[arg-type]
+        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
+    )
+
+    info = manager.open_session("sw1")
+
+    assert params[0]["device_type"] == "cisco_ios_telnet"
+    assert params[0]["port"] == 2002
+    assert "ssh_strict" not in params[0]
+    assert any("console access transmits credentials and traffic in cleartext"
+               for warning in info.warnings)
+    assert audit.records[0]["route"] == "console"
+
+
+def test_console_requires_allow_telnet_on_the_device() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit(), console=True, allow_telnet=False)
+
+    with pytest.raises(TransportError, match="allow_telnet"):
+        manager.open_session("sw1")
+
+
+def test_legacy_direct_applies_disabled_algorithms_from_the_allowlist() -> None:
+    connection = FakeConnection()
+    params: list[dict[str, object]] = []
+
+    def factory(connection_params: dict[str, object]) -> FakeConnection:
+        params.append(connection_params)
+        return connection
+
+    connections = ConnectionsConfig.model_validate(
+        {
+            "connections": {
+                "legacy": {
+                    "type": "direct",
+                    "protocol": "legacy_ssh",
+                    "host_key_algorithms": ["ssh-rsa"],
+                    "kex_algorithms": ["diffie-hellman-group1-sha1"],
+                    "ciphers": ["aes128-cbc"],
+                }
+            },
+            "platforms": {"snr_29xx": {"driver": "cisco_ios"}},
+        }
+    )
+    manager = SessionManager(
+        AppConfig(
+            inventory=InventoryConfig.model_validate(
+                {
+                    "devices": {
+                        "sw1": {
+                            "host": "192.0.2.1",
+                            "platform": "snr_29xx",
+                            "credentials": "net",
+                            "connection": "legacy",
+                        }
+                    }
+                }
+            ),
+            connections=connections,
+            credentials=CredentialsConfig.model_validate(
+                {
+                    "credentials": {
+                        "net": {"backend": "pass", "entry": "network/net",
+                                 "username": "operator"},
+                    }
+                }
+            ),
+            policy=PolicyConfig.model_validate({}),
+            config_dir=Path("."),
+        ),
+        connection_factory=factory,
+        credential_resolver=FakeCredentials(),
+        audit_logger=FakeAudit(),  # type: ignore[arg-type]
+        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
+    )
+
+    info = manager.open_session("sw1")
+
+    disabled = params[0]["disabled_algorithms"]
+    assert isinstance(disabled, dict)
+    assert "ssh-rsa" not in disabled["keys"]
+    assert "diffie-hellman-group1-sha1" not in disabled["kex"]
+    assert "aes128-cbc" not in disabled["ciphers"]
+    assert any("explicit legacy algorithm overrides in use" for warning in info.warnings)
+    assert any("legacy SSH profile in use" for warning in info.warnings)
     connection = FakeConnection()
     host_keys = FakeHostKeys()
     manager, host_keys, _, _ = _nested_manager(
@@ -588,7 +883,7 @@ def test_nested_session_expires_and_disconnects() -> None:
     assert connection.disconnected is True
 
 
-def test_nested_telnet_is_rejected_without_connecting() -> None:
+def test_nested_telnet_requires_allow_telnet_on_the_device() -> None:
     connections = ConnectionsConfig.model_validate(
         {
             "connections": {
@@ -639,7 +934,63 @@ def test_nested_telnet_is_rejected_without_connecting() -> None:
         host_keys=FakeHostKeys(),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(TransportError, match="nested Telnet is not implemented"):
+    with pytest.raises(TransportError, match="allow_telnet"):
+        manager.open_session("sw1")
+
+
+def test_nested_telnet_requires_policy_allow_even_with_allow_telnet() -> None:
+    connections = ConnectionsConfig.model_validate(
+        {
+            "connections": {
+                "nested-term": {
+                    "type": "nested",
+                    "host": "192.0.2.254",
+                    "protocol": "ssh",
+                    "credentials": "intermediate",
+                    "next_protocol": "telnet",
+                }
+            },
+            "platforms": {
+                "snr_29xx": {"driver": "cisco_ios", "dialect": "snr_29xx"}
+            },
+        }
+    )
+    manager = SessionManager(
+        AppConfig(
+            inventory=InventoryConfig.model_validate(
+                {
+                    "devices": {
+                        "sw1": {
+                            "host": "192.0.2.1",
+                            "platform": "snr_29xx",
+                            "credentials": "net",
+                            "connection": "nested-term",
+                            "allow_telnet": True,
+                        }
+                    }
+                }
+            ),
+            connections=connections,
+            credentials=CredentialsConfig.model_validate(
+                {
+                    "credentials": {
+                        "net": {"backend": "pass", "entry": "network/net",
+                                 "username": "operator"},
+                        "intermediate": {"backend": "pass",
+                                         "entry": "network/intermediate",
+                                         "username": "term-operator"},
+                    }
+                }
+            ),
+            policy=PolicyConfig.model_validate({}),
+            config_dir=Path("."),
+        ),
+        credential_resolver=FakeCredentials(),
+        audit_logger=FakeAudit(),  # type: ignore[arg-type]
+        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(TransportError, match="Telnet is denied"):
         manager.open_session("sw1")
 
 

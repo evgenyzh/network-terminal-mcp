@@ -36,6 +36,20 @@ connections:
     kex_algorithms: [diffie-hellman-group14-sha1]
     ciphers: [aes128-cbc]
 
+  # Cleartext-only. Requires allow_telnet: true on the device and a policy that
+  # allows Telnet. host_key checking does not apply.
+  direct-telnet:
+    type: direct
+    protocol: telnet
+    host_key_policy: strict
+    port: 23
+
+  # TCP console port of a terminal server; requires allow_telnet and policy
+  # allow. connect_command is deliberately unsupported.
+  console:
+    type: console
+    port: 2002
+
 platforms:
   snr_29xx:
     driver: cisco_ios
@@ -49,3 +63,5 @@ platforms:
     driver: dlink_ds
     dialect: dlink_ds
     cli_help_requires_enter: true
+    # Optional Telnet driver override; defaults to <driver>_telnet.
+    telnet_driver: dlink_ds_telnet

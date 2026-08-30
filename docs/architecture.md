@@ -36,20 +36,21 @@ platform registry
   +-- local BDCOM/EcoSGE/PON adapters (planned)
 ```
 
-Реализованы direct SSH, один configured SSH-only ProxyJump hop и один
-configured SSH-only Nested hop (`generic_termserver` + `redispatch`). TCP
-console, Nested Telnet и OpenSSH PTY fallback остаются отдельными transport
-backends следующих этапов.
+Реализованы direct SSH, один configured SSH-only ProxyJump hop, один configured
+Nested hop (SSH или Telnet через `generic_termserver` + `redispatch`), прямой
+Telnet и TCP console profiles. OpenSSH PTY fallback и local adapters остаются
+отдельными transport backends следующих этапов.
 
 ## MCP-инструменты Этапов 1-2
 
 ### `open_session`
 
-Открывает direct, configured one-hop ProxyJump или configured one-hop Nested
-SSH-соединение и возвращает непрозрачный `session_id`, platform, dialect,
-prompt и transport warnings. Перед соединением ключ проверяется через локальный
-`known_hosts`; у ProxyJump отдельно проверяются ключи bastion и final target, у
-Nested — ключ intermediate host.
+Открывает direct, configured one-hop ProxyJump, configured one-hop Nested,
+Telnet или console-соединение и возвращает непрозрачный `session_id`, platform,
+dialect, prompt и transport warnings. Перед соединением SSH-ключ проверяется
+через локальный `known_hosts`; у ProxyJump отдельно проверяются ключи bastion и
+final target, у Nested — ключ intermediate host. Telnet/console не проверяют
+host key.
 
 Цель задается именем из инвентаря или одноразовым описанием `host`, `platform`,
 `credentials`, `connection`, `port`. Одноразовая цель не содержит пароль и
@@ -171,13 +172,19 @@ BDCOM делится как минимум на `bdcom_huawei_like` и `bdcom_ci
 ## Транспортные маршруты
 
 - `direct` SSH: реализован; `legacy_ssh` использует Paramiko/Netmiko.
+  Per-profile allowlists (`host_key_algorithms`/`kex_algorithms`/`ciphers`)
+  становятся Paramiko `disabled_algorithms` и не ослабляют host key checking.
 - `proxyjump`: один configured SSH hop реализован через Paramiko `direct-tcpip`
   channel и Netmiko `sock`; arbitrary `ProxyCommand` не поддерживается.
-- `nested`: один configured SSH hop реализован через `generic_termserver` +
-  `redispatch`; `next_protocol` SSH-only. Inner SSH выполняется SSH-клиентом
-  промежуточного хоста, поэтому host key final target проверяет именно он.
-- `direct` Telnet: запланирован, пока отвергается явно.
-- `console`: запланирован.
+- `nested`: один configured hop реализован через `generic_termserver` +
+  `redispatch`; `next_protocol` поддерживает `ssh` и `telnet`. Inner SSH
+  выполняется SSH-клиентом промежуточного хоста, поэтому host key final target
+  проверяет именно он; inner Telnet host key не проверяет.
+- `direct` Telnet: реализован с двойным gating
+  (`allow_telnet` на устройстве и `defaults.telnet: allow`), использует
+  `telnet_driver` платформы, host key не проверяется.
+- `console`: реализован как TCP console port терминального сервера через
+  Telnet-драйвер; требует заданный `port` и тот же gating.
 
 Маршруты состоят только из заранее определенных connection profiles. Модель не
 может передать произвольную shell-команду перехода.

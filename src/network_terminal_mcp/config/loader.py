@@ -24,6 +24,7 @@ from network_terminal_mcp.config.models import (
     ConnectionsConfig,
     CredentialsConfig,
     InventoryConfig,
+    NestedConnection,
     PolicyConfig,
     ProxyJumpConnection,
 )
@@ -86,6 +87,14 @@ class AppConfig:
                 raise ConfigError(
                     f"connection {name!r} references unknown jump credential profile "
                     f"{profile.jump_credentials!r}"
+                )
+            if (
+                isinstance(profile, NestedConnection)
+                and profile.credentials not in self.credentials.credentials
+            ):
+                raise ConfigError(
+                    f"connection {name!r} references unknown intermediate credential "
+                    f"profile {profile.credentials!r}"
                 )
 
     def to_summary(self) -> str:

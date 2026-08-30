@@ -15,7 +15,6 @@
 ## Терминальные серверы
 
 - Какие переходы поддерживают `ssh -W`/ProxyJump.
-- Где используется вложенная команда `ssh` или `telnet`.
 - Какие устройства доступны через TCP console ports.
 - Требуют ли terminal servers menu/banner interaction до shell.
 

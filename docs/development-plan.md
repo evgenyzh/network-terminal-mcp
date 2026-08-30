@@ -95,10 +95,14 @@ terminal-server целей.
 
 ## Этап 4. Legacy SSH и Telnet
 
-Наблюдение Этапа 1: проверенный Cisco IOS использует только
-`diffie-hellman-group1-sha1`, `ssh-rsa`, `3des-cbc` и `hmac-sha1`. Paramiko 4.0
-поддержал их без отдельного oldssh. Per-profile algorithm overrides и Telnet
-по-прежнему не реализованы.
+Статус: реализован. Per-profile legacy SSH algorithm overrides применяются как
+allowlist через Paramiko `disabled_algorithms` только к перечисленным
+категориям. Прямой Telnet и `console` profiles поддерживают только явный
+двойной gating (`allow_telnet: true` + `defaults.telnet: allow`), Telnet-драйвер
+платформы задаётся через `telnet_driver` (по умолчанию `<driver>_telnet`).
+Nested Telnet выполняется через `telnet` из shell промежуточного хоста.
+Telnet и console проверены unit-тестами; hardware-проверка Telnet на реальной
+цели не выполнялась.
 
 - Реализовать host-scoped SSH algorithm profiles.
 - Проверить `ssh-rsa`, SHA1 KEX и CBC на лабораторной цели.

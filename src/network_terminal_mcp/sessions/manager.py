@@ -20,6 +20,7 @@ from network_terminal_mcp.config.loader import AppConfig
 from network_terminal_mcp.config.models import (
     Action,
     ConnectionProfile,
+    ConsoleConnection,
     CredentialProfile,
     DirectConnection,
     NestedConnection,
@@ -92,6 +93,14 @@ _CONFIRMATION_END = re.compile(
 )
 _SECRET_END = re.compile(r"(?:password|passphrase|secret)\s*:\s*\Z", re.IGNORECASE)
 
+# Full algorithm sets Paramiko can offer; per-profile allowlists become the
+# complement via ``disabled_algorithms`` so legacy overrides are never global.
+_PARAMIKO_ALGORITHMS: dict[str, list[str]] = {
+    "keys": sorted(paramiko.Transport._preferred_keys),  # type: ignore[attr-defined]
+    "kex": sorted(paramiko.Transport._preferred_kex),  # type: ignore[attr-defined]
+    "ciphers": sorted(paramiko.Transport._preferred_ciphers),  # type: ignore[attr-defined]
+}
+
 
 @dataclass(frozen=True)
 class _PendingResponse:
@@ -125,6 +134,27 @@ def _netmiko_connection_factory(params: dict[str, object]) -> TerminalConnection
 
 def _netmiko_nested_redispatch(connection: TerminalConnection, device_type: str) -> None:
     redispatch(cast(Any, connection), device_type, session_prep=True)
+
+
+def _disabled_algorithms(profile: DirectConnection) -> dict[str, list[str]] | None:
+    """Convert per-profile allowlists into Paramiko ``disabled_algorithms``.
+
+    Only categories explicitly listed in the profile are restricted; the
+    remaining categories keep Paramiko's default algorithm set. Returns None
+    when the profile does not restrict anything.
+    """
+    allowlists: dict[str, list[str] | None] = {
+        "keys": profile.host_key_algorithms,
+        "kex": profile.kex_algorithms,
+        "ciphers": profile.ciphers,
+    }
+    disabled: dict[str, list[str]] = {}
+    for category, allowlist in allowlists.items():
+        if allowlist is None:
+            continue
+        full = _PARAMIKO_ALGORITHMS[category]
+        disabled[category] = [name for name in full if name not in allowlist]
+    return disabled or None
 
 
 @dataclass
@@ -186,7 +216,7 @@ class SessionManager:
         self._cleanup_expired()
         target = self._targets.resolve(name=name, **ad_hoc)
         platform = self._platforms.resolve(target.platform)
-        profile = self._ssh_profile(target)
+        profile = self._transport_profile(target)
         credentials = self._resolve_credentials(target.credentials)
         intermediate_credentials = (
             self._resolve_credentials(profile.credentials)
@@ -221,7 +251,17 @@ class SessionManager:
         redactor = Redactor(passwords)
         port = target.port or profile.port or 22
         if isinstance(profile, NestedConnection):
-            port = target.port or profile.next_port or 22
+            if profile.next_protocol == "telnet":
+                port = target.port or profile.next_port or 23
+            else:
+                port = target.port or profile.next_port or 22
+        if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
+            port = target.port or profile.port or 23
+        if isinstance(profile, ConsoleConnection):
+            console_port = target.port or profile.port
+            if console_port is None:
+                raise TransportError("console connection requires a port")
+            port = console_port
         warnings = self._transport_warnings(profile)
         route = self._route_details(profile)
 
@@ -275,8 +315,25 @@ class SessionManager:
                 connection = self._connection_factory(
                     self._nested_connection_params(profile, intermediate_credentials)
                 )
-                self._nested_login(connection, target, credentials, port)
+                if profile.next_protocol == "telnet":
+                    self._nested_telnet_login(connection, target, credentials, port)
+                else:
+                    self._nested_login(connection, target, credentials, port)
                 self._nested_redispatch(connection, platform.driver)
+                host_key = None
+                sock = None
+            elif isinstance(profile, DirectConnection) and profile.protocol == "telnet":
+                self._require_telnet_allowed(target)
+                connection = self._connection_factory(
+                    self._telnet_connection_params(target, platform, credentials, port)
+                )
+                host_key = None
+                sock = None
+            elif isinstance(profile, ConsoleConnection):
+                self._require_telnet_allowed(target)
+                connection = self._connection_factory(
+                    self._telnet_connection_params(target, platform, credentials, port)
+                )
                 host_key = None
                 sock = None
             else:
@@ -291,7 +348,9 @@ class SessionManager:
                 warnings.extend(self._host_key_warnings(host_key))
             if connection is None:
                 connection = self._connection_factory(
-                    self._connection_params(target, platform, credentials, port, sock=sock)
+                    self._connection_params(
+                        target, platform, credentials, port, sock=sock, profile=profile
+                    )
                 )
             prompt = connection.find_prompt()
         except Exception as exc:
@@ -981,21 +1040,19 @@ class SessionManager:
             **details,
         )
 
-    def _ssh_profile(
+    def _transport_profile(
         self, target: Target
-    ) -> DirectConnection | ProxyJumpConnection | NestedConnection:
+    ) -> DirectConnection | ProxyJumpConnection | NestedConnection | ConsoleConnection:
         profile = self._config.connections.connections[target.connection]
         if not isinstance(
-            profile, (DirectConnection, ProxyJumpConnection, NestedConnection)
+            profile, (DirectConnection, ProxyJumpConnection, NestedConnection, ConsoleConnection)
         ):
             raise TransportError(
                 f"connection profile {target.connection!r} is {profile.type!r}; "
-                "only direct, proxyjump and nested SSH are implemented in this phase"
+                "only direct, proxyjump, nested and console profiles are supported"
             )
-        if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
-            raise TransportError("Telnet is not implemented in this phase")
         if isinstance(profile, NestedConnection) and profile.next_protocol == "telnet":
-            raise TransportError("nested Telnet is not implemented in this phase")
+            self._require_telnet_allowed(target)
         return profile
 
     def _resolve_credentials(self, name: str) -> Credentials:
@@ -1078,6 +1135,7 @@ class SessionManager:
         port: int,
         *,
         sock: object | None = None,
+        profile: ConnectionProfile | None = None,
     ) -> dict[str, object]:
         timeout = float(self._config.policy.runtime.command_timeout)
         params: dict[str, object] = {
@@ -1094,6 +1152,10 @@ class SessionManager:
             "alt_host_keys": True,
             "alt_key_file": str(self._host_keys.path),
         }
+        if isinstance(profile, DirectConnection):
+            disabled = _disabled_algorithms(profile)
+            if disabled is not None:
+                params["disabled_algorithms"] = disabled
         if credentials.key_file is not None:
             params["use_keys"] = True
             params["key_file"] = credentials.key_file
@@ -1106,6 +1168,38 @@ class SessionManager:
         if sock is not None:
             params["sock"] = sock
         return params
+
+    def _telnet_connection_params(
+        self, target: Target, platform: Platform, credentials: Credentials, port: int
+    ) -> dict[str, object]:
+        if platform.telnet_driver is None:
+            raise TransportError(
+                f"platform {platform.name!r} has no Telnet driver; "
+                "set telnet_driver in connections.yml"
+            )
+        if credentials.password is None:
+            raise TransportError("Telnet target credential has no password")
+        timeout = float(self._config.policy.runtime.command_timeout)
+        return {
+            "device_type": platform.telnet_driver,
+            "host": target.host,
+            "port": port,
+            "username": credentials.username,
+            "password": credentials.password,
+            "conn_timeout": timeout,
+            "banner_timeout": timeout,
+            "auth_timeout": timeout,
+            "fast_cli": False,
+        }
+
+    def _require_telnet_allowed(self, target: Target) -> None:
+        if not target.allow_telnet:
+            raise TransportError(
+                f"Telnet is not enabled for target {target.name!r}; "
+                "set allow_telnet: true on the device"
+            )
+        if self._config.policy.defaults.telnet == "deny":
+            raise TransportError("Telnet is denied by policy defaults")
 
     def _nested_connection_params(
         self, profile: NestedConnection, credentials: Credentials
@@ -1157,6 +1251,28 @@ class SessionManager:
             raise TransportError("nested target credential has no password")
         connection.write_channel(credentials.password + "\n")
 
+    def _nested_telnet_login(
+        self,
+        connection: TerminalConnection,
+        target: Target,
+        credentials: Credentials,
+        next_port: int,
+    ) -> None:
+        """Reach the final target from the intermediate shell with a telnet command."""
+        timeout = float(self._config.policy.runtime.command_timeout)
+        command = f"telnet {target.host}"
+        if next_port != 23:
+            command += f" {next_port}"
+        connection.write_channel(command + "\n")
+        connection.read_until_pattern(
+            r"(?:[Ll]ogin:|[Uu]sername:|[Pp]assword\s*:)", read_timeout=timeout
+        )
+        if credentials.password is None:
+            raise TransportError("nested Telnet target credential has no password")
+        connection.write_channel(credentials.username + "\n")
+        connection.read_until_pattern(r"[Pp]assword\s*:", read_timeout=timeout)
+        connection.write_channel(credentials.password + "\n")
+
     @staticmethod
     def _transport_warnings(profile: ConnectionProfile) -> list[str]:
         warnings: list[str] = []
@@ -1165,9 +1281,16 @@ class SessionManager:
         if isinstance(profile, DirectConnection) and (
             profile.host_key_algorithms or profile.kex_algorithms or profile.ciphers
         ):
-            warnings.append("explicit legacy algorithm overrides are not implemented yet")
+            warnings.append("explicit legacy algorithm overrides in use")
+        if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
+            warnings.append("Telnet transmits credentials and traffic in cleartext")
         if isinstance(profile, NestedConnection):
-            warnings.append("nested SSH uses the intermediate host's SSH client")
+            if profile.next_protocol == "telnet":
+                warnings.append("nested Telnet transmits credentials and traffic in cleartext")
+            else:
+                warnings.append("nested SSH uses the intermediate host's SSH client")
+        if isinstance(profile, ConsoleConnection):
+            warnings.append("console access transmits credentials and traffic in cleartext")
         return warnings
 
     @staticmethod
@@ -1184,6 +1307,10 @@ class SessionManager:
                 "intermediate_host": profile.host,
                 "intermediate_port": profile.port or 22,
             }
+        if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
+            return {"route": "telnet"}
+        if isinstance(profile, ConsoleConnection):
+            return {"route": "console"}
         return {"route": "direct"}
 
     @staticmethod

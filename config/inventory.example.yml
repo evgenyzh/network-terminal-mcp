@@ -14,6 +14,16 @@ devices:
     connection: through-terminal
     tags: [lab, snr, access]
 
+  # Telnet is only reachable with an explicit opt-in on the device in addition
+  # to a policy that allows Telnet.
+  lab-cisco-telnet:
+    host: 192.0.2.30
+    platform: cisco_ios
+    credentials: network-tacacs
+    connection: direct-telnet
+    allow_telnet: true
+    tags: [lab, cisco, telnet]
+
 groups:
   lab:
     tags: [lab]

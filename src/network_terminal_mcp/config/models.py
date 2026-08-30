@@ -90,6 +90,16 @@ class ConsoleConnection(StrictModel):
     connect_command: str | None = None
     port: int | None = None
 
+    @model_validator(mode="after")
+    def _validate_console(self) -> ConsoleConnection:
+        if self.connect_command is not None:
+            raise ValueError(
+                "console connect_command is not supported; use a TCP console port"
+            )
+        if self.port is None:
+            raise ValueError("console connection requires a port")
+        return self
+
 
 ConnectionProfile = Annotated[
     DirectConnection | ProxyJumpConnection | NestedConnection | ConsoleConnection,
@@ -101,6 +111,7 @@ class PlatformAlias(StrictModel):
     driver: str
     dialect: str | None = None
     cli_help_requires_enter: bool = False
+    telnet_driver: str | None = None
 
 
 class ConnectionsConfig(StrictModel):

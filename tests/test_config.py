@@ -78,6 +78,25 @@ def test_connection_rejects_unknown_type() -> None:
         )
 
 
+def test_console_connection_requires_a_port_and_rejects_connect_command() -> None:
+    config = ConnectionsConfig.model_validate(
+        {"connections": {"console": {"type": "console", "port": 2002}}}
+    )
+    assert config.connections["console"].port == 2002  # type: ignore[attr-defined]
+
+    with pytest.raises(ValidationError, match="requires a port"):
+        ConnectionsConfig.model_validate({"connections": {"console": {"type": "console"}}})
+
+    with pytest.raises(ValidationError, match="not supported"):
+        ConnectionsConfig.model_validate(
+            {
+                "connections": {
+                    "console": {"type": "console", "port": 2002, "connect_command": "picocom"}
+                }
+            }
+        )
+
+
 def test_proxyjump_connection_requires_ssh_and_defaults_to_strict_keys() -> None:
     config = ConnectionsConfig.model_validate(
         {
@@ -304,6 +323,45 @@ def test_reference_validation_catches_missing_jump_credentials(config_dir: Path)
     )
 
     with pytest.raises(ConfigError, match="unknown jump credential profile"):
+        load_config(config_dir)
+
+
+def test_reference_validation_catches_missing_nested_credentials(config_dir: Path) -> None:
+    _write(
+        config_dir,
+        "inventory.yml",
+        {
+            "devices": {
+                "sw1": {
+                    "host": "192.0.2.1",
+                    "platform": "cisco_ios",
+                    "credentials": "net",
+                    "connection": "nested-term",
+                }
+            }
+        },
+    )
+    _write(
+        config_dir,
+        "connections.yml",
+        {
+            "connections": {
+                "nested-term": {
+                    "type": "nested",
+                    "host": "192.0.2.254",
+                    "credentials": "missing-intermediate",
+                    "next_protocol": "ssh",
+                }
+            }
+        },
+    )
+    _write(
+        config_dir,
+        "credentials.yml",
+        {"credentials": {"net": {"backend": "pass", "entry": "n/c", "username": "operator"}}},
+    )
+
+    with pytest.raises(ConfigError, match="unknown intermediate credential profile"):
         load_config(config_dir)
 
 

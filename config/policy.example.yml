@@ -4,6 +4,8 @@ defaults:
   unknown_exec_command: ask
   config_mode: ask
   raw_input: deny
+  # Global Telnet switch: keep deny unless Telnet/console access is required,
+  # and even then only for devices with allow_telnet: true.
   telnet: deny
 
 rules:

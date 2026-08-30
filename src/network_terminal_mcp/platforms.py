@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from netmiko.ssh_dispatcher import CLASS_MAPPER
+
 from network_terminal_mcp.config.models import ConnectionsConfig
 from network_terminal_mcp.errors import TransportError
 
@@ -20,6 +22,11 @@ _STOCK_DRIVERS = frozenset(
     }
 )
 
+# Netmiko names Telnet drivers as ``<driver>_telnet`` for most platforms, but a
+# few stock drivers use a different Telnet class name. Kept local to the
+# platform registry so the mapping stays explicit.
+_TELNET_DRIVER_SUFFIX = "_telnet"
+
 
 @dataclass(frozen=True)
 class Platform:
@@ -29,6 +36,7 @@ class Platform:
     driver: str
     dialect: str
     cli_help_requires_enter: bool = False
+    telnet_driver: str | None = None
 
 
 class PlatformRegistry:
@@ -58,4 +66,16 @@ class PlatformRegistry:
             cli_help_requires_enter=(
                 bool(alias.cli_help_requires_enter) if alias is not None else False
             ),
+            telnet_driver=self._resolve_telnet_driver(alias, driver),
         )
+
+    @staticmethod
+    def _resolve_telnet_driver(alias: object, driver: str) -> str | None:
+        explicit = getattr(alias, "telnet_driver", None)
+        if explicit is not None:
+            candidate = str(explicit)
+        else:
+            candidate = f"{driver}{_TELNET_DRIVER_SUFFIX}"
+        if candidate not in CLASS_MAPPER:
+            return None
+        return candidate
