@@ -49,9 +49,11 @@ Read-only проверки через `MCPServer.call_tool` на реально�
 | Huawei VRP | работает | работает | `session_preparation` отключает pager; help возвращает `prompt + display `, Ctrl-C + Ctrl-U очищают строку |
 | Juniper Junos | работает | работает | `session_preparation` отключает pager; help возвращает `prompt + show ` с backspace bytes, Ctrl-C + Ctrl-U очищают строку |
 
-На SNR old проверен flow `cli_help -> space -> q -> run_command` в одной
-сессии. На Junos/Huawei проверен `cli_help -> run_command` в одной сессии после
-silent Ctrl-C/Ctrl-U cleanup. Если help-pager не возвращает распознанный prompt,
+На SNR old проверены flows `cli_help -> space -> q -> run_command`,
+`show interface -> space -> q -> show version` и естественное завершение
+`show interface` после 29 страниц с последующим `show version` в одной сессии.
+На Junos/Huawei проверен `cli_help -> run_command` в одной сессии после silent
+Ctrl-C/Ctrl-U cleanup. Если help-pager не возвращает распознанный prompt,
 сессия всё ещё безопасно переводится в `failed`.
 
 Netmiko `session_preparation` отключает pager на проверенных Junos и Huawei,
@@ -72,7 +74,6 @@ cleanup даже при ошибке чтения.
 
 - Полный MCP stdio round-trip с клиентом OpenCode.
 - Interactive confirmations на Junos/Huawei.
-- Continuation большого обычного command pager на реальном устройстве.
 - Anonymized transcripts для platform-specific pager/prompt patterns.
 - `raw_input`.
 - ProxyJump, nested SSH/Telnet, console ports и Telnet.
