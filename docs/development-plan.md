@@ -81,12 +81,12 @@ platform-specific pager/prompt patterns.
 ProxyJump hop работает через Paramiko `direct-tcpip` и Netmiko `sock`, с
 независимыми host-key checks и cleanup обоих hops. Поддерживаются password и
 explicit `ssh_key` (включая encrypted key c passphrase из `pass`) credential
-profiles. Hardware validation пройдена на согласованной паре jump host +
-SNR old target.
+profiles. Nested SSH реализован через `generic_termserver` + `redispatch` и
+проверен на реальной паре intermediate host + SNR old target. Hardware
+validation пройдена через OpenCode MCP для обоих маршрутов.
 
 - Не добавлять literal `ProxyCommand`; произвольный shell process небезопасен
   для password-backed local profiles.
-- Добавить nested SSH через `generic_termserver` и `redispatch`.
 - Добавить console profiles и вложенный Telnet.
 - Проверить очистку сессий при ошибках на любом hop.
 

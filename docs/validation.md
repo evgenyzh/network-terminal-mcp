@@ -92,11 +92,21 @@ jump host key после TOFU enrollment проверяется в `strict`, tar
 `accept_changed` из-за rotating keys. В репозиторий записаны только обезличенные
 выводы и hostkey не входят.
 
+## Nested SSH validation
+
+Проверен реальный маршрут local -> intermediate host (password profile) -> SNR
+old target. Intermediate host — Linux shell; из его shell выполняется `ssh` до
+final target с credentials целевого устройства, затем `redispatch` на
+`cisco_ios`. Flow `open_session -> show version -> close_session` выполнен в
+одной session; intermediate host key проверяется в `strict`. Inner SSH
+использует SSH-клиент промежуточного хоста, поэтому host key final target
+проверяется им, а не локальным store.
+
 ## Непроверенное
 
 - Interactive confirmations на Junos/Huawei.
 - Anonymized transcripts для platform-specific pager/prompt patterns.
 - `raw_input`.
-- Nested SSH/Telnet, console ports и Telnet.
+- Nested Telnet, console ports и Telnet.
 - BDCOM, EcoSGE, Eltex и PON adapters.
 - Per-device legacy algorithm override и DSA-only SSH.

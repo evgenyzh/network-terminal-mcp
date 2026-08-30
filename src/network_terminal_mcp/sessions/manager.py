@@ -9,17 +9,20 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal, Protocol, TypedDict, cast
+from typing import Any, Literal, Protocol, TypedDict, cast
 
 import paramiko
 from netmiko import ConnectHandler
+from netmiko.ssh_dispatcher import redispatch
 
 from network_terminal_mcp.audit import AuditLogger
 from network_terminal_mcp.config.loader import AppConfig
 from network_terminal_mcp.config.models import (
     Action,
+    ConnectionProfile,
     CredentialProfile,
     DirectConnection,
+    NestedConnection,
     ProxyJumpConnection,
 )
 from network_terminal_mcp.credentials.pass_backend import Credentials, PassBackend
@@ -72,6 +75,7 @@ class CredentialResolver(Protocol):
 
 
 ConnectionFactory = Callable[[dict[str, object]], TerminalConnection]
+NestedRedispatch = Callable[[TerminalConnection, str], None]
 Clock = Callable[[], float]
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -119,6 +123,10 @@ def _netmiko_connection_factory(params: dict[str, object]) -> TerminalConnection
     return cast(TerminalConnection, ConnectHandler(**params))
 
 
+def _netmiko_nested_redispatch(connection: TerminalConnection, device_type: str) -> None:
+    redispatch(cast(Any, connection), device_type, session_prep=True)
+
+
 @dataclass
 class _ManagedSession:
     session_id: str
@@ -156,6 +164,7 @@ class SessionManager:
         audit_logger: AuditLogger | None = None,
         host_keys: HostKeyStore | None = None,
         jump_client_factory: Callable[[], paramiko.SSHClient] = paramiko.SSHClient,
+        nested_redispatch: NestedRedispatch = _netmiko_nested_redispatch,
         clock: Clock = time.monotonic,
     ) -> None:
         self._config = config
@@ -167,6 +176,7 @@ class SessionManager:
         self._audit = audit_logger or AuditLogger(config.policy.runtime.audit_file)
         self._host_keys = host_keys or HostKeyStore(config.policy.runtime.known_hosts_file)
         self._jump_client_factory = jump_client_factory
+        self._nested_redispatch = nested_redispatch
         self._clock = clock
         self._sessions: dict[str, _ManagedSession] = {}
         self._lock = threading.RLock()
@@ -178,6 +188,11 @@ class SessionManager:
         platform = self._platforms.resolve(target.platform)
         profile = self._ssh_profile(target)
         credentials = self._resolve_credentials(target.credentials)
+        intermediate_credentials = (
+            self._resolve_credentials(profile.credentials)
+            if isinstance(profile, NestedConnection)
+            else None
+        )
         jump_credentials = (
             self._resolve_credentials(profile.jump_credentials)
             if isinstance(profile, ProxyJumpConnection)
@@ -188,6 +203,15 @@ class SessionManager:
             for secret in (credentials.password, credentials.key_passphrase)
             if secret is not None
         ]
+        if intermediate_credentials is not None:
+            passwords.extend(
+                secret
+                for secret in (
+                    intermediate_credentials.password,
+                    intermediate_credentials.key_passphrase,
+                )
+                if secret is not None
+            )
         if jump_credentials is not None:
             passwords.extend(
                 secret
@@ -196,6 +220,8 @@ class SessionManager:
             )
         redactor = Redactor(passwords)
         port = target.port or profile.port or 22
+        if isinstance(profile, NestedConnection):
+            port = target.port or profile.next_port or 22
         warnings = self._transport_warnings(profile)
         route = self._route_details(profile)
 
@@ -234,6 +260,25 @@ class SessionManager:
                     ),
                 )
                 sock = self._open_jump_channel(jump_client, target.host, port)
+            elif isinstance(profile, NestedConnection):
+                assert intermediate_credentials is not None
+                intermediate_host_key = self._host_keys.ensure(
+                    profile.host,
+                    port=profile.port or 22,
+                    policy=profile.host_key_policy,
+                    timeout=timeout,
+                )
+                warnings.extend(
+                    f"intermediate host: {warning}"
+                    for warning in self._host_key_warnings(intermediate_host_key)
+                )
+                connection = self._connection_factory(
+                    self._nested_connection_params(profile, intermediate_credentials)
+                )
+                self._nested_login(connection, target, credentials, port)
+                self._nested_redispatch(connection, platform.driver)
+                host_key = None
+                sock = None
             else:
                 host_key = self._host_keys.ensure(
                     target.host,
@@ -242,10 +287,12 @@ class SessionManager:
                     timeout=timeout,
                 )
                 sock = None
-            warnings.extend(self._host_key_warnings(host_key))
-            connection = self._connection_factory(
-                self._connection_params(target, platform, credentials, port, sock=sock)
-            )
+            if host_key is not None:
+                warnings.extend(self._host_key_warnings(host_key))
+            if connection is None:
+                connection = self._connection_factory(
+                    self._connection_params(target, platform, credentials, port, sock=sock)
+                )
             prompt = connection.find_prompt()
         except Exception as exc:
             try:
@@ -934,15 +981,21 @@ class SessionManager:
             **details,
         )
 
-    def _ssh_profile(self, target: Target) -> DirectConnection | ProxyJumpConnection:
+    def _ssh_profile(
+        self, target: Target
+    ) -> DirectConnection | ProxyJumpConnection | NestedConnection:
         profile = self._config.connections.connections[target.connection]
-        if not isinstance(profile, (DirectConnection, ProxyJumpConnection)):
+        if not isinstance(
+            profile, (DirectConnection, ProxyJumpConnection, NestedConnection)
+        ):
             raise TransportError(
                 f"connection profile {target.connection!r} is {profile.type!r}; "
-                "only direct and proxyjump SSH are implemented in this phase"
+                "only direct, proxyjump and nested SSH are implemented in this phase"
             )
         if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
             raise TransportError("Telnet is not implemented in this phase")
+        if isinstance(profile, NestedConnection) and profile.next_protocol == "telnet":
+            raise TransportError("nested Telnet is not implemented in this phase")
         return profile
 
     def _resolve_credentials(self, name: str) -> Credentials:
@@ -1054,8 +1107,58 @@ class SessionManager:
             params["sock"] = sock
         return params
 
+    def _nested_connection_params(
+        self, profile: NestedConnection, credentials: Credentials
+    ) -> dict[str, object]:
+        timeout = float(self._config.policy.runtime.command_timeout)
+        params: dict[str, object] = {
+            "device_type": "generic_termserver",
+            "host": profile.host,
+            "port": profile.port or 22,
+            "username": credentials.username,
+            "conn_timeout": timeout,
+            "banner_timeout": timeout,
+            "auth_timeout": timeout,
+            "fast_cli": False,
+            "ssh_strict": True,
+            "system_host_keys": False,
+            "alt_host_keys": True,
+            "alt_key_file": str(self._host_keys.path),
+        }
+        if credentials.key_file is not None:
+            params["use_keys"] = True
+            params["key_file"] = credentials.key_file
+            if credentials.key_passphrase is not None:
+                params["passphrase"] = credentials.key_passphrase
+        elif credentials.password is not None:
+            params["password"] = credentials.password
+        else:
+            raise TransportError("nested intermediate credential has no password or SSH key")
+        return params
+
+    def _nested_login(
+        self,
+        connection: TerminalConnection,
+        target: Target,
+        credentials: Credentials,
+        next_port: int,
+    ) -> None:
+        """Reach the final target from the intermediate shell with an ssh command."""
+        timeout = float(self._config.policy.runtime.command_timeout)
+        command = (
+            f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+            f"{credentials.username}@{target.host}"
+        )
+        if next_port != 22:
+            command += f" -p {next_port}"
+        connection.write_channel(command + "\n")
+        connection.read_until_pattern(r"[Pp]assword\s*:", read_timeout=timeout)
+        if credentials.password is None:
+            raise TransportError("nested target credential has no password")
+        connection.write_channel(credentials.password + "\n")
+
     @staticmethod
-    def _transport_warnings(profile: DirectConnection | ProxyJumpConnection) -> list[str]:
+    def _transport_warnings(profile: ConnectionProfile) -> list[str]:
         warnings: list[str] = []
         if isinstance(profile, DirectConnection) and profile.protocol == "legacy_ssh":
             warnings.append("legacy SSH profile in use")
@@ -1063,15 +1166,23 @@ class SessionManager:
             profile.host_key_algorithms or profile.kex_algorithms or profile.ciphers
         ):
             warnings.append("explicit legacy algorithm overrides are not implemented yet")
+        if isinstance(profile, NestedConnection):
+            warnings.append("nested SSH uses the intermediate host's SSH client")
         return warnings
 
     @staticmethod
-    def _route_details(profile: DirectConnection | ProxyJumpConnection) -> dict[str, object]:
+    def _route_details(profile: ConnectionProfile) -> dict[str, object]:
         if isinstance(profile, ProxyJumpConnection):
             return {
                 "route": "proxyjump",
                 "jump_host": profile.jump_host,
                 "jump_port": profile.jump_port,
+            }
+        if isinstance(profile, NestedConnection):
+            return {
+                "route": "nested",
+                "intermediate_host": profile.host,
+                "intermediate_port": profile.port or 22,
             }
         return {"route": "direct"}
 

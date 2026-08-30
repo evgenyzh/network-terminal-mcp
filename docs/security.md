@@ -119,6 +119,19 @@ host keys не используются. Key-based profile допускает т
 SSH forwarding; запрет forwarding на bastion, ошибка проверки key или target
 login закрывают весь маршрут fail-closed.
 
+## Nested SSH
+
+Nested profile подключается к intermediate host через `generic_termserver`,
+затем из его shell выполняет `ssh` до final target и `redispatch` на платформу
+цели. Host key intermediate host проверяется локальным `known_hosts_file` с
+политикой `host_key_policy` профиля. Inner SSH выполняется SSH-клиентом
+intermediate host: host key final target проверяется именно им, а не локальным
+store, поэтому nested маршрут по умолчанию доверяет SSH-конфигурации
+промежуточного хоста. Username final target передается в команду `ssh`;
+password final target читается из `pass` и добавляется в redaction. Shell
+`ssh` без параметров, raw command от модели и произвольный hop не
+поддерживаются.
+
 ## Telnet
 
 Telnet разрешается только явно и только для конкретных targets/profiles.

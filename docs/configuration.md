@@ -66,6 +66,7 @@ connections:
     protocol: ssh
     credentials: terminal-tacacs
     next_protocol: ssh
+    host_key_policy: strict
 
   old-switch:
     type: direct
@@ -75,17 +76,24 @@ connections:
     ciphers: [aes128-cbc]
 ```
 
-Поддерживаются `direct` с protocol `ssh` или `legacy_ssh` и один SSH-only
-`proxyjump` hop. ProxyJump аутентифицируется на `jump_host`, открывает
-`direct-tcpip` channel к final target и передаёт его Netmiko как socket.
-`jump_port` относится к bastion; final target использует `Device.port` или
-ad-hoc `port`, затем fallback profile `port`, затем 22.
+Поддерживаются `direct` с protocol `ssh` или `legacy_ssh`, один SSH-only
+`proxyjump` hop и один SSH-only `nested` hop. ProxyJump аутентифицируется на
+`jump_host`, открывает `direct-tcpip` channel к final target и передаёт его
+Netmiko как socket. `jump_port` относится к bastion; final target использует
+`Device.port` или ad-hoc `port`, затем fallback profile `port`, затем 22.
+
+Nested подключается к `host` через `generic_termserver`, затем из shell
+промежуточного хоста выполняет `ssh` до final target с credentials целевого
+устройства и переключает драйвер `redispatch` на платформу цели. Inner SSH
+использует SSH-клиент промежуточного хоста: host key цели проверяется им, а не
+локальным `known_hosts_file`.
 
 Ключи jump host и final target проверяются раздельно в одном dedicated
 `known_hosts_file`: `jump_host_key_policy` относится к bastion, а
-`host_key_policy` — к final target. Literal `ProxyCommand`, несколько hops,
-`nested`, `console` и Telnet не поддерживаются. Сложные nested-профили в
-дальнейшем будут описываться массивом typed hops, а не shell-строкой.
+`host_key_policy` — к final target (для `nested` — к intermediate host).
+Literal `ProxyCommand`, несколько hops, `console` и Telnet не поддерживаются.
+Сложные nested-профили в дальнейшем будут описываться массивом typed hops, а не
+shell-строкой.
 
 `legacy_ssh` сейчас передается Paramiko/Netmiko. Явные списки KEX/ciphers/key
 types сохраняются в профиле для будущего per-device override, но еще не меняют

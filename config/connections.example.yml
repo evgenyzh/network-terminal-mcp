@@ -27,6 +27,7 @@ connections:
     protocol: ssh
     credentials: terminal-tacacs
     next_protocol: ssh
+    host_key_policy: strict
 
   legacy-direct:
     type: direct

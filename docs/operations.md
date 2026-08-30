@@ -2,13 +2,21 @@
 
 ## Границы текущей версии
 
-Сервер поддерживает постоянные direct SSH-сессии и один configured SSH-only
-ProxyJump hop. Он не поддерживает terminal server, nested SSH/Telnet, console
-ports, Telnet, `raw_input` или запись конфигурации.
+Сервер поддерживает постоянные direct SSH-сессии, один configured SSH-only
+ProxyJump hop и один configured SSH-only Nested hop. Он не поддерживает
+terminal server, Nested Telnet, console ports, Telnet, `raw_input` или запись
+конфигурации.
 
 Для ProxyJump нужны локальные connection и credential profiles для final target
 и bastion. Обе host key проверяются независимо; bastion должен разрешать
 `direct-tcpip` forwarding. При ошибке любого hop обе SSH-сессии закрываются.
+
+Для Nested нужны локальные connection и credential profiles для intermediate
+host и final target. Сервер подключается к intermediate host через
+`generic_termserver`, выполняет из его shell `ssh` до final target и
+`redispatch` на платформу цели. Host key intermediate host проверяется локально;
+inner SSH использует SSH-клиент intermediate host, поэтому host key final target
+проверяется им. При ошибке connection закрывается.
 
 Реализованные MCP tools:
 

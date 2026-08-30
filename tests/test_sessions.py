@@ -129,7 +129,12 @@ class FakeCredentials:
     def resolve(self, profile: CredentialProfile) -> Credentials:
         if profile.backend == "ssh_key":
             return Credentials(username=profile.username, key_file=str(profile.key_file))
-        password = "jump-secret" if profile.username == "jump-operator" else "hunter2"
+        if profile.username == "term-operator":
+            password = "intermediate-secret"
+        elif profile.username == "jump-operator":
+            password = "jump-secret"
+        else:
+            password = "hunter2"
         return Credentials(username=profile.username, password=password)
 
 
@@ -182,9 +187,10 @@ def _config(
     help_enter: bool = False,
     proxyjump: bool = False,
     jump_key: bool = False,
+    nested: bool = False,
     **runtime: object,
 ) -> AppConfig:
-    connection_name = "through-jump" if proxyjump else "direct"
+    connection_name = "through-jump" if proxyjump else "nested-term" if nested else "direct"
     connections: dict[str, object] = {
         "direct": {"type": "direct", "protocol": "ssh"}
     }
@@ -210,6 +216,19 @@ def _config(
                 "username": "jump-operator",
             }
         )
+    if nested:
+        connections["nested-term"] = {
+            "type": "nested",
+            "host": "192.0.2.254",
+            "protocol": "ssh",
+            "credentials": "intermediate",
+            "next_protocol": "ssh",
+        }
+        credentials["intermediate"] = {
+            "backend": "pass",
+            "entry": "network/intermediate",
+            "username": "term-operator",
+        }
     return AppConfig(
         inventory=InventoryConfig.model_validate(
             {
@@ -297,6 +316,40 @@ def _proxy_manager(
         clock=clock or MutableClock(),
     )
     return manager, resolved_host_keys, params
+
+
+def _nested_manager(
+    connection: FakeConnection,
+    audit: FakeAudit,
+    *,
+    redispatch_device_types: list[str] | None = None,
+    connection_error: Exception | None = None,
+    host_keys: FakeHostKeys | None = None,
+    clock: MutableClock | None = None,
+) -> tuple[SessionManager, FakeHostKeys, list[dict[str, object]], list[str]]:
+    resolved_host_keys = host_keys or FakeHostKeys()
+    params: list[dict[str, object]] = []
+    redispatched = redispatch_device_types if redispatch_device_types is not None else []
+
+    def factory(connection_params: dict[str, object]) -> FakeConnection:
+        params.append(connection_params)
+        if connection_error is not None:
+            raise connection_error
+        return connection
+
+    def fake_redispatch(conn: object, device_type: str) -> None:
+        redispatched.append(device_type)
+
+    manager = SessionManager(
+        _config(nested=True),
+        connection_factory=factory,
+        credential_resolver=FakeCredentials(),
+        audit_logger=audit,  # type: ignore[arg-type]
+        host_keys=resolved_host_keys,  # type: ignore[arg-type]
+        nested_redispatch=fake_redispatch,  # type: ignore[arg-type]
+        clock=clock or MutableClock(),
+    )
+    return manager, resolved_host_keys, params, redispatched
 
 
 def test_open_session_resolves_alias_and_uses_factory() -> None:
@@ -442,6 +495,152 @@ def test_proxyjump_closes_the_jump_client_when_a_session_expires() -> None:
 
     assert connection.disconnected is True
     assert jump_client.closed is True
+
+
+def test_nested_connects_to_the_intermediate_host_and_redispatches() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager, host_keys, params, redispatched = _nested_manager(connection, audit)
+
+    info = manager.open_session("sw1")
+
+    assert host_keys.calls == [("192.0.2.254", 22, "strict", False)]
+    assert params[0]["device_type"] == "generic_termserver"
+    assert params[0]["host"] == "192.0.2.254"
+    assert params[0]["username"] == "term-operator"
+    assert params[0]["password"] == "intermediate-secret"
+    assert "sock" not in params[0]
+    assert redispatched == ["cisco_ios"]
+    assert info.prompt == "switch#"
+    assert audit.records[0]["route"] == "nested"
+    assert any(w == "nested SSH uses the intermediate host's SSH client"
+               for w in info.warnings)
+
+    manager.close_session(info.session_id)
+    assert connection.disconnected is True
+
+
+def test_nested_login_sends_the_ssh_command_and_target_password() -> None:
+    connection = FakeConnection()
+    manager, _, _, _ = _nested_manager(connection, FakeAudit())
+
+    manager.open_session("sw1")
+
+    assert connection.writes == [
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null operator@192.0.2.1\n",
+        "hunter2\n",
+    ]
+    assert connection.read_timeouts == [60.0]
+
+
+def test_nested_checks_the_intermediate_host_key_before_connecting() -> None:
+    connection = FakeConnection()
+    host_keys = FakeHostKeys()
+    manager, host_keys, _, _ = _nested_manager(
+        connection, FakeAudit(), host_keys=host_keys
+    )
+
+    manager.open_session("sw1")
+
+    assert host_keys.calls == [("192.0.2.254", 22, "strict", False)]
+
+
+def test_nested_disconnects_the_connection_when_target_login_fails() -> None:
+    connection = FakeConnection()
+    connection.read_error = RuntimeError("intermediate login failed with intermediate-secret")
+    manager, _, _, _ = _nested_manager(connection, FakeAudit())
+
+    with pytest.raises(TransportError, match="intermediate login failed") as error:
+        manager.open_session("sw1")
+
+    assert "intermediate-secret" not in str(error.value)
+    assert connection.disconnected is True
+
+
+def test_nested_redacts_target_password_when_factory_fails() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager, _, _, _ = _nested_manager(
+        connection,
+        audit,
+        connection_error=RuntimeError("target login failed with hunter2"),
+    )
+
+    with pytest.raises(TransportError, match="target login failed") as error:
+        manager.open_session("sw1")
+
+    assert "hunter2" not in str(error.value)
+    assert connection.disconnected is False
+
+
+def test_nested_session_expires_and_disconnects() -> None:
+    connection = FakeConnection()
+    clock = MutableClock()
+    manager, _, _, _ = _nested_manager(
+        connection, FakeAudit(), clock=clock
+    )
+    info = manager.open_session("sw1")
+
+    clock.value = 301
+    with pytest.raises(SessionError, match="unknown or expired session"):
+        manager.session_status(info.session_id)
+
+    assert connection.disconnected is True
+
+
+def test_nested_telnet_is_rejected_without_connecting() -> None:
+    connections = ConnectionsConfig.model_validate(
+        {
+            "connections": {
+                "nested-term": {
+                    "type": "nested",
+                    "host": "192.0.2.254",
+                    "protocol": "ssh",
+                    "credentials": "intermediate",
+                    "next_protocol": "telnet",
+                }
+            },
+            "platforms": {
+                "snr_29xx": {"driver": "cisco_ios", "dialect": "snr_29xx"}
+            },
+        }
+    )
+    manager = SessionManager(
+        AppConfig(
+            inventory=InventoryConfig.model_validate(
+                {
+                    "devices": {
+                        "sw1": {
+                            "host": "192.0.2.1",
+                            "platform": "snr_29xx",
+                            "credentials": "net",
+                            "connection": "nested-term",
+                        }
+                    }
+                }
+            ),
+            connections=connections,
+            credentials=CredentialsConfig.model_validate(
+                {
+                    "credentials": {
+                        "net": {"backend": "pass", "entry": "network/net",
+                                 "username": "operator"},
+                        "intermediate": {"backend": "pass",
+                                         "entry": "network/intermediate",
+                                         "username": "term-operator"},
+                    }
+                }
+            ),
+            policy=PolicyConfig.model_validate({}),
+            config_dir=Path("."),
+        ),
+        credential_resolver=FakeCredentials(),
+        audit_logger=FakeAudit(),  # type: ignore[arg-type]
+        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(TransportError, match="nested Telnet is not implemented"):
+        manager.open_session("sw1")
 
 
 def test_allowed_command_is_executed_and_audited() -> None:

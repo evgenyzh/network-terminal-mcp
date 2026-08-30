@@ -112,6 +112,43 @@ def test_proxyjump_connection_requires_ssh_and_defaults_to_strict_keys() -> None
         )
 
 
+def test_nested_connection_defaults_and_rejects_unsupported_protocols() -> None:
+    config = ConnectionsConfig.model_validate(
+        {
+            "connections": {
+                "nested": {
+                    "type": "nested",
+                    "host": "term.example.net",
+                    "protocol": "ssh",
+                    "credentials": "intermediate",
+                    "next_protocol": "ssh",
+                }
+            }
+        }
+    )
+
+    profile = config.connections["nested"]
+    assert profile.protocol == "ssh"  # type: ignore[attr-defined]
+    assert profile.next_protocol == "ssh"  # type: ignore[attr-defined]
+    assert profile.host_key_policy == "strict"  # type: ignore[attr-defined]
+    assert profile.port is None  # type: ignore[attr-defined]
+
+    telnet_config = ConnectionsConfig.model_validate(
+        {
+            "connections": {
+                "nested": {
+                    "type": "nested",
+                    "host": "term.example.net",
+                    "protocol": "ssh",
+                    "credentials": "intermediate",
+                    "next_protocol": "telnet",
+                }
+            }
+        }
+    )
+    assert telnet_config.connections["nested"].next_protocol == "telnet"
+
+
 def test_credential_profile_requires_entry_and_username() -> None:
     profile = CredentialProfile.model_validate(
         {"backend": "pass", "entry": "a/b", "username": "operator"}

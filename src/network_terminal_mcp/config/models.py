@@ -80,6 +80,7 @@ class NestedConnection(StrictModel):
     protocol: Protocol = "ssh"
     credentials: str
     next_protocol: Literal["ssh", "telnet"] = "ssh"
+    host_key_policy: HostKeyPolicy = "strict"
     port: int | None = None
     next_port: int | None = None
 
