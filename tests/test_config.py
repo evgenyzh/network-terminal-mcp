@@ -78,6 +78,40 @@ def test_connection_rejects_unknown_type() -> None:
         )
 
 
+def test_proxyjump_connection_requires_ssh_and_defaults_to_strict_keys() -> None:
+    config = ConnectionsConfig.model_validate(
+        {
+            "connections": {
+                "jump": {
+                    "type": "proxyjump",
+                    "jump_host": "jump.example.net",
+                    "jump_credentials": "terminal",
+                }
+            }
+        }
+    )
+
+    profile = config.connections["jump"]
+    assert profile.protocol == "ssh"
+    assert profile.jump_port == 22  # type: ignore[attr-defined]
+    assert profile.host_key_policy == "strict"  # type: ignore[attr-defined]
+    assert profile.jump_host_key_policy == "strict"  # type: ignore[attr-defined]
+
+    with pytest.raises(ValidationError):
+        ConnectionsConfig.model_validate(
+            {
+                "connections": {
+                    "jump": {
+                        "type": "proxyjump",
+                        "protocol": "telnet",
+                        "jump_host": "jump.example.net",
+                        "jump_credentials": "terminal",
+                    }
+                }
+            }
+        )
+
+
 def test_credential_profile_requires_entry_and_username() -> None:
     profile = CredentialProfile.model_validate(
         {"backend": "pass", "entry": "a/b", "username": "operator"}
@@ -86,6 +120,26 @@ def test_credential_profile_requires_entry_and_username() -> None:
     assert profile.username == "operator"
     with pytest.raises(ValidationError):
         CredentialProfile.model_validate({"backend": "pass"})
+
+    key = CredentialProfile.model_validate(
+        {"backend": "ssh_key", "key_file": "~/.ssh/id_ed25519", "username": "operator"}
+    )
+    assert key.key_file == Path("~/.ssh/id_ed25519").expanduser()
+
+    with pytest.raises(ValidationError):
+        CredentialProfile.model_validate(
+            {"backend": "ssh_key", "entry": "not-allowed", "username": "operator"}
+        )
+
+    with pytest.raises(ValidationError):
+        CredentialProfile.model_validate(
+            {
+                "backend": "pass",
+                "entry": "network/password",
+                "key_passphrase_entry": "not-allowed",
+                "username": "operator",
+            }
+        )
 
 
 def test_runtime_expands_user_home() -> None:
@@ -175,6 +229,44 @@ def test_reference_validation_catches_missing_profiles(config_dir: Path) -> None
         },
     )
     with pytest.raises(ConfigError, match="unknown credential profile"):
+        load_config(config_dir)
+
+
+def test_reference_validation_catches_missing_jump_credentials(config_dir: Path) -> None:
+    _write(
+        config_dir,
+        "inventory.yml",
+        {
+            "devices": {
+                "sw1": {
+                    "host": "192.0.2.1",
+                    "platform": "cisco_ios",
+                    "credentials": "net",
+                    "connection": "jump",
+                }
+            }
+        },
+    )
+    _write(
+        config_dir,
+        "connections.yml",
+        {
+            "connections": {
+                "jump": {
+                    "type": "proxyjump",
+                    "jump_host": "192.0.2.254",
+                    "jump_credentials": "missing-jump",
+                }
+            }
+        },
+    )
+    _write(
+        config_dir,
+        "credentials.yml",
+        {"credentials": {"net": {"backend": "pass", "entry": "n/c", "username": "operator"}}},
+    )
+
+    with pytest.raises(ConfigError, match="unknown jump credential profile"):
         load_config(config_dir)
 
 

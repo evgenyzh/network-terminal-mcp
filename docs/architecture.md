@@ -28,6 +28,7 @@ MCP tools
   v
 connection backend (implemented)
   +-- Netmiko direct SSH
+   +-- Paramiko one-hop proxyjump -> Netmiko target session
   |
   v
 platform registry
@@ -35,16 +36,18 @@ platform registry
   +-- local BDCOM/EcoSGE/PON adapters (planned)
 ```
 
-Реализован только direct SSH. ProxyJump, nested SSH/Telnet, TCP console и
-OpenSSH PTY fallback остаются отдельными transport backends следующих этапов.
+Реализованы direct SSH и один configured SSH-only ProxyJump hop. Nested
+SSH/Telnet, TCP console и OpenSSH PTY fallback остаются отдельными transport
+backends следующих этапов.
 
 ## MCP-инструменты Этапов 1-2
 
 ### `open_session`
 
-Открывает direct SSH-соединение и возвращает непрозрачный `session_id`,
-platform, dialect, prompt и transport warnings. Перед соединением ключ
-проверяется через локальный `known_hosts`.
+Открывает direct или configured one-hop ProxyJump SSH-соединение и возвращает
+непрозрачный `session_id`, platform, dialect, prompt и transport warnings.
+Перед соединением ключ проверяется через локальный `known_hosts`; у ProxyJump
+отдельно проверяются ключи bastion и final target.
 
 Цель задается именем из инвентаря или одноразовым описанием `host`, `platform`,
 `credentials`, `connection`, `port`. Одноразовая цель не содержит пароль и
@@ -166,8 +169,9 @@ BDCOM делится как минимум на `bdcom_huawei_like` и `bdcom_ci
 ## Транспортные маршруты
 
 - `direct` SSH: реализован; `legacy_ssh` использует Paramiko/Netmiko.
+- `proxyjump`: один configured SSH hop реализован через Paramiko `direct-tcpip`
+  channel и Netmiko `sock`; arbitrary `ProxyCommand` не поддерживается.
 - `direct` Telnet: запланирован, пока отвергается явно.
-- `proxyjump`: запланирован.
 - `nested`: запланирован.
 - `console`: запланирован.
 

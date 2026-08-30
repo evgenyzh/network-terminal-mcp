@@ -106,6 +106,19 @@ Cisco, даже при локальных client options. Paramiko 4.0 подд�
 отдельный oldssh пока не нужен. DSA-only оборудование все еще потребует
 изолированного решения или Telnet и не входит в текущую реализацию.
 
+## ProxyJump
+
+Один SSH jump host задаётся только локальным connection profile. Сервер сначала
+проверяет и аутентифицирует bastion, затем открывает Paramiko `direct-tcpip`
+channel и проверяет key final target через этот channel. Password и host key
+policy у hop и final target независимы; оба password добавляются в redaction.
+
+Literal `ProxyCommand`, shell command, automatic agent/key discovery и system
+host keys не используются. Key-based profile допускает только явный локальный
+`key_file`; он не передается в MCP arguments. Поддерживаются только один hop и
+SSH forwarding; запрет forwarding на bastion, ошибка проверки key или target
+login закрывают весь маршрут fail-closed.
+
 ## Telnet
 
 Telnet разрешается только явно и только для конкретных targets/profiles.

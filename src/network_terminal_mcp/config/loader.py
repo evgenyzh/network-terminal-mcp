@@ -25,6 +25,7 @@ from network_terminal_mcp.config.models import (
     CredentialsConfig,
     InventoryConfig,
     PolicyConfig,
+    ProxyJumpConnection,
 )
 from network_terminal_mcp.errors import ConfigError
 
@@ -76,6 +77,15 @@ class AppConfig:
                 raise ConfigError(
                     f"device {name!r} references unknown connection profile "
                     f"{device.connection!r}"
+                )
+        for name, profile in self.connections.connections.items():
+            if (
+                isinstance(profile, ProxyJumpConnection)
+                and profile.jump_credentials not in self.credentials.credentials
+            ):
+                raise ConfigError(
+                    f"connection {name!r} references unknown jump credential profile "
+                    f"{profile.jump_credentials!r}"
                 )
 
     def to_summary(self) -> str:

@@ -45,21 +45,30 @@ def _known_host_name(host: str, port: int) -> str:
 def probe_host_key(host: str, port: int, timeout: float) -> PKey:
     """Perform an unauthenticated SSH handshake and return the public key."""
     sock: socket.socket | None = None
-    transport: paramiko.Transport | None = None
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
-        transport = paramiko.Transport(sock)
+        return probe_host_key_socket(sock, timeout)
+    except OSError as exc:
+        raise TransportError(f"cannot retrieve host key from {host}:{port}: {exc}") from exc
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def probe_host_key_socket(sock: object, timeout: float) -> PKey:
+    """Perform an SSH handshake over an already-connected socket-like object."""
+    transport: paramiko.Transport | None = None
+    try:
+        transport = paramiko.Transport(sock)  # type: ignore[arg-type]
         transport.banner_timeout = timeout
         transport.auth_timeout = timeout
         transport.start_client(timeout=timeout)
         return transport.get_remote_server_key()
     except (OSError, paramiko.SSHException) as exc:
-        raise TransportError(f"cannot retrieve host key from {host}:{port}: {exc}") from exc
+        raise TransportError(f"cannot retrieve host key: {exc}") from exc
     finally:
         if transport is not None:
             transport.close()
-        elif sock is not None:
-            sock.close()
 
 
 class HostKeyStore:
@@ -81,6 +90,7 @@ class HostKeyStore:
         port: int = 22,
         policy: str = "strict",
         timeout: float = 10.0,
+        probe: HostKeyProbe | None = None,
     ) -> HostKeyStatus:
         """Verify known host presence or explicitly add a TOFU key.
 
@@ -97,6 +107,7 @@ class HostKeyStore:
         if policy not in {"strict", "accept_new", "accept_changed"}:
             raise TransportError(f"unsupported host key policy {policy!r}")
         host_name = _known_host_name(host, port)
+        key_probe = probe or self._probe
         with self._lock:
             keys = self._load()
             known = keys.lookup(host_name)
@@ -111,7 +122,7 @@ class HostKeyStore:
                         enrolled=False,
                     )
                 if policy == "accept_changed":
-                    live_key = self._probe(host, port, timeout)
+                    live_key = key_probe(host, port, timeout)
                     live_fingerprint = fingerprint_sha256(live_key)
                     if key.asbytes() == live_key.asbytes():
                         return HostKeyStatus(
@@ -133,13 +144,20 @@ class HostKeyStore:
                         changed=True,
                         previous_fingerprint=previous,
                     )
+                return HostKeyStatus(
+                    host=host,
+                    port=port,
+                    algorithm=key_type,
+                    fingerprint=fingerprint_sha256(key),
+                    enrolled=False,
+                )
             if policy == "strict":
                 raise TransportError(
                     f"unknown host key for {host_name}; enroll it explicitly "
                     "with host_key_policy: accept_new"
                 )
 
-            key = self._probe(host, port, timeout)
+            key = key_probe(host, port, timeout)
             keys.add(host_name, key.get_name(), key)
             self._save(keys)
             return HostKeyStatus(

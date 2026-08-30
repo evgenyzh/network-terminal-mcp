@@ -77,7 +77,15 @@ platform-specific pager/prompt patterns.
 
 ## Этап 3. Маршруты доступа
 
-- Добавить ProxyJump/ProxyCommand.
+Статус: реализован и проверен на реальном bastion. Один configured SSH-only
+ProxyJump hop работает через Paramiko `direct-tcpip` и Netmiko `sock`, с
+независимыми host-key checks и cleanup обоих hops. Поддерживаются password и
+explicit `ssh_key` (включая encrypted key c passphrase из `pass`) credential
+profiles. Hardware validation пройдена на согласованной паре jump host +
+SNR old target.
+
+- Не добавлять literal `ProxyCommand`; произвольный shell process небезопасен
+  для password-backed local profiles.
 - Добавить nested SSH через `generic_termserver` и `redispatch`.
 - Добавить console profiles и вложенный Telnet.
 - Проверить очистку сессий при ошибках на любом hop.
@@ -114,10 +122,15 @@ suite и собственные transcript-тесты.
 
 ## Этап 6. Интеграция OpenCode
 
-- Добавить глобальную MCP-конфигурацию OpenCode.
-- Создать network skill с правилами диагностики и подтверждения изменений.
-- Настроить permissions: read-only tools доступны, опасные требуют `ask`.
-- Проверить перезапуск OpenCode и обнаружение MCP tools.
+Статус: выполнен для текущего global OpenCode profile. Local stdio MCP
+`network-terminal` зарегистрирован с рабочим каталогом проекта и timeout 65
+секунд. Global skill направляет диагностику только через MCP, требует inventory
+target, read-only command и закрытие session.
+
+`opencode mcp list` подтвердил подключение, а read-only round-trip
+`open_session -> run_command -> close_session` выполнен через OpenCode.
+Ограничения команд по-прежнему применяет policy самого MCP: `ask` не
+исполняется, `respond` не подтверждает policy.
 
 Критерий завершения: обычный запрос пользователя приводит к безопасной MCP-
 сессии, а не к `sshpass` или временному Python-скрипту.

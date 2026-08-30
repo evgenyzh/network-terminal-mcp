@@ -10,6 +10,7 @@ import pytest
 from network_terminal_mcp.config.loader import AppConfig
 from network_terminal_mcp.config.models import (
     ConnectionsConfig,
+    CredentialProfile,
     CredentialsConfig,
     InventoryConfig,
     PolicyConfig,
@@ -77,9 +78,59 @@ class FakeConnection:
         self.disconnected = True
 
 
+class FakeJumpTransport:
+    def __init__(self) -> None:
+        self.active = True
+        self.channels: list[tuple[str, tuple[str, int], tuple[str, int], float]] = []
+
+    def is_active(self) -> bool:
+        return self.active
+
+    def open_channel(
+        self,
+        kind: str,
+        destination: tuple[str, int],
+        source: tuple[str, int],
+        *,
+        timeout: float,
+    ) -> object:
+        self.channels.append((kind, destination, source, timeout))
+        return object()
+
+
+class FakeJumpClient:
+    def __init__(self) -> None:
+        self.transport = FakeJumpTransport()
+        self.loaded_host_keys: list[str] = []
+        self.missing_host_key_policy: object | None = None
+        self.connect_kwargs: dict[str, object] = {}
+        self.connect_error: Exception | None = None
+        self.closed = False
+
+    def load_host_keys(self, filename: str) -> None:
+        self.loaded_host_keys.append(filename)
+
+    def set_missing_host_key_policy(self, policy: object) -> None:
+        self.missing_host_key_policy = policy
+
+    def connect(self, hostname: str, **kwargs: object) -> None:
+        self.connect_kwargs = {"hostname": hostname, **kwargs}
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    def get_transport(self) -> FakeJumpTransport:
+        return self.transport
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeCredentials:
-    def resolve(self, profile: object) -> Credentials:
-        return Credentials(username="operator", password="hunter2")
+    def resolve(self, profile: CredentialProfile) -> Credentials:
+        if profile.backend == "ssh_key":
+            return Credentials(username=profile.username, key_file=str(profile.key_file))
+        password = "jump-secret" if profile.username == "jump-operator" else "hunter2"
+        return Credentials(username=profile.username, password=password)
 
 
 class FakeAudit:
@@ -93,9 +144,22 @@ class FakeAudit:
 class FakeHostKeys:
     path = Path("/tmp/known_hosts")
 
+    def __init__(self, *, invoke_probe: bool = False) -> None:
+        self.calls: list[tuple[str, int, str, bool]] = []
+        self.invoke_probe = invoke_probe
+
     def ensure(
-        self, host: str, *, port: int, policy: str, timeout: float
+        self,
+        host: str,
+        *,
+        port: int,
+        policy: str,
+        timeout: float,
+        probe: object | None = None,
     ) -> HostKeyStatus:
+        self.calls.append((host, port, policy, probe is not None))
+        if self.invoke_probe and probe is not None:
+            probe(host, port, timeout)  # type: ignore[operator]
         return HostKeyStatus(
             host=host,
             port=port,
@@ -113,7 +177,39 @@ class MutableClock:
         return self.value
 
 
-def _config(*, help_enter: bool = False, **runtime: object) -> AppConfig:
+def _config(
+    *,
+    help_enter: bool = False,
+    proxyjump: bool = False,
+    jump_key: bool = False,
+    **runtime: object,
+) -> AppConfig:
+    connection_name = "through-jump" if proxyjump else "direct"
+    connections: dict[str, object] = {
+        "direct": {"type": "direct", "protocol": "ssh"}
+    }
+    credentials: dict[str, object] = {
+        "net": {"backend": "pass", "entry": "network/net", "username": "operator"}
+    }
+    if proxyjump:
+        connections["through-jump"] = {
+            "type": "proxyjump",
+            "jump_host": "192.0.2.254",
+            "jump_credentials": "jump",
+        }
+        credentials["jump"] = (
+            {
+                "backend": "ssh_key",
+                "key_file": "/tmp/jump-key",
+                "username": "jump-operator",
+            }
+            if jump_key
+            else {
+                "backend": "pass",
+                "entry": "network/jump",
+                "username": "jump-operator",
+            }
+        )
     return AppConfig(
         inventory=InventoryConfig.model_validate(
             {
@@ -122,16 +218,14 @@ def _config(*, help_enter: bool = False, **runtime: object) -> AppConfig:
                         "host": "192.0.2.1",
                         "platform": "snr_29xx",
                         "credentials": "net",
-                        "connection": "direct",
+                        "connection": connection_name,
                     }
                 }
             }
         ),
         connections=ConnectionsConfig.model_validate(
             {
-                "connections": {
-                    "direct": {"type": "direct", "protocol": "ssh"}
-                },
+                "connections": connections,
                 "platforms": {
                     "snr_29xx": {
                         "driver": "cisco_ios",
@@ -143,9 +237,7 @@ def _config(*, help_enter: bool = False, **runtime: object) -> AppConfig:
         ),
         credentials=CredentialsConfig.model_validate(
             {
-                "credentials": {
-                    "net": {"backend": "pass", "entry": "network/net", "username": "operator"}
-                }
+                "credentials": credentials
             }
         ),
         policy=PolicyConfig.model_validate(
@@ -176,6 +268,37 @@ def _manager(
     )
 
 
+def _proxy_manager(
+    connection: FakeConnection,
+    jump_client: FakeJumpClient,
+    audit: FakeAudit,
+    *,
+    connection_error: Exception | None = None,
+    clock: MutableClock | None = None,
+    host_keys: FakeHostKeys | None = None,
+    jump_key: bool = False,
+) -> tuple[SessionManager, FakeHostKeys, list[dict[str, object]]]:
+    resolved_host_keys = host_keys or FakeHostKeys()
+    params: list[dict[str, object]] = []
+
+    def factory(connection_params: dict[str, object]) -> FakeConnection:
+        params.append(connection_params)
+        if connection_error is not None:
+            raise connection_error
+        return connection
+
+    manager = SessionManager(
+        _config(proxyjump=True, jump_key=jump_key),
+        connection_factory=factory,
+        credential_resolver=FakeCredentials(),
+        audit_logger=audit,  # type: ignore[arg-type]
+        host_keys=resolved_host_keys,  # type: ignore[arg-type]
+        jump_client_factory=lambda: jump_client,  # type: ignore[arg-type]
+        clock=clock or MutableClock(),
+    )
+    return manager, resolved_host_keys, params
+
+
 def test_open_session_resolves_alias_and_uses_factory() -> None:
     connection = FakeConnection()
     manager = _manager(connection, FakeAudit())
@@ -183,6 +306,142 @@ def test_open_session_resolves_alias_and_uses_factory() -> None:
     assert info.state is SessionState.READY
     assert info.dialect == "snr_29xx"
     assert info.prompt == "switch#"
+
+
+def test_proxyjump_uses_a_forwarded_socket_and_closes_the_jump_client() -> None:
+    connection = FakeConnection()
+    jump_client = FakeJumpClient()
+    audit = FakeAudit()
+    manager, host_keys, params = _proxy_manager(connection, jump_client, audit)
+
+    info = manager.open_session("sw1")
+
+    assert host_keys.calls == [
+        ("192.0.2.254", 22, "strict", False),
+        ("192.0.2.1", 22, "strict", True),
+    ]
+    assert jump_client.connect_kwargs == {
+        "hostname": "192.0.2.254",
+        "port": 22,
+        "username": "jump-operator",
+        "password": "jump-secret",
+        "timeout": 60.0,
+        "banner_timeout": 60.0,
+        "auth_timeout": 60.0,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    assert jump_client.transport.channels == [
+        ("direct-tcpip", ("192.0.2.1", 22), ("127.0.0.1", 0), 60.0)
+    ]
+    assert params[0]["host"] == "192.0.2.1"
+    assert "sock" in params[0]
+    assert audit.records[0]["route"] == "proxyjump"
+
+    manager.close_session(info.session_id)
+
+    assert connection.disconnected is True
+    assert jump_client.closed is True
+
+
+def test_proxyjump_uses_an_explicit_key_file_without_agent_discovery() -> None:
+    connection = FakeConnection()
+    jump_client = FakeJumpClient()
+    manager, _, _ = _proxy_manager(
+        connection,
+        jump_client,
+        FakeAudit(),
+        jump_key=True,
+    )
+
+    info = manager.open_session("sw1")
+
+    assert jump_client.connect_kwargs == {
+        "hostname": "192.0.2.254",
+        "port": 22,
+        "username": "jump-operator",
+        "key_filename": "/tmp/jump-key",
+        "passphrase": None,
+        "timeout": 60.0,
+        "banner_timeout": 60.0,
+        "auth_timeout": 60.0,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    manager.close_session(info.session_id)
+
+
+def test_proxyjump_probes_an_unenrolled_target_through_a_separate_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = FakeConnection()
+    jump_client = FakeJumpClient()
+    host_keys = FakeHostKeys(invoke_probe=True)
+    monkeypatch.setattr(
+        "network_terminal_mcp.sessions.manager.probe_host_key_socket",
+        lambda *_: object(),
+    )
+    manager, _, _ = _proxy_manager(
+        connection,
+        jump_client,
+        FakeAudit(),
+        host_keys=host_keys,
+    )
+
+    info = manager.open_session("sw1")
+
+    assert len(jump_client.transport.channels) == 2
+    manager.close_session(info.session_id)
+
+
+def test_proxyjump_closes_the_jump_client_when_target_connection_fails() -> None:
+    connection = FakeConnection()
+    jump_client = FakeJumpClient()
+    manager, _, _ = _proxy_manager(
+        connection,
+        jump_client,
+        FakeAudit(),
+        connection_error=RuntimeError("target login failed with hunter2 and jump-secret"),
+    )
+
+    with pytest.raises(TransportError, match="target login failed") as error:
+        manager.open_session("sw1")
+
+    assert "hunter2" not in str(error.value)
+    assert "jump-secret" not in str(error.value)
+    assert jump_client.closed is True
+
+
+def test_proxyjump_closes_the_jump_client_when_bastion_login_fails() -> None:
+    jump_client = FakeJumpClient()
+    jump_client.connect_error = RuntimeError("bastion login failed with jump-secret")
+    manager, _, _ = _proxy_manager(FakeConnection(), jump_client, FakeAudit())
+
+    with pytest.raises(TransportError, match="bastion login failed") as error:
+        manager.open_session("sw1")
+
+    assert "jump-secret" not in str(error.value)
+    assert jump_client.closed is True
+
+
+def test_proxyjump_closes_the_jump_client_when_a_session_expires() -> None:
+    connection = FakeConnection()
+    jump_client = FakeJumpClient()
+    clock = MutableClock()
+    manager, _, _ = _proxy_manager(
+        connection,
+        jump_client,
+        FakeAudit(),
+        clock=clock,
+    )
+    info = manager.open_session("sw1")
+
+    clock.value = 301
+    with pytest.raises(SessionError, match="unknown or expired session"):
+        manager.session_status(info.session_id)
+
+    assert connection.disconnected is True
+    assert jump_client.closed is True
 
 
 def test_allowed_command_is_executed_and_audited() -> None:

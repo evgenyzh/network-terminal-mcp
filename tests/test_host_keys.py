@@ -53,6 +53,49 @@ def test_accept_new_enrolls_and_strict_reuses_key(tmp_path: Path) -> None:
     assert calls == 1
 
 
+def test_accept_new_reuses_an_existing_key_without_probing(tmp_path: Path) -> None:
+    key = paramiko.RSAKey.generate(1024)
+    calls = 0
+
+    def probe(host: str, port: int, timeout: float) -> paramiko.PKey:
+        nonlocal calls
+        calls += 1
+        return key
+
+    store = HostKeyStore(tmp_path / "known_hosts", probe=probe)
+    enrolled = store.ensure("192.0.2.1", policy="accept_new")
+    reused = store.ensure("192.0.2.1", policy="accept_new")
+
+    assert enrolled.enrolled is True
+    assert reused.enrolled is False
+    assert reused.fingerprint == enrolled.fingerprint
+    assert calls == 1
+
+
+def test_per_call_probe_overrides_the_default_probe(tmp_path: Path) -> None:
+    default_key = paramiko.RSAKey.generate(1024)
+    forwarded_key = paramiko.RSAKey.generate(1024)
+    default_calls = 0
+    forwarded_calls = 0
+
+    def default_probe(host: str, port: int, timeout: float) -> paramiko.PKey:
+        nonlocal default_calls
+        default_calls += 1
+        return default_key
+
+    def forwarded_probe(host: str, port: int, timeout: float) -> paramiko.PKey:
+        nonlocal forwarded_calls
+        forwarded_calls += 1
+        return forwarded_key
+
+    store = HostKeyStore(tmp_path / "known_hosts", probe=default_probe)
+    status = store.ensure("192.0.2.1", policy="accept_new", probe=forwarded_probe)
+
+    assert status.fingerprint == fingerprint_sha256(forwarded_key)
+    assert default_calls == 0
+    assert forwarded_calls == 1
+
+
 def test_accept_changed_enrolls_unknown_host(tmp_path: Path) -> None:
     key = paramiko.RSAKey.generate(1024)
     store = HostKeyStore(tmp_path / "known_hosts", probe=lambda *_: key)

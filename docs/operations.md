@@ -1,10 +1,14 @@
-# Эксплуатация Этапов 1-2
+# Эксплуатация Этапов 1-3
 
 ## Границы текущей версии
 
-Сервер поддерживает постоянные direct SSH-сессии через Netmiko. Он не
-поддерживает ProxyJump, terminal server, nested SSH/Telnet, console ports,
-Telnet, `raw_input` или запись конфигурации.
+Сервер поддерживает постоянные direct SSH-сессии и один configured SSH-only
+ProxyJump hop. Он не поддерживает terminal server, nested SSH/Telnet, console
+ports, Telnet, `raw_input` или запись конфигурации.
+
+Для ProxyJump нужны локальные connection и credential profiles для final target
+и bastion. Обе host key проверяются независимо; bastion должен разрешать
+`direct-tcpip` forwarding. При ошибке любого hop обе SSH-сессии закрываются.
 
 Реализованные MCP tools:
 
@@ -145,5 +149,22 @@ uv run network-terminal-mcp
 ```
 
 Не запускать его вручную в обычном терминале для диагностики: stdout зарезервирован
-исключительно для MCP protocol. Интеграция с OpenCode еще не выполнена; она
-запланирована в Этапе 6.
+исключительно для MCP protocol. Для OpenCode server регистрируется как local
+MCP с абсолютным `cwd` проекта и timeout не меньше `runtime.command_timeout`:
+
+```json
+{
+  "mcp": {
+    "network-terminal": {
+      "type": "local",
+      "command": ["uv", "run", "network-terminal-mcp"],
+      "cwd": "/absolute/path/to/network-terminal-mcp",
+      "enabled": true,
+      "timeout": 65000
+    }
+  }
+}
+```
+
+После изменения global OpenCode config или skill перезапустите OpenCode:
+конфигурация и MCP tools загружаются только при старте.

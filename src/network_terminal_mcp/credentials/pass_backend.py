@@ -26,7 +26,9 @@ class Credentials:
     """Resolved credentials for one connection."""
 
     username: str
-    password: str
+    password: str | None = None
+    key_file: str | None = None
+    key_passphrase: str | None = None
 
 
 def require_pass_binary() -> str:
@@ -46,35 +48,49 @@ def parse_entry(content: str) -> str:
 
 
 class PassBackend:
-    """Retrieve credentials for a :class:`CredentialProfile` via ``pass``."""
+    """Resolve password-store and explicitly configured SSH key profiles."""
 
     def __init__(self, binary: str | None = None) -> None:
         self._binary = binary or require_pass_binary()
 
     def resolve(self, profile: CredentialProfile) -> Credentials:
         """Return credentials for ``profile``, raising on any failure."""
-        if profile.backend != "pass":
-            raise CredentialError(
-                f"unsupported credential backend {profile.backend!r}"
+        if profile.backend == "ssh_key":
+            assert profile.key_file is not None
+            if not profile.key_file.is_file():
+                raise CredentialError(f"SSH key file does not exist: {profile.key_file}")
+            passphrase = (
+                self._read_entry(profile.key_passphrase_entry)
+                if profile.key_passphrase_entry is not None
+                else None
             )
+            return Credentials(
+                username=profile.username,
+                key_file=str(profile.key_file),
+                key_passphrase=passphrase,
+            )
+        password = self._read_entry(profile.entry or "")
+        return Credentials(username=profile.username, password=password)
+
+    def _read_entry(self, entry: str) -> str:
         try:
             completed = subprocess.run(
-                [self._binary, "show", profile.entry],
+                [self._binary, "show", entry],
                 check=False,
                 capture_output=True,
                 text=True,
             )
         except OSError as exc:
             raise CredentialError(
-                f"failed to run pass for entry {profile.entry!r}: {exc}"
+                f"failed to run pass for entry {entry!r}: {exc}"
             ) from exc
         if completed.returncode != 0:
             raise CredentialError(
-                f"pass could not show entry {profile.entry!r}"
+                f"pass could not show entry {entry!r}"
             )
         try:
-            return Credentials(username=profile.username, password=parse_entry(completed.stdout))
+            return parse_entry(completed.stdout)
         except CredentialError as exc:
             raise CredentialError(
-                f"invalid pass entry {profile.entry!r}: {exc}"
+                f"invalid pass entry {entry!r}: {exc}"
             ) from exc

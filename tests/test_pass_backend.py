@@ -41,6 +41,59 @@ def test_pass_backend_resolves_via_binary(tmp_path: Path) -> None:
     )
 
 
+def test_pass_backend_resolves_an_explicit_ssh_key(tmp_path: Path) -> None:
+    key_file = tmp_path / "id_ed25519"
+    key_file.write_text("not read by the backend", encoding="utf-8")
+    backend = PassBackend(binary="unused")
+    profile = CredentialProfile.model_validate(
+        {"backend": "ssh_key", "key_file": str(key_file), "username": "operator"}
+    )
+
+    assert backend.resolve(profile) == Credentials(
+        username="operator", key_file=str(key_file)
+    )
+
+
+def test_pass_backend_resolves_an_ssh_key_passphrase_from_pass(tmp_path: Path) -> None:
+    key_file = tmp_path / "id_ed25519"
+    key_file.write_text("not read by the backend", encoding="utf-8")
+    fake_pass = tmp_path / "pass"
+    fake_pass.write_text(
+        "#!/bin/sh\nprintf 'unlock-key\\n'\n",
+        encoding="utf-8",
+    )
+    fake_pass.chmod(0o755)
+    backend = PassBackend(binary=str(fake_pass))
+    profile = CredentialProfile.model_validate(
+        {
+            "backend": "ssh_key",
+            "key_file": str(key_file),
+            "key_passphrase_entry": "network/jump-key",
+            "username": "operator",
+        }
+    )
+
+    assert backend.resolve(profile) == Credentials(
+        username="operator",
+        key_file=str(key_file),
+        key_passphrase="unlock-key",
+    )
+
+
+def test_pass_backend_rejects_missing_ssh_key(tmp_path: Path) -> None:
+    backend = PassBackend(binary="unused")
+    profile = CredentialProfile.model_validate(
+        {
+            "backend": "ssh_key",
+            "key_file": str(tmp_path / "missing-key"),
+            "username": "operator",
+        }
+    )
+
+    with pytest.raises(CredentialError, match="does not exist"):
+        backend.resolve(profile)
+
+
 def test_pass_backend_failure_raises(tmp_path: Path) -> None:
     fake_pass = tmp_path / "pass"
     fake_pass.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")

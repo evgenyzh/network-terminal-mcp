@@ -11,14 +11,20 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal, Protocol, TypedDict, cast
 
+import paramiko
 from netmiko import ConnectHandler
 
 from network_terminal_mcp.audit import AuditLogger
 from network_terminal_mcp.config.loader import AppConfig
-from network_terminal_mcp.config.models import Action, CredentialProfile, DirectConnection
+from network_terminal_mcp.config.models import (
+    Action,
+    CredentialProfile,
+    DirectConnection,
+    ProxyJumpConnection,
+)
 from network_terminal_mcp.credentials.pass_backend import Credentials, PassBackend
 from network_terminal_mcp.errors import PolicyError, SessionError, TransportError
-from network_terminal_mcp.host_keys import HostKeyStatus, HostKeyStore
+from network_terminal_mcp.host_keys import HostKeyStatus, HostKeyStore, probe_host_key_socket
 from network_terminal_mcp.platforms import Platform, PlatformRegistry
 from network_terminal_mcp.policy.engine import PolicyEngine
 from network_terminal_mcp.redaction import Redactor
@@ -119,6 +125,7 @@ class _ManagedSession:
     target: Target
     platform: Platform
     connection: TerminalConnection
+    jump_client: paramiko.SSHClient | None
     prompt: str
     raw_prompt: str
     warnings: list[str]
@@ -148,6 +155,7 @@ class SessionManager:
         credential_resolver: CredentialResolver | None = None,
         audit_logger: AuditLogger | None = None,
         host_keys: HostKeyStore | None = None,
+        jump_client_factory: Callable[[], paramiko.SSHClient] = paramiko.SSHClient,
         clock: Clock = time.monotonic,
     ) -> None:
         self._config = config
@@ -158,20 +166,38 @@ class SessionManager:
         self._credentials = credential_resolver or PassBackend()
         self._audit = audit_logger or AuditLogger(config.policy.runtime.audit_file)
         self._host_keys = host_keys or HostKeyStore(config.policy.runtime.known_hosts_file)
+        self._jump_client_factory = jump_client_factory
         self._clock = clock
         self._sessions: dict[str, _ManagedSession] = {}
         self._lock = threading.RLock()
 
     def open_session(self, name: str | None = None, **ad_hoc: object) -> SessionInfo:
-        """Open a direct SSH session and run Netmiko session preparation."""
+        """Open a direct or configured one-hop SSH session."""
         self._cleanup_expired()
         target = self._targets.resolve(name=name, **ad_hoc)
         platform = self._platforms.resolve(target.platform)
-        profile = self._direct_profile(target)
-        credentials = self._resolve_credentials(target)
-        redactor = Redactor([credentials.password])
+        profile = self._ssh_profile(target)
+        credentials = self._resolve_credentials(target.credentials)
+        jump_credentials = (
+            self._resolve_credentials(profile.jump_credentials)
+            if isinstance(profile, ProxyJumpConnection)
+            else None
+        )
+        passwords = [
+            secret
+            for secret in (credentials.password, credentials.key_passphrase)
+            if secret is not None
+        ]
+        if jump_credentials is not None:
+            passwords.extend(
+                secret
+                for secret in (jump_credentials.password, jump_credentials.key_passphrase)
+                if secret is not None
+            )
+        redactor = Redactor(passwords)
         port = target.port or profile.port or 22
         warnings = self._transport_warnings(profile)
+        route = self._route_details(profile)
 
         self._audit_event(
             "open_session",
@@ -180,23 +206,53 @@ class SessionManager:
             username=credentials.username,
             outcome="started",
             redactor=redactor,
+            **route,
         )
         connection: TerminalConnection | None = None
+        jump_client: paramiko.SSHClient | None = None
         try:
-            host_key = self._host_keys.ensure(
-                target.host,
-                port=port,
-                policy=profile.host_key_policy,
-                timeout=float(self._config.policy.runtime.command_timeout),
-            )
+            timeout = float(self._config.policy.runtime.command_timeout)
+            if isinstance(profile, ProxyJumpConnection):
+                assert jump_credentials is not None
+                jump_host_key = self._host_keys.ensure(
+                    profile.jump_host,
+                    port=profile.jump_port,
+                    policy=profile.jump_host_key_policy,
+                    timeout=timeout,
+                )
+                warnings.extend(
+                    f"jump host: {warning}" for warning in self._host_key_warnings(jump_host_key)
+                )
+                jump_client = self._open_jump_client(profile, jump_credentials)
+                host_key = self._host_keys.ensure(
+                    target.host,
+                    port=port,
+                    policy=profile.host_key_policy,
+                    timeout=timeout,
+                    probe=lambda host, probe_port, probe_timeout: self._probe_via_jump(
+                        jump_client, host, probe_port, probe_timeout
+                    ),
+                )
+                sock = self._open_jump_channel(jump_client, target.host, port)
+            else:
+                host_key = self._host_keys.ensure(
+                    target.host,
+                    port=port,
+                    policy=profile.host_key_policy,
+                    timeout=timeout,
+                )
+                sock = None
             warnings.extend(self._host_key_warnings(host_key))
             connection = self._connection_factory(
-                self._connection_params(target, platform, credentials, port)
+                self._connection_params(target, platform, credentials, port, sock=sock)
             )
             prompt = connection.find_prompt()
         except Exception as exc:
-            if connection is not None:
-                connection.disconnect()
+            try:
+                if connection is not None:
+                    connection.disconnect()
+            finally:
+                self._close_jump_client(jump_client)
             message = redactor.redact(str(exc))
             self._audit_event(
                 "open_session",
@@ -206,6 +262,7 @@ class SessionManager:
                 outcome="failed",
                 redactor=redactor,
                 error=message,
+                **route,
             )
             if isinstance(exc, TransportError):
                 raise
@@ -218,6 +275,7 @@ class SessionManager:
             target=target,
             platform=platform,
             connection=connection,
+            jump_client=jump_client,
             prompt=redactor.redact(prompt),
             raw_prompt=prompt,
             warnings=warnings,
@@ -229,7 +287,10 @@ class SessionManager:
         )
         with self._lock:
             if len(self._sessions) >= self._config.policy.runtime.max_open_sessions:
-                connection.disconnect()
+                try:
+                    connection.disconnect()
+                finally:
+                    self._close_jump_client(jump_client)
                 raise SessionError("maximum number of open sessions reached")
             self._sessions[session.session_id] = session
         self._audit_event(
@@ -242,6 +303,7 @@ class SessionManager:
             session_id=session.session_id,
             prompt=session.prompt,
             warnings=warnings,
+            **route,
         )
         return self._session_info(session)
 
@@ -509,6 +571,8 @@ class SessionManager:
             try:
                 session.connection.disconnect()
             finally:
+                self._close_jump_client(session.jump_client)
+                session.jump_client = None
                 session.state = SessionState.CLOSED
                 self._touch(session)
             self._audit_event(
@@ -870,20 +934,88 @@ class SessionManager:
             **details,
         )
 
-    def _direct_profile(self, target: Target) -> DirectConnection:
+    def _ssh_profile(self, target: Target) -> DirectConnection | ProxyJumpConnection:
         profile = self._config.connections.connections[target.connection]
-        if not isinstance(profile, DirectConnection):
+        if not isinstance(profile, (DirectConnection, ProxyJumpConnection)):
             raise TransportError(
                 f"connection profile {target.connection!r} is {profile.type!r}; "
-                "only direct SSH is implemented in this phase"
+                "only direct and proxyjump SSH are implemented in this phase"
             )
-        if profile.protocol == "telnet":
+        if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
             raise TransportError("Telnet is not implemented in this phase")
         return profile
 
-    def _resolve_credentials(self, target: Target) -> Credentials:
-        profile = self._config.credentials.credentials[target.credentials]
+    def _resolve_credentials(self, name: str) -> Credentials:
+        profile = self._config.credentials.credentials[name]
         return self._credentials.resolve(profile)
+
+    def _open_jump_client(
+        self, profile: ProxyJumpConnection, credentials: Credentials
+    ) -> paramiko.SSHClient:
+        """Authenticate the configured bastion after its key has been checked."""
+        timeout = float(self._config.policy.runtime.command_timeout)
+        client = self._jump_client_factory()
+        try:
+            client.load_host_keys(str(self._host_keys.path))
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            if credentials.key_file is not None:
+                client.connect(
+                    profile.jump_host,
+                    port=profile.jump_port,
+                    username=credentials.username,
+                    key_filename=credentials.key_file,
+                    passphrase=credentials.key_passphrase,
+                    timeout=timeout,
+                    banner_timeout=timeout,
+                    auth_timeout=timeout,
+                    look_for_keys=False,
+                    allow_agent=False,
+                )
+            elif credentials.password is not None:
+                client.connect(
+                    profile.jump_host,
+                    port=profile.jump_port,
+                    username=credentials.username,
+                    password=credentials.password,
+                    timeout=timeout,
+                    banner_timeout=timeout,
+                    auth_timeout=timeout,
+                    look_for_keys=False,
+                    allow_agent=False,
+                )
+            else:
+                raise TransportError("jump credential has no password or SSH key")
+        except Exception:
+            client.close()
+            raise
+        return client
+
+    def _probe_via_jump(
+        self, jump_client: paramiko.SSHClient, host: str, port: int, timeout: float
+    ) -> paramiko.PKey:
+        """Read the final target key through a fresh forwarded channel."""
+        return probe_host_key_socket(self._open_jump_channel(jump_client, host, port), timeout)
+
+    def _open_jump_channel(
+        self, jump_client: paramiko.SSHClient, host: str, port: int
+    ) -> object:
+        transport = jump_client.get_transport()
+        if transport is None or not transport.is_active():
+            raise TransportError("SSH jump host transport is not active")
+        channel = transport.open_channel(
+            "direct-tcpip",
+            (host, port),
+            ("127.0.0.1", 0),
+            timeout=float(self._config.policy.runtime.command_timeout),
+        )
+        if channel is None:
+            raise TransportError("SSH jump host refused the target forwarding channel")
+        return channel
+
+    @staticmethod
+    def _close_jump_client(jump_client: paramiko.SSHClient | None) -> None:
+        if jump_client is not None:
+            jump_client.close()
 
     def _connection_params(
         self,
@@ -891,14 +1023,15 @@ class SessionManager:
         platform: Platform,
         credentials: Credentials,
         port: int,
+        *,
+        sock: object | None = None,
     ) -> dict[str, object]:
         timeout = float(self._config.policy.runtime.command_timeout)
-        return {
+        params: dict[str, object] = {
             "device_type": platform.driver,
             "host": target.host,
             "port": port,
             "username": credentials.username,
-            "password": credentials.password,
             "conn_timeout": timeout,
             "banner_timeout": timeout,
             "auth_timeout": timeout,
@@ -908,15 +1041,39 @@ class SessionManager:
             "alt_host_keys": True,
             "alt_key_file": str(self._host_keys.path),
         }
+        if credentials.key_file is not None:
+            params["use_keys"] = True
+            params["key_file"] = credentials.key_file
+            if credentials.key_passphrase is not None:
+                params["passphrase"] = credentials.key_passphrase
+        elif credentials.password is not None:
+            params["password"] = credentials.password
+        else:
+            raise TransportError("target credential has no password or SSH key")
+        if sock is not None:
+            params["sock"] = sock
+        return params
 
     @staticmethod
-    def _transport_warnings(profile: DirectConnection) -> list[str]:
+    def _transport_warnings(profile: DirectConnection | ProxyJumpConnection) -> list[str]:
         warnings: list[str] = []
-        if profile.protocol == "legacy_ssh":
+        if isinstance(profile, DirectConnection) and profile.protocol == "legacy_ssh":
             warnings.append("legacy SSH profile in use")
-        if profile.host_key_algorithms or profile.kex_algorithms or profile.ciphers:
+        if isinstance(profile, DirectConnection) and (
+            profile.host_key_algorithms or profile.kex_algorithms or profile.ciphers
+        ):
             warnings.append("explicit legacy algorithm overrides are not implemented yet")
         return warnings
+
+    @staticmethod
+    def _route_details(profile: DirectConnection | ProxyJumpConnection) -> dict[str, object]:
+        if isinstance(profile, ProxyJumpConnection):
+            return {
+                "route": "proxyjump",
+                "jump_host": profile.jump_host,
+                "jump_port": profile.jump_port,
+            }
+        return {"route": "direct"}
 
     @staticmethod
     def _host_key_warnings(status: HostKeyStatus) -> list[str]:
@@ -963,8 +1120,12 @@ class SessionManager:
         for session in expired:
             with session.lock:
                 session.state = SessionState.CLOSED
-                session.connection.disconnect()
-                self._touch(session)
+                try:
+                    session.connection.disconnect()
+                finally:
+                    self._close_jump_client(session.jump_client)
+                    session.jump_client = None
+                    self._touch(session)
                 self._audit_event(
                     "close_session",
                     target=session.target,

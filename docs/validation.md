@@ -1,4 +1,4 @@
-# Результаты проверок Этапов 1-2
+# Результаты проверок Этапов 1, 2, 3 и 6
 
 ## Scope
 
@@ -70,12 +70,33 @@ confirmation allowlist, отказ от password prompt и state-bound control a
 Отдельные тесты фиксируют короткий `cli_help_timeout` и гарантированный Ctrl-C
 cleanup даже при ошибке чтения.
 
+## OpenCode integration
+
+Текущий global OpenCode profile регистрирует `network-terminal` как local stdio
+MCP с рабочим каталогом проекта и timeout 65 секунд. `opencode mcp list`
+подтвердил подключение сервера. Через этот MCP выполнен read-only round-trip
+`open_session -> run_command -> close_session` на зарегистрированной цели;
+device identifiers и terminal output в репозиторий не записываются.
+
+Global skill `network-terminal` требует inventory targets, read-only commands,
+явное закрытие session и запрещает обходить MCP через shell SSH. Безопасность
+команд остаётся в policy самого сервера: `ask` не исполняется.
+
+## One-hop ProxyJump validation
+
+Проверен реальный маршрут local -> SSH jump host (explicit `ssh_key` profile с
+encrypted key и passphrase из `pass`) -> SNR old target. Bastion auth по
+explicit local key file, final target по password profile. Flow
+`open_session -> show version -> close_session` выполнен в одной session;
+jump host key после TOFU enrollment проверяется в `strict`, target — в
+`accept_changed` из-за rotating keys. В репозиторий записаны только обезличенные
+выводы и hostkey не входят.
+
 ## Непроверенное
 
-- Полный MCP stdio round-trip с клиентом OpenCode.
 - Interactive confirmations на Junos/Huawei.
 - Anonymized transcripts для platform-specific pager/prompt patterns.
 - `raw_input`.
-- ProxyJump, nested SSH/Telnet, console ports и Telnet.
+- Nested SSH/Telnet, console ports и Telnet.
 - BDCOM, EcoSGE, Eltex и PON adapters.
 - Per-device legacy algorithm override и DSA-only SSH.

@@ -14,8 +14,12 @@ connections:
 
   through-jump:
     type: proxyjump
+    protocol: ssh
     jump_host: jump.example.net
+    jump_port: 22
     jump_credentials: terminal-tacacs
+    jump_host_key_policy: strict
+    host_key_policy: strict
 
   through-terminal:
     type: nested

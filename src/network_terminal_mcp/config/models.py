@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Action = Literal["allow", "ask", "deny"]
 Protocol = Literal["ssh", "telnet", "legacy_ssh"]
@@ -65,9 +65,12 @@ class DirectConnection(StrictModel):
 
 class ProxyJumpConnection(StrictModel):
     type: Literal["proxyjump"] = "proxyjump"
-    protocol: Protocol = "ssh"
+    protocol: Literal["ssh"] = "ssh"
     jump_host: str
     jump_credentials: str
+    jump_port: int = 22
+    host_key_policy: HostKeyPolicy = "strict"
+    jump_host_key_policy: HostKeyPolicy = "strict"
     port: int | None = None
 
 
@@ -110,9 +113,34 @@ class ConnectionsConfig(StrictModel):
 
 
 class CredentialProfile(StrictModel):
-    backend: Literal["pass"] = "pass"
-    entry: str
+    backend: Literal["pass", "ssh_key"] = "pass"
+    entry: str | None = None
     username: str
+    key_file: Path | None = None
+    key_passphrase_entry: str | None = None
+
+    @field_validator("key_file", mode="before")
+    @classmethod
+    def _expand_key_file(cls, value: object) -> object:
+        if isinstance(value, str):
+            return os.path.expanduser(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_backend_fields(self) -> CredentialProfile:
+        if self.backend == "pass":
+            if not self.entry:
+                raise ValueError("pass credential requires entry")
+            if self.key_file is not None:
+                raise ValueError("pass credential cannot define key_file")
+            if self.key_passphrase_entry is not None:
+                raise ValueError("pass credential cannot define key_passphrase_entry")
+        else:
+            if self.key_file is None:
+                raise ValueError("ssh_key credential requires key_file")
+            if self.entry is not None:
+                raise ValueError("ssh_key credential cannot define entry")
+        return self
 
 
 class CredentialsConfig(StrictModel):

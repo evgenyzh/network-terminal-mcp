@@ -1,6 +1,6 @@
 # Конфигурация
 
-Формат ниже реализован Pydantic-схемой Этапов 1-2. Неизвестные поля отклоняются,
+Формат ниже реализован Pydantic-схемой Этапов 1-3. Неизвестные поля отклоняются,
 а ссылки устройства на credential/connection profiles проверяются при загрузке.
 
 ## Разделение файлов
@@ -51,8 +51,14 @@ connections:
 
   through-jump:
     type: proxyjump
+    protocol: ssh
     jump_host: jump.example.net
+    jump_port: 22
     jump_credentials: terminal-tacacs
+    jump_host_key_policy: strict
+    host_key_policy: strict
+    # Optional fallback for the final target. Device/ad-hoc port wins.
+    port: 22
 
   through-terminal:
     type: nested
@@ -69,10 +75,17 @@ connections:
     ciphers: [aes128-cbc]
 ```
 
-В Этапе 1 поддерживается только `direct` с protocol `ssh` или `legacy_ssh`.
-`proxyjump`, `nested`, `console` и Telnet уже описаны схемой, но сервер их
-отвергает до реализации соответствующего transport backend. Сложные nested-
-профили в дальнейшем будут описываться массивом typed hops, а не shell-строкой.
+Поддерживаются `direct` с protocol `ssh` или `legacy_ssh` и один SSH-only
+`proxyjump` hop. ProxyJump аутентифицируется на `jump_host`, открывает
+`direct-tcpip` channel к final target и передаёт его Netmiko как socket.
+`jump_port` относится к bastion; final target использует `Device.port` или
+ad-hoc `port`, затем fallback profile `port`, затем 22.
+
+Ключи jump host и final target проверяются раздельно в одном dedicated
+`known_hosts_file`: `jump_host_key_policy` относится к bastion, а
+`host_key_policy` — к final target. Literal `ProxyCommand`, несколько hops,
+`nested`, `console` и Telnet не поддерживаются. Сложные nested-профили в
+дальнейшем будут описываться массивом typed hops, а не shell-строкой.
 
 `legacy_ssh` сейчас передается Paramiko/Netmiko. Явные списки KEX/ciphers/key
 types сохраняются в профиле для будущего per-device override, но еще не меняют
@@ -91,11 +104,22 @@ credentials:
     backend: pass
     entry: network/credentials/terminal-server
     username: operator
+
+  jump-key:
+    backend: ssh_key
+    key_file: ~/.ssh/id_ed25519
+    key_passphrase_entry: network/credentials/jump-key-passphrase
+    username: operator
 ```
 
 Поля `entry` и `username` не принимаются из MCP-вызова. Пароль всегда берется
 из `pass`; username не считается секретом и задается отдельно, чтобы не
-дублировать его в password store.
+дублировать его в password store. Profile с `backend: ssh_key` хранит только
+явный локальный путь `key_file` и username; automatic ssh-agent/key discovery
+не включается. Key file не передается в MCP arguments. Для password-backed
+target используйте отдельный `pass` profile, даже если jump host использует key.
+Для зашифрованного private key добавьте `key_passphrase_entry`: его первая строка
+также читается из `pass`, redacted и не передается в MCP arguments.
 
 ## Platform aliases
 

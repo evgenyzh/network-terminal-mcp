@@ -6,16 +6,18 @@
 несколько команд в одной сессии и получить полный вывод без временных
 `sshpass`-команд и одноразовых скриптов.
 
-Статус: Этапы 1 и 2 реализованы для direct SSH. Есть конфигурация, политика,
+Статус: Этапы 1, 2 и 6 реализованы; Этап 3 поддерживает один SSH-only ProxyJump
+hop. Есть конфигурация, политика,
 аудит, credential backend, known_hosts, постоянные Netmiko-сессии, безопасный
 `cli_help`, pager/control state machine и stdio MCP tools. Direct SSH проверен
 на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Junos. `cli_help` подтвержден
 на всех этих платформах: SNR old поддерживает `space`/`q` pager flow, а
-Junos/Huawei очищают оставшуюся help-строку Ctrl-C и Ctrl-U. Подробности в
-[результатах проверок](docs/validation.md).
+Junos/Huawei очищают оставшуюся help-строку Ctrl-C и Ctrl-U. Current local
+OpenCode profile подключён к server через stdio MCP и прошёл read-only
+round-trip. Подробности в [результатах проверок](docs/validation.md).
 
-Текущие ограничения: только direct SSH; terminal servers, ProxyJump, Telnet,
-`raw_input` и config changes остаются следующими этапами. Команда с
+Текущие ограничения: terminal servers, nested SSH, Telnet, `raw_input` и config
+changes остаются следующими этапами. Команда с
 policy-решением `ask` возвращает `confirmation_required`, но не исполняется.
 `respond` отвечает только на уже распознанный prompt устройства и не является
 механизмом policy confirmation.
