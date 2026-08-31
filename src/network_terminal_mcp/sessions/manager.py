@@ -694,6 +694,34 @@ class SessionManager:
         with session.lock:
             return self._session_info(session)
 
+    def set_platform(self, session_id: str, platform: str) -> SessionInfo:
+        """Switch an active session to another device platform/driver.
+
+        The model usually opens an ad-hoc session with a best-guess platform,
+        reads the output, and switches to the real driver when the guess was
+        wrong. Redispatches the underlying Netmiko connection and updates the
+        session metadata in place; the SSH connection itself is kept.
+        """
+        session = self._get_session(session_id)
+        new_platform = self._platforms.resolve(platform)
+        with session.lock:
+            self._require_ready(session)
+            previous = session.platform
+            self._nested_redispatch(session.connection, new_platform.driver)
+            session.platform = new_platform
+            self._touch(session)
+            self._audit_event(
+                "set_platform",
+                target=session.target,
+                platform=session.platform,
+                outcome="completed",
+                redactor=session.redactor,
+                session_id=session.session_id,
+                previous_platform=previous.name,
+                previous_dialect=previous.dialect,
+            )
+            return self._session_info(session)
+
     def close_session(self, session_id: str, *, force: bool = False) -> SessionInfo:
         """Disconnect and permanently remove a session.
 

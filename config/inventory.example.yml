@@ -1,38 +1,24 @@
 ---
+# Inventory is infrastructure-only: bastion/jump hosts, and defaults for ad-hoc
+# device access. Network devices themselves are reached ad-hoc by the model via
+# open_session(host=..., platform=...), where credentials and connection fall
+# back to the defaults below.
+#
+# For a fleet of thousands of switches there is no per-switch record here. The
+# model decides how to connect each time, specifying the platform (or guessing
+# it and correcting with set_platform after reading the output).
+default_credentials: network-tacacs
+default_connection: through-jump
+
 devices:
+  # Optional: keep named infrastructure targets (jump hosts, console servers)
+  # or a handful of lab devices for debugging. Most devices are ad-hoc.
   lab-cisco:
     host: 192.0.2.10
     platform: cisco_ios
     credentials: network-tacacs
-    connection: direct
+    connection: through-jump
     tags: [lab, cisco]
-
-  lab-snr-29xx:
-    host: 192.0.2.20
-    platform: snr_29xx
-    credentials: network-tacacs
-    connection: through-terminal
-    tags: [lab, snr, access]
-
-  # Telnet is only reachable with an explicit opt-in on the device in addition
-  # to a policy that allows Telnet.
-  lab-cisco-telnet:
-    host: 192.0.2.30
-    platform: cisco_ios
-    credentials: network-tacacs
-    connection: direct-telnet
-    allow_telnet: true
-    tags: [lab, cisco, telnet]
-
-  # Configuration changes require allow_writes: true in addition to a policy
-  # that allows write_change. Only set it for devices where changes are wanted.
-  lab-cisco-writable:
-    host: 192.0.2.40
-    platform: cisco_ios
-    credentials: network-tacacs
-    connection: direct
-    allow_writes: true
-    tags: [lab, cisco, writable]
 
 groups:
   lab:

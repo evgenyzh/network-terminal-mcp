@@ -79,6 +79,23 @@ class AppConfig:
                     f"device {name!r} references unknown connection profile "
                     f"{device.connection!r}"
                 )
+        defaults = self.inventory.default_credentials, self.inventory.default_connection
+        if (
+            defaults[0] is not None
+            and defaults[0] not in self.credentials.credentials
+        ):
+            raise ConfigError(
+                f"default_credentials references unknown credential profile "
+                f"{defaults[0]!r}"
+            )
+        if (
+            defaults[1] is not None
+            and defaults[1] not in self.connections.connections
+        ):
+            raise ConfigError(
+                f"default_connection references unknown connection profile "
+                f"{defaults[1]!r}"
+            )
         for name, profile in self.connections.connections.items():
             if (
                 isinstance(profile, ProxyJumpConnection)

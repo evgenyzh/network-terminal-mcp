@@ -41,6 +41,30 @@ Telnet-драйвер платформы берётся из `telnet_driver` в 
 выводится как `<driver>_telnet`; если такого класса нет, Telnet/console для
 платформы недоступны.
 
+## Ad-hoc доступ
+
+Сетевые устройства обычно достигаются ad-hoc, без записей в `devices`:
+`open_session(host="192.0.2.2", platform="snr_29xx")`. Поля `credentials` и
+`connection` необязательны — берутся из `default_credentials` /
+`default_connection` в инвентаре.
+
+Тип оборудования модели может быть неверен с первого раза. В этом случае
+модель читает вывод (`show version` / `display version` и т.п.), распознаёт
+вендора и вызывает `set_platform(session_id, platform)`, который
+переустанавливает Netmiko-драйвер на той же SSH-сессии (соединение не
+закрывается). Платформа должна быть известной (stock Netmiko driver или
+локальный alias). `set_platform` записывает audit-событие и возвращает
+обновлённые метаданные сессии.
+
+Пример флоу:
+
+```
+open_session(host=192.0.2.4, platform=cisco_ios)   # предполагаем Cisco
+run_command(show version)                            # вывод показывает SNR
+set_platform(session_id, snr_29xx)                   # переключаем драйвер
+run_command(show version)                            # продолжение с правильным драйвером
+```
+
 ## Изменения конфигурации
 
 Изменения идут через отдельные инструменты, не через `run_command`:
@@ -79,6 +103,7 @@ Telnet-драйвер платформы берётся из `telnet_driver` в 
 - `respond`
 - `read_output`
 - `session_status`
+- `set_platform`
 - `close_session`
 - `plan_change`
 - `apply_change`

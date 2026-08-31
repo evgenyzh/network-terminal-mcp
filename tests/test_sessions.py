@@ -425,6 +425,30 @@ def _nested_manager(
     return manager, resolved_host_keys, params, redispatched
 
 
+def _set_platform_manager(
+    connection: FakeConnection,
+    audit: FakeAudit,
+    *,
+    redispatch_device_types: list[str] | None = None,
+) -> tuple[SessionManager, list[str]]:
+    redispatched = redispatch_device_types if redispatch_device_types is not None else []
+
+    def fake_redispatch(conn: object, device_type: str) -> None:
+        redispatched.append(device_type)
+
+    manager = SessionManager(
+        _config(socks=True),
+        connection_factory=lambda params: connection,
+        credential_resolver=FakeCredentials(),
+        audit_logger=audit,  # type: ignore[arg-type]
+        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
+        nested_redispatch=fake_redispatch,  # type: ignore[arg-type]
+        clock=MutableClock(),
+    )
+    return manager, redispatched
+
+
+
 def test_open_session_resolves_alias_and_uses_factory() -> None:
     connection = FakeConnection()
     manager = _manager(connection, FakeAudit())
@@ -514,6 +538,49 @@ def test_socks_proxyjump_reaches_target_through_a_socks_socket(
 
     manager.close_session(info.session_id)
     assert connection.disconnected is True
+
+
+def test_set_platform_redispatches_and_updates_session_metadata() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager, redispatched = _set_platform_manager(connection, audit)
+
+    info = manager.open_session("sw1")
+    assert info.platform == "snr_29xx"
+
+    updated = manager.set_platform(info.session_id, "dlink_ds")
+
+    assert redispatched == ["dlink_ds"]
+    assert updated.platform == "dlink_ds"
+    assert updated.session_id == info.session_id
+    assert any(r["event"] == "set_platform" for r in audit.records)
+
+    manager.close_session(info.session_id)
+
+
+def test_set_platform_requires_a_ready_session() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager, _ = _set_platform_manager(connection, audit)
+
+    info = manager.open_session("sw1")
+    manager.close_session(info.session_id)
+
+    with pytest.raises(SessionError, match="unknown or expired session"):
+        manager.set_platform(info.session_id, "dlink_ds")
+
+
+def test_set_platform_rejects_unknown_platform() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager, _ = _set_platform_manager(connection, audit)
+
+    info = manager.open_session("sw1")
+
+    with pytest.raises(TransportError, match="unsupported platform"):
+        manager.set_platform(info.session_id, "not_a_real_platform")
+
+    manager.close_session(info.session_id)
 
 
 def test_socks_proxyjump_does_not_connect_an_ssh_bastion() -> None:

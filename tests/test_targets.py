@@ -24,8 +24,12 @@ def _config(**inventory: object) -> AppConfig:
         "credentials",
         {"net": {"backend": "pass", "entry": "n/c", "username": "operator"}},
     )
+    inv_data: dict[str, object] = {"devices": devices}
+    for key in ("default_credentials", "default_connection"):
+        if inventory.get(key) is not None:
+            inv_data[key] = inventory[key]
     return AppConfig(
-        inventory=InventoryConfig.model_validate({"devices": devices}),
+        inventory=InventoryConfig.model_validate(inv_data),
         connections=ConnectionsConfig.model_validate(
             {"connections": connections}
         ),
@@ -95,6 +99,23 @@ def test_ad_hoc_requires_host() -> None:
         TargetResolver(_config()).resolve(
             platform="cisco_ios", credentials="net", connection="direct"
         )
+
+
+def test_ad_hoc_uses_configured_defaults_for_credentials_and_connection() -> None:
+    config = _config(
+        default_credentials="net",
+        default_connection="direct",
+    )
+    target = TargetResolver(config).resolve(host="192.0.2.7", platform="cisco_ios")
+    assert target.credentials == "net"
+    assert target.connection == "direct"
+    assert target.host == "192.0.2.7"
+
+
+def test_ad_hoc_requires_platform_even_with_defaults() -> None:
+    config = _config(default_credentials="net", default_connection="direct")
+    with pytest.raises(TargetError, match="platform"):
+        TargetResolver(config).resolve(host="192.0.2.7")
 
 
 def test_ad_hoc_rejects_unknown_fields() -> None:

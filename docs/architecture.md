@@ -111,6 +111,14 @@ session в `failed`.
 Вывод хранится в ограниченном session buffer; при превышении лимита старые данные
 вытесняются, а `oldest_offset` сообщает доступную начальную позицию.
 
+### `set_platform`
+
+`set_platform(session_id, platform)` переключает драйвер существующей сессии на
+лету через Netmiko `redispatch` (тот же механизм, что и для nested). Используется
+при ad-hoc доступе, когда модель ошиблась в типе оборудования: открывает сессию
+с предполагаемым `platform`, читает вывод, затем корректирует драйвер, не теряя
+SSH-соединение. Обновляет `session.platform` и пишет audit `set_platform`.
+
 ### Инструменты Этапа 7: изменения конфигурации
 
 `plan_change(session_id, title, commands, safety_net?, auto_approve?)`

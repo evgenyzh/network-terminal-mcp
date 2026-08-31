@@ -65,10 +65,14 @@ class TargetResolver:
         connection = fields.get("connection")
         if not isinstance(platform, str) or not platform:
             raise TargetError("ad-hoc target requires 'platform'")
+        if credentials is None:
+            credentials = self._config.inventory.default_credentials
+        if connection is None:
+            connection = self._config.inventory.default_connection
         if not isinstance(credentials, str) or not credentials:
-            raise TargetError("ad-hoc target requires 'credentials'")
+            raise TargetError("ad-hoc target requires 'credentials' (or a configured default)")
         if not isinstance(connection, str) or not connection:
-            raise TargetError("ad-hoc target requires 'connection'")
+            raise TargetError("ad-hoc target requires 'connection' (or a configured default)")
         port = fields.get("port")
         if port is not None and not isinstance(port, int):
             raise TargetError("ad-hoc target 'port' must be an integer")

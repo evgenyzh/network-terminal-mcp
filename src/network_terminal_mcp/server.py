@@ -44,11 +44,12 @@ def create_server(
         connection: str | None = None,
         port: int | None = None,
     ) -> SessionInfo:
-        """Open an inventory target or an ad-hoc direct SSH session.
+        """Open an inventory target or an ad-hoc SSH session.
 
-        ``target`` is an inventory name. Without it, host, platform,
-        credentials, and connection are required; they refer only to local
-        profiles, and passwords are never accepted as tool arguments.
+        ``target`` is an inventory name (infrastructure hosts only). Without it,
+        ``host`` (and usually ``platform``) are required; ``credentials`` and
+        ``connection`` fall back to the configured inventory defaults. Passwords
+        are never accepted as tool arguments.
         """
         if target is not None:
             if any(value is not None for value in (host, platform, credentials, connection, port)):
@@ -110,6 +111,16 @@ def create_server(
     async def session_status(session_id: str) -> SessionInfo:
         """Return state and prompt metadata for an active session."""
         return await _run_sync(session_manager.session_status, session_id)
+
+    @server.tool()
+    async def set_platform(session_id: str, platform: str) -> SessionInfo:
+        """Switch an active session to another device platform/driver.
+
+        Use after the device output shows the real vendor when an ad-hoc
+        ``open_session`` was opened with a best-guess ``platform``. The SSH
+        connection is kept; only the Netmiko driver and session metadata change.
+        """
+        return await _run_sync(session_manager.set_platform, session_id, platform)
 
     @server.tool()
     async def close_session(session_id: str, force: bool = False) -> SessionInfo:

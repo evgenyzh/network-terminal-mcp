@@ -47,6 +47,8 @@ class Group(StrictModel):
 class InventoryConfig(StrictModel):
     devices: dict[str, Device] = Field(default_factory=dict)
     groups: dict[str, Group] = Field(default_factory=dict)
+    default_credentials: str | None = None
+    default_connection: str | None = None
 
 
 # ---------------------------------------------------------------------------

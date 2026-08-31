@@ -95,6 +95,9 @@ client round-trip и OpenCode registration остаются задачей Эт�
 - SOCKS5 с не-IP target.
 - SOCKS5 при недоступном прокси/цели.
 - `proxyjump` с `socks` и `jump_host` одновременно.
+- Ad-hoc без `default_credentials`/`default_connection`.
+- `set_platform` с неизвестной платформой.
+- `set_platform` после закрытия сессии.
 
 ## Команды проверки
 
