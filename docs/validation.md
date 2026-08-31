@@ -82,6 +82,25 @@ Global skill `network-terminal` требует inventory targets, read-only comm
 явное закрытие session и запрещает обходить MCP через shell SSH. Безопасность
 команд остаётся в policy самого сервера: `ask` не исполняется.
 
+## SOCKS validation
+
+SOCKS-маршрут покрыт unit-тестами:
+- минимальный SOCKS5 CONNECT (no-auth, IPv4/IPv6) против фейкового сервера:
+  greeting, request, успешный reply;
+- отказ при требующейся авторизации прокси (`0x05 0x02`);
+- отказ для не-IP target (прокси не резолвит имена);
+- обёртка ошибок подключения в `TransportError`;
+- конфиг-валидация `proxyjump` с полем `socks`: дефолты, взаимоисключение
+  `socks` и `jump_host`, обязательность `socks` или `jump_host`;
+- менеджер: сокет из `socks5_connect` передаётся Netmiko как `sock`, route в
+  audit `socks`, SSH-бастион не создаётся, host key цели проверяется через
+  SOCKS-сокет. Probe выполняется до открытия connection-сокета: некоторые
+  старые устройства (SNR old) не выдерживают второе одновременное SSH-соединение
+  через тот же туннель, и обратный порядок даёт EOF на handshake.
+
+Проверка на реальном оборудовании через живой локальный SOCKS-прокси
+описывается в этом разделе при её выполнении.
+
 ## One-hop ProxyJump validation
 
 Проверен реальный маршрут local -> SSH jump host (explicit `ssh_key` profile с

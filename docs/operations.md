@@ -3,8 +3,9 @@
 ## Границы текущей версии
 
 Сервер поддерживает постоянные direct SSH-сессии, один configured SSH-only
-ProxyJump hop, один configured Nested hop (SSH или Telnet) и TCP console
-profiles. Он не поддерживает `raw_input`.
+ProxyJump hop, один configured Nested hop (SSH или Telnet), локальный
+SOCKS5-прокси (`proxyjump` с полем `socks`) и TCP console profiles. Он не
+поддерживает `raw_input`.
 
 Для ProxyJump нужны локальные connection и credential profiles для final target
 и bastion. Обе host key проверяются независимо; bastion должен разрешать
@@ -16,6 +17,14 @@ host и final target. Сервер подключается к intermediate host
 `redispatch` на платформу цели. Host key intermediate host проверяется локально;
 inner SSH использует SSH-клиент intermediate host, поэтому host key final target
 проверяется им. При ошибке connection закрывается.
+
+Для SOCKS-маршрута нужен локальный `proxyjump` profile с полем `socks`
+(`host`/`port` локального SOCKS5-прокси, обычно локальный SSH dynamic forward
+`ssh -D`). Credential profile bastion не нужен: цель достигается через прокси, а
+не через SSH-бастион. Target должен быть IP-адресом (прокси не резолвит имена).
+Host key final target проверяется через SOCKS-сокет; для первого подключения
+используйте `host_key_policy: accept_new`, затем `strict`. Трафик внутри туннеля
+и уровень доверия к прокси — на усмотрение оператора (сервер предупреждает).
 
 ## Telnet и console
 

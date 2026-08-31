@@ -132,6 +132,47 @@ def test_proxyjump_connection_requires_ssh_and_defaults_to_strict_keys() -> None
         )
 
 
+def test_socks_proxyjump_connection_defaults() -> None:
+    config = ConnectionsConfig.model_validate(
+        {
+            "connections": {
+                "jump": {
+                    "type": "proxyjump",
+                    "socks": {"host": "127.0.0.1", "port": 10900},
+                }
+            }
+        }
+    )
+
+    profile = config.connections["jump"]
+    assert profile.protocol == "ssh"  # type: ignore[attr-defined]
+    assert profile.jump_host is None  # type: ignore[attr-defined]
+    assert profile.socks.host == "127.0.0.1"  # type: ignore[attr-defined]
+    assert profile.socks.port == 10900  # type: ignore[attr-defined]
+    assert profile.host_key_policy == "strict"  # type: ignore[attr-defined]
+
+
+def test_proxyjump_requires_socks_or_jump_host() -> None:
+    with pytest.raises(ValidationError):
+        ConnectionsConfig.model_validate(
+            {"connections": {"jump": {"type": "proxyjump"}}}
+        )
+
+    with pytest.raises(ValidationError):
+        ConnectionsConfig.model_validate(
+            {
+                "connections": {
+                    "jump": {
+                        "type": "proxyjump",
+                        "socks": {"host": "127.0.0.1", "port": 10900},
+                        "jump_host": "jump.example.net",
+                        "jump_credentials": "terminal",
+                    }
+                }
+            }
+        )
+
+
 def test_nested_connection_defaults_and_rejects_unsupported_protocols() -> None:
     config = ConnectionsConfig.model_validate(
         {

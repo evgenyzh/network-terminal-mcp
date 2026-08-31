@@ -195,7 +195,11 @@ BDCOM делится как минимум на `bdcom_huawei_like` и `bdcom_ci
   Per-profile allowlists (`host_key_algorithms`/`kex_algorithms`/`ciphers`)
   становятся Paramiko `disabled_algorithms` и не ослабляют host key checking.
 - `proxyjump`: один configured SSH hop реализован через Paramiko `direct-tcpip`
-  channel и Netmiko `sock`; arbitrary `ProxyCommand` не поддерживается.
+  channel и Netmiko `sock`; arbitrary `ProxyCommand` не поддерживается. С полем
+  `socks: {host, port}` вместо `jump_host` тот же профиль маршрутизирует final
+  target через локальный SOCKS5-прокси (обычно локальный SSH dynamic forward);
+  целевой сокет создаётся модулем `socks` и передаётся Netmiko как `sock`, а
+  host key цели проверяется через тот же SOCKS-сокет.
 - `nested`: один configured hop реализован через `generic_termserver` +
   `redispatch`; `next_protocol` поддерживает `ssh` и `telnet`. Inner SSH
   выполняется SSH-клиентом промежуточного хоста, поэтому host key final target

@@ -21,6 +21,19 @@ connections:
     jump_host_key_policy: strict
     host_key_policy: strict
 
+  # Route through a local SOCKS5 proxy instead of an SSH bastion. This is
+  # typically a local SSH dynamic forward (ssh -D 1080 jump.example.net).
+  # The target must be configured as an IP address; the proxy resolves nothing.
+  # Use accept_new for the first enrollment of a target that is only reachable
+  # through the tunnel, then switch to strict.
+  through-socks:
+    type: proxyjump
+    protocol: ssh
+    socks:
+      host: 127.0.0.1
+      port: 1080
+    host_key_policy: accept_new
+
   through-terminal:
     type: nested
     host: terminal.example.net

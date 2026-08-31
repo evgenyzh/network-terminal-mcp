@@ -47,6 +47,7 @@ from network_terminal_mcp.sessions.models import (
     SessionInfo,
     SessionState,
 )
+from network_terminal_mcp.socks import socks5_connect
 from network_terminal_mcp.targets.resolver import Target, TargetResolver
 
 
@@ -233,7 +234,7 @@ class SessionManager:
         )
         jump_credentials = (
             self._resolve_credentials(profile.jump_credentials)
-            if isinstance(profile, ProxyJumpConnection)
+            if isinstance(profile, ProxyJumpConnection) and profile.jump_credentials is not None
             else None
         )
         passwords = [
@@ -284,10 +285,37 @@ class SessionManager:
         )
         connection: TerminalConnection | None = None
         jump_client: paramiko.SSHClient | None = None
+        sock: object | None = None
         try:
             timeout = float(self._config.policy.runtime.command_timeout)
-            if isinstance(profile, ProxyJumpConnection):
+            if isinstance(profile, ProxyJumpConnection) and profile.socks is not None:
+                socks_endpoint = profile.socks
+                host_key = self._host_keys.ensure(
+                    target.host,
+                    port=port,
+                    policy=profile.host_key_policy,
+                    timeout=timeout,
+                    probe=lambda host, probe_port, probe_timeout: probe_host_key_socket(
+                        socks5_connect(
+                            socks_endpoint.host,
+                            socks_endpoint.port,
+                            host,
+                            probe_port,
+                            probe_timeout,
+                        ),
+                        probe_timeout,
+                    ),
+                )
+                sock = socks5_connect(
+                    socks_endpoint.host,
+                    socks_endpoint.port,
+                    target.host,
+                    port,
+                    timeout,
+                )
+            elif isinstance(profile, ProxyJumpConnection):
                 assert jump_credentials is not None
+                assert profile.jump_host is not None
                 jump_host_key = self._host_keys.ensure(
                     profile.jump_host,
                     port=profile.jump_port,
@@ -1349,6 +1377,7 @@ class SessionManager:
         self, profile: ProxyJumpConnection, credentials: Credentials
     ) -> paramiko.SSHClient:
         """Authenticate the configured bastion after its key has been checked."""
+        assert profile.jump_host is not None
         timeout = float(self._config.policy.runtime.command_timeout)
         client = self._jump_client_factory()
         try:
@@ -1570,6 +1599,10 @@ class SessionManager:
             warnings.append("explicit legacy algorithm overrides in use")
         if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
             warnings.append("Telnet transmits credentials and traffic in cleartext")
+        if isinstance(profile, ProxyJumpConnection) and profile.socks is not None:
+            warnings.append(
+                "target reached through a local SOCKS proxy; verify trust in the tunnel"
+            )
         if isinstance(profile, NestedConnection):
             if profile.next_protocol == "telnet":
                 warnings.append("nested Telnet transmits credentials and traffic in cleartext")
@@ -1582,6 +1615,12 @@ class SessionManager:
     @staticmethod
     def _route_details(profile: ConnectionProfile) -> dict[str, object]:
         if isinstance(profile, ProxyJumpConnection):
+            if profile.socks is not None:
+                return {
+                    "route": "socks",
+                    "proxy_host": profile.socks.host,
+                    "proxy_port": profile.socks.port,
+                }
             return {
                 "route": "proxyjump",
                 "jump_host": profile.jump_host,

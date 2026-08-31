@@ -91,6 +91,10 @@ client round-trip и OpenCode registration остаются задачей Эт�
 - `abort_change` после исполнения.
 - `close_session` при активной запланированной перезагрузке.
 - Change-команда с pager/confirmation prompt.
+- SOCKS5 с требующейся авторизацией прокси.
+- SOCKS5 с не-IP target.
+- SOCKS5 при недоступном прокси/цели.
+- `proxyjump` с `socks` и `jump_host` одновременно.
 
 ## Команды проверки
 

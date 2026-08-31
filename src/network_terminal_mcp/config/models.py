@@ -64,15 +64,33 @@ class DirectConnection(StrictModel):
     ciphers: list[str] | None = None
 
 
+class SocksEndpoint(StrictModel):
+    """A local SOCKS5 proxy used as the last mile to a target."""
+
+    host: str
+    port: int
+
+
 class ProxyJumpConnection(StrictModel):
     type: Literal["proxyjump"] = "proxyjump"
     protocol: Literal["ssh"] = "ssh"
-    jump_host: str
-    jump_credentials: str
+    jump_host: str | None = None
+    jump_credentials: str | None = None
     jump_port: int = 22
+    socks: SocksEndpoint | None = None
     host_key_policy: HostKeyPolicy = "strict"
     jump_host_key_policy: HostKeyPolicy = "strict"
     port: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_route(self) -> ProxyJumpConnection:
+        if self.socks is None and (self.jump_host is None or self.jump_credentials is None):
+            raise ValueError(
+                "proxyjump requires jump_host+jump_credentials, or a socks endpoint"
+            )
+        if self.socks is not None and self.jump_host is not None:
+            raise ValueError("proxyjump cannot combine a socks endpoint with jump_host")
+        return self
 
 
 class NestedConnection(StrictModel):

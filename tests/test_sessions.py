@@ -186,6 +186,7 @@ def _config(
     *,
     help_enter: bool = False,
     proxyjump: bool = False,
+    socks: bool = False,
     jump_key: bool = False,
     nested: bool = False,
     nested_telnet: bool = False,
@@ -194,7 +195,9 @@ def _config(
     console: bool = False,
     **runtime: object,
 ) -> AppConfig:
-    if proxyjump:
+    if socks:
+        connection_name = "through-socks"
+    elif proxyjump:
         connection_name = "through-jump"
     elif nested or nested_telnet:
         connection_name = "nested-term"
@@ -210,6 +213,12 @@ def _config(
     credentials: dict[str, object] = {
         "net": {"backend": "pass", "entry": "network/net", "username": "operator"}
     }
+    if socks:
+        connections["through-socks"] = {
+            "type": "proxyjump",
+            "socks": {"host": "127.0.0.1", "port": 10900},
+            "host_key_policy": "accept_new",
+        }
     if proxyjump:
         connections["through-jump"] = {
             "type": "proxyjump",
@@ -353,6 +362,34 @@ def _proxy_manager(
     return manager, resolved_host_keys, params
 
 
+def _socks_manager(
+    connection: FakeConnection,
+    audit: FakeAudit,
+    *,
+    connection_error: Exception | None = None,
+    clock: MutableClock | None = None,
+    host_keys: FakeHostKeys | None = None,
+) -> tuple[SessionManager, FakeHostKeys, list[dict[str, object]]]:
+    resolved_host_keys = host_keys or FakeHostKeys()
+    params: list[dict[str, object]] = []
+
+    def factory(connection_params: dict[str, object]) -> FakeConnection:
+        params.append(connection_params)
+        if connection_error is not None:
+            raise connection_error
+        return connection
+
+    manager = SessionManager(
+        _config(socks=True),
+        connection_factory=factory,
+        credential_resolver=FakeCredentials(),
+        audit_logger=audit,  # type: ignore[arg-type]
+        host_keys=resolved_host_keys,  # type: ignore[arg-type]
+        clock=clock or MutableClock(),
+    )
+    return manager, resolved_host_keys, params
+
+
 def _nested_manager(
     connection: FakeConnection,
     audit: FakeAudit,
@@ -433,7 +470,64 @@ def test_proxyjump_uses_a_forwarded_socket_and_closes_the_jump_client() -> None:
     assert jump_client.closed is True
 
 
-def test_proxyjump_uses_an_explicit_key_file_without_agent_discovery() -> None:
+class FakeSocket:
+    def settimeout(self, value: float) -> None:
+        self.timeout = value
+
+    def fileno(self) -> int:
+        return -1
+
+
+def test_socks_proxyjump_reaches_target_through_a_socks_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    host_keys = FakeHostKeys(invoke_probe=False)
+    socks_targets: list[tuple[str, int, float]] = []
+    fake_socket = FakeSocket()
+
+    def fake_socks5_connect(
+        proxy_host: str,
+        proxy_port: int,
+        target_host: str,
+        target_port: int,
+        timeout: float,
+    ) -> object:
+        socks_targets.append((target_host, target_port, timeout))
+        assert proxy_host == "127.0.0.1"
+        assert proxy_port == 10900
+        return fake_socket
+
+    monkeypatch.setattr(
+        "network_terminal_mcp.sessions.manager.socks5_connect", fake_socks5_connect
+    )
+    manager, _, params = _socks_manager(connection, audit, host_keys=host_keys)
+
+    info = manager.open_session("sw1")
+
+    assert host_keys.calls == [("192.0.2.1", 22, "accept_new", True)]
+    assert socks_targets == [(("192.0.2.1", 22, 60.0))]
+    assert params[0]["host"] == "192.0.2.1"
+    assert params[0]["sock"] is fake_socket
+    assert audit.records[0]["route"] == "socks"
+
+    manager.close_session(info.session_id)
+    assert connection.disconnected is True
+
+
+def test_socks_proxyjump_does_not_connect_an_ssh_bastion() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager, _, params = _socks_manager(connection, audit)
+
+    info = manager.open_session("sw1")
+
+    assert params[0]["sock"] is not None
+    # No jump client is created for the socks-only route.
+    assert "jump_client" not in params[0]
+
+    manager.close_session(info.session_id)
     connection = FakeConnection()
     jump_client = FakeJumpClient()
     manager, _, _ = _proxy_manager(

@@ -82,6 +82,7 @@ class AppConfig:
         for name, profile in self.connections.connections.items():
             if (
                 isinstance(profile, ProxyJumpConnection)
+                and profile.jump_credentials is not None
                 and profile.jump_credentials not in self.credentials.credentials
             ):
                 raise ConfigError(

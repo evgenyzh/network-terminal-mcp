@@ -106,6 +106,23 @@ Nested подключается к `host` через `generic_termserver`, за�
 Literal `ProxyCommand` и несколько hops не поддерживаются. Сложные nested-профили
 в дальнейшем будут описываться массивом typed hops, а не shell-строкой.
 
+`proxyjump` с полем `socks: {host, port}` вместо `jump_host` маршрутизирует
+final target через локальный SOCKS5-прокси — обычно это локальный SSH dynamic
+forward (`ssh -D 1080 jump.example.net`). `socks` и `jump_host` взаимоисключающие.
+Прокси не резолвит имена, поэтому target должен быть IP-адресом. Для первого
+подключения цели, видимой только через туннель, используйте
+`host_key_policy: accept_new` (TOFU через SOCKS), затем переключите на `strict`.
+Пример:
+
+```yaml
+connections:
+  through-socks:
+    type: proxyjump
+    protocol: ssh
+    socks: { host: 127.0.0.1, port: 1080 }
+    host_key_policy: accept_new
+```
+
 `legacy_ssh` и явные списки KEX/ciphers/key types выполняют per-profile
 algorithm override: категории, перечисленные в профиле, ограничиваются
 allowlist, остальные сохраняют значения Paramiko по умолчанию. Списки не
