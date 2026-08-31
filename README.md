@@ -6,10 +6,12 @@
 несколько команд в одной сессии и получить полный вывод без временных
 `sshpass`-команд и одноразовых скриптов.
 
-Статус: Этапы 1, 2, 3, 4 и 6 реализованы; Этап 3 поддерживает один SSH-only
+Статус: Этапы 1, 2, 3, 4, 6 и 7 реализованы; Этап 3 поддерживает один SSH-only
 ProxyJump hop и один Nested hop (`generic_termserver` + `redispatch`), а
 Этап 4 — per-profile legacy SSH algorithm overrides, прямой Telnet, Nested
-Telnet и TCP console profiles.
+Telnet и TCP console profiles. Этап 7 добавляет безопасное применение
+изменений (`plan_change`/`apply_change`/`abort_change`/`finalize_change`) с
+двойным gating, двухшаговым подтверждением и опциональным reload-откатом.
 Есть конфигурация, политика,
 аудит, credential backend, known_hosts, постоянные Netmiko-сессии, безопасный
 `cli_help`, pager/control state machine и stdio MCP tools. Direct SSH проверен
@@ -21,13 +23,15 @@ password bastion до SNR old. Current local OpenCode profile подключён
 через stdio MCP и прошёл read-only round-trip. Подробности в
 [результатах проверок](docs/validation.md).
 
-Текущие ограничения: `raw_input` и config
-changes остаются следующими этапами. Команда с
+Текущие ограничения: `raw_input`
+остаётся следующим этапом. Команда с
 policy-решением `ask` возвращает `confirmation_required`, но не исполняется.
 `respond` отвечает только на уже распознанный prompt устройства и не является
 механизмом policy confirmation. Telnet и console требуют двойного gating
 (`allow_telnet` на устройстве и `defaults.telnet: allow`) и проверены только
-unit-тестами, без hardware-подтверждения.
+unit-тестами, без hardware-подтверждения. Изменения конфигурации проверены
+unit-тестами; hardware-проверка rollback (Junos commit confirmed, Huawei
+schedule reboot delay) не выполнялась.
 
 ## Основные цели
 

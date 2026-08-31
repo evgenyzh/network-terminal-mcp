@@ -24,6 +24,16 @@ devices:
     allow_telnet: true
     tags: [lab, cisco, telnet]
 
+  # Configuration changes require allow_writes: true in addition to a policy
+  # that allows write_change. Only set it for devices where changes are wanted.
+  lab-cisco-writable:
+    host: 192.0.2.40
+    platform: cisco_ios
+    credentials: network-tacacs
+    connection: direct
+    allow_writes: true
+    tags: [lab, cisco, writable]
+
 groups:
   lab:
     tags: [lab]

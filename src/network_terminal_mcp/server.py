@@ -11,6 +11,7 @@ from typing import Literal
 import anyio
 from mcp.server import MCPServer
 
+from network_terminal_mcp.changes.models import ChangeResult, SafetyNet
 from network_terminal_mcp.config.loader import load_config
 from network_terminal_mcp.errors import TargetError
 from network_terminal_mcp.sessions import (
@@ -111,9 +112,59 @@ def create_server(
         return await _run_sync(session_manager.session_status, session_id)
 
     @server.tool()
-    async def close_session(session_id: str) -> SessionInfo:
-        """Close a session and disconnect from the device."""
-        return await _run_sync(session_manager.close_session, session_id)
+    async def close_session(session_id: str, force: bool = False) -> SessionInfo:
+        """Close a session and disconnect from the device.
+
+        ``force=true`` closes even when a scheduled reboot from an applied
+        change plan is still pending cancellation (emergency use).
+        """
+        return await _run_sync(session_manager.close_session, session_id, force=force)
+
+    @server.tool()
+    async def plan_change(
+        session_id: str,
+        title: str,
+        commands: list[str],
+        safety_net: SafetyNet | None = None,
+        auto_approve: bool = False,
+    ) -> ChangeResult:
+        """Register a configuration change plan without executing anything.
+
+        The device must have ``allow_writes: true`` and the policy default
+        ``write_change`` must not be ``deny``. Commands are validated for
+        structural safety. Optionally declare a reload/commit safety net with
+        opaque ``save``, ``arm`` and ``cancel`` commands.
+        """
+        return await _run_sync(
+            session_manager.plan_change,
+            session_id,
+            title,
+            commands,
+            safety_net=(
+                safety_net.model_dump() if safety_net is not None else None
+            ),
+            auto_approve=auto_approve,
+        )
+
+    @server.tool()
+    async def apply_change(change_id: str) -> ChangeResult:
+        """Confirm and then execute a change plan.
+
+        The first call returns the canonical command list with
+        ``confirmation_required`` and executes nothing; the second call
+        executes the plan.
+        """
+        return await _run_sync(session_manager.apply_change, change_id)
+
+    @server.tool()
+    async def abort_change(change_id: str) -> ChangeResult:
+        """Cancel a change plan before anything is executed."""
+        return await _run_sync(session_manager.abort_change, change_id)
+
+    @server.tool()
+    async def finalize_change(change_id: str) -> ChangeResult:
+        """Cancel the scheduled reboot or commit the safety net after apply."""
+        return await _run_sync(session_manager.finalize_change, change_id)
 
     return server
 

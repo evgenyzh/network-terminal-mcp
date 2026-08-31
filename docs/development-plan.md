@@ -141,7 +141,14 @@ target, read-only command и закрытие session.
 
 ## Этап 7. Изменения конфигурации
 
-Этот этап начинается только после стабильной диагностики.
+Статус: реализован. Изменения отделены от диагностики отдельными инструментами
+`plan_change`, `apply_change`, `abort_change` и `finalize_change` с двойным
+gating (`allow_writes` на устройстве и `defaults.write_change` в policy).
+`apply_change` двухшаговый, хранит канонический список команд на сервере и
+исполняет один раз. Опциональная `safety_net` (save/arm/cancel) даёт откат через
+reload/commit confirmed: `save` выполняется до команд изменений, `arm` после,
+`finalize_change` отменяет страховку, а блокировка `close_session` гарантирует,
+что запланированная перезагрузка не будет забыта.
 
 - Добавить отдельные `plan_change` и `apply_change`; не расширять
   `run_command` скрытым режимом записи.

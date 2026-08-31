@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
+from network_terminal_mcp.changes.models import ChangeResult
 from network_terminal_mcp.server import create_server
 from network_terminal_mcp.sessions import (
     CliHelpResult,
@@ -78,9 +79,69 @@ class FakeManager:
         self.calls.append(("session_status", session_id))
         return self.info
 
-    def close_session(self, session_id: str) -> SessionInfo:
-        self.calls.append(("close_session", session_id))
+    def close_session(self, session_id: str, *, force: bool = False) -> SessionInfo:
+        self.calls.append(("close_session", (session_id, force)))
         return self.info.model_copy(update={"state": SessionState.CLOSED})
+
+    def plan_change(
+        self,
+        session_id: str,
+        title: str,
+        commands: list[str],
+        *,
+        safety_net: object | None = None,
+        auto_approve: bool = False,
+    ) -> ChangeResult:
+        self.calls.append(("plan_change", (session_id, title, commands, safety_net, auto_approve)))
+        return ChangeResult(
+            change_id="chg-1",
+            session_id=session_id,
+            target="sw1",
+            platform="cisco_ios",
+            title=title,
+            state="proposed",
+            hash="abc",
+            commands=[{"command": command} for command in commands],
+        )
+
+    def apply_change(self, change_id: str) -> ChangeResult:
+        self.calls.append(("apply_change", change_id))
+        return ChangeResult(
+            change_id=change_id,
+            session_id="session-1",
+            target="sw1",
+            platform="cisco_ios",
+            title="t",
+            state="applied",
+            hash="abc",
+            commands=[],
+        )
+
+    def abort_change(self, change_id: str) -> ChangeResult:
+        self.calls.append(("abort_change", change_id))
+        return ChangeResult(
+            change_id=change_id,
+            session_id="session-1",
+            target="sw1",
+            platform="cisco_ios",
+            title="t",
+            state="aborted",
+            hash="abc",
+            commands=[],
+        )
+
+    def finalize_change(self, change_id: str) -> ChangeResult:
+        self.calls.append(("finalize_change", change_id))
+        return ChangeResult(
+            change_id=change_id,
+            session_id="session-1",
+            target="sw1",
+            platform="cisco_ios",
+            title="t",
+            state="finalized",
+            hash="abc",
+            commands=[],
+        )
 
 
 @pytest.mark.asyncio
@@ -179,3 +240,55 @@ async def test_output_and_close_tools() -> None:
     closed = await server.call_tool("close_session", {"session_id": "session-1"})
     assert output.structured_content["output"] == "chunk"
     assert closed.structured_content["state"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_change_tools() -> None:
+    manager = FakeManager()
+    server = create_server(manager=manager)  # type: ignore[arg-type]
+
+    planned = await server.call_tool(
+        "plan_change",
+        {
+            "session_id": "session-1",
+            "title": "vlan",
+            "commands": ["vlan 100"],
+            "safety_net": {
+                "save": "copy running-config startup-config",
+                "arm": "reload in 10",
+                "cancel": "reload cancel",
+            },
+        },
+    )
+    applied = await server.call_tool("apply_change", {"change_id": "chg-1"})
+    aborted = await server.call_tool("abort_change", {"change_id": "chg-2"})
+    finalized = await server.call_tool("finalize_change", {"change_id": "chg-3"})
+    forced = await server.call_tool(
+        "close_session", {"session_id": "session-1", "force": True}
+    )
+
+    assert planned.structured_content["state"] == "proposed"
+    assert applied.structured_content["state"] == "applied"
+    assert aborted.structured_content["state"] == "aborted"
+    assert finalized.structured_content["state"] == "finalized"
+    assert forced.structured_content["state"] == "closed"
+    assert manager.calls == [
+        (
+            "plan_change",
+            (
+                "session-1",
+                "vlan",
+                ["vlan 100"],
+                {
+                    "save": "copy running-config startup-config",
+                    "arm": "reload in 10",
+                    "cancel": "reload cancel",
+                },
+                False,
+            ),
+        ),
+        ("apply_change", "chg-1"),
+        ("abort_change", "chg-2"),
+        ("finalize_change", "chg-3"),
+        ("close_session", ("session-1", True)),
+    ]

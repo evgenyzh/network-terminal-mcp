@@ -16,6 +16,12 @@ from netmiko import ConnectHandler
 from netmiko.ssh_dispatcher import redispatch
 
 from network_terminal_mcp.audit import AuditLogger
+from network_terminal_mcp.changes.manager import ChangeManager
+from network_terminal_mcp.changes.models import (
+    ChangeResult,
+    ChangeState,
+    SafetyNet,
+)
 from network_terminal_mcp.config.loader import AppConfig
 from network_terminal_mcp.config.models import (
     Action,
@@ -27,10 +33,10 @@ from network_terminal_mcp.config.models import (
     ProxyJumpConnection,
 )
 from network_terminal_mcp.credentials.pass_backend import Credentials, PassBackend
-from network_terminal_mcp.errors import PolicyError, SessionError, TransportError
+from network_terminal_mcp.errors import ChangeError, PolicyError, SessionError, TransportError
 from network_terminal_mcp.host_keys import HostKeyStatus, HostKeyStore, probe_host_key_socket
 from network_terminal_mcp.platforms import Platform, PlatformRegistry
-from network_terminal_mcp.policy.engine import PolicyEngine
+from network_terminal_mcp.policy.engine import PolicyEngine, check_structural_safety
 from network_terminal_mcp.redaction import Redactor
 from network_terminal_mcp.sessions.models import (
     CliHelpResult,
@@ -195,6 +201,7 @@ class SessionManager:
         host_keys: HostKeyStore | None = None,
         jump_client_factory: Callable[[], paramiko.SSHClient] = paramiko.SSHClient,
         nested_redispatch: NestedRedispatch = _netmiko_nested_redispatch,
+        change_manager: ChangeManager | None = None,
         clock: Clock = time.monotonic,
     ) -> None:
         self._config = config
@@ -207,6 +214,7 @@ class SessionManager:
         self._host_keys = host_keys or HostKeyStore(config.policy.runtime.known_hosts_file)
         self._jump_client_factory = jump_client_factory
         self._nested_redispatch = nested_redispatch
+        self._changes = change_manager or ChangeManager()
         self._clock = clock
         self._sessions: dict[str, _ManagedSession] = {}
         self._lock = threading.RLock()
@@ -658,8 +666,20 @@ class SessionManager:
         with session.lock:
             return self._session_info(session)
 
-    def close_session(self, session_id: str) -> SessionInfo:
-        """Disconnect and permanently remove a session."""
+    def close_session(self, session_id: str, *, force: bool = False) -> SessionInfo:
+        """Disconnect and permanently remove a session.
+
+        Refuses to close while a scheduled reboot from an applied change plan
+        is still pending cancellation; ``force=True`` overrides for emergency
+        cases and logs a ``reboot_not_cancelled`` audit warning.
+        """
+        active = self._changes.has_active_reboot(session_id)
+        if active is not None and not force:
+            raise SessionError(
+                f"session {session_id} has an active scheduled reboot from change "
+                f"plan {active.change_id}; call finalize_change first or "
+                "close with force=true"
+            )
         with self._lock:
             session = self._sessions.pop(session_id, None)
         if session is None:
@@ -681,15 +701,281 @@ class SessionManager:
                 session.jump_client = None
                 session.state = SessionState.CLOSED
                 self._touch(session)
+            outcome = "completed"
+            if active is not None:
+                self._audit_event(
+                    "reboot_not_cancelled",
+                    target=session.target,
+                    platform=session.platform,
+                    outcome="warning",
+                    redactor=session.redactor,
+                    session_id=session_id,
+                    change_id=active.change_id,
+                )
+                outcome = "completed_with_reboot_pending"
             self._audit_event(
                 "close_session",
                 target=session.target,
                 platform=session.platform,
-                outcome="completed",
+                outcome=outcome,
                 redactor=session.redactor,
                 session_id=session_id,
             )
             return self._session_info(session)
+
+    def plan_change(
+        self,
+        session_id: str,
+        title: str,
+        commands: list[str],
+        *,
+        safety_net: dict[str, str] | None = None,
+        auto_approve: bool = False,
+    ) -> ChangeResult:
+        """Register a configuration change plan without executing anything."""
+        if not title.strip():
+            raise ChangeError("change plan title must not be empty")
+        if not commands:
+            raise ChangeError("change plan must contain at least one command")
+        session = self._get_session(session_id)
+        with session.lock:
+            self._require_ready(session)
+            self._require_writes_allowed(session)
+            for command in commands:
+                check_structural_safety(command, tool="plan_change")
+            resolved_safety = None
+            if safety_net is not None:
+                if set(safety_net) != {"save", "arm", "cancel"}:
+                    raise ChangeError(
+                        "safety_net requires exactly save, arm and cancel commands"
+                    )
+                for command in safety_net.values():
+                    check_structural_safety(command, tool="safety_net")
+                resolved_safety = SafetyNet(**safety_net)
+            plan = self._changes.create(
+                session_id=session_id,
+                target=session.target.name,
+                host=session.target.host,
+                platform=session.platform.name,
+                title=title.strip(),
+                commands=commands,
+                safety_net=resolved_safety,
+                auto_approve=auto_approve,
+            )
+            self._audit_event(
+                "plan_change",
+                target=session.target,
+                platform=session.platform,
+                outcome="created",
+                redactor=session.redactor,
+                session_id=session_id,
+                change_id=plan.change_id,
+                title=plan.title,
+                hash=plan.hash,
+                safety_net=bool(resolved_safety),
+            )
+            return ChangeResult.from_plan(plan)
+
+    def apply_change(self, change_id: str) -> ChangeResult:
+        """Confirm and then execute a change plan in two steps.
+
+        The first call returns the canonical command list with
+        ``confirmation_required`` and executes nothing. The second call on the
+        same plan executes it. ``auto_approve`` plans skip the confirmation
+        step only when the operator pre-authorized auto-approval for this
+        session/device pair.
+        """
+        plan = self._changes.get(change_id)
+        session = self._get_session(plan.session_id)
+        with session.lock:
+            if plan.state == ChangeState.PROPOSED:
+                confirmed = self._changes.confirm(change_id)
+                self._audit_event(
+                    "apply_change",
+                    target=session.target,
+                    platform=session.platform,
+                    outcome="confirmed",
+                    redactor=session.redactor,
+                    session_id=session.session_id,
+                    change_id=change_id,
+                    hash=plan.hash,
+                )
+                if not plan.auto_approve:
+                    return ChangeResult.from_plan(
+                        confirmed, confirmation_required=True
+                    )
+                plan = confirmed
+            elif plan.state != ChangeState.CONFIRMED:
+                raise ChangeError(
+                    f"change plan {change_id} cannot be applied from {plan.state.value}"
+                )
+
+            self._require_ready(session)
+            self._require_writes_allowed(session)
+            warnings: list[str] = []
+            output_parts: list[str] = []
+            try:
+                plan = self._changes.mark_applied(change_id)
+                if plan.safety_net is not None:
+                    self._run_change_command(
+                        session, plan.safety_net.save, output_parts
+                    )
+                    self._run_change_command(
+                        session, plan.safety_net.arm, output_parts
+                    )
+                    self._changes.set_reboot_required(change_id, True)
+                    plan = self._changes.get(change_id)
+                    warnings.append(
+                        "scheduled reboot armed; call finalize_change after "
+                        "verification to cancel it"
+                    )
+                for command in [cmd.command for cmd in plan.commands]:
+                    self._run_change_command(session, command, output_parts)
+            except Exception as exc:
+                self._changes.mark_failed(change_id)
+                message = session.redactor.redact(str(exc))
+                self._audit_event(
+                    "apply_change",
+                    target=session.target,
+                    platform=session.platform,
+                    outcome="failed",
+                    redactor=session.redactor,
+                    session_id=session.session_id,
+                    change_id=change_id,
+                    hash=plan.hash,
+                    error=message,
+                )
+                return ChangeResult.from_plan(
+                    self._changes.get(change_id),
+                    output="\n".join(output_parts),
+                    error=message,
+                )
+
+            self._touch(session)
+            output = "\n".join(output_parts)
+            self._audit_event(
+                "apply_change",
+                target=session.target,
+                platform=session.platform,
+                outcome="completed",
+                redactor=session.redactor,
+                session_id=session.session_id,
+                change_id=change_id,
+                hash=plan.hash,
+                reboot_cancel_required=plan.reboot_cancel_required,
+            )
+            return ChangeResult.from_plan(
+                self._changes.get(change_id), output=output, warnings=warnings
+            )
+
+    def abort_change(self, change_id: str) -> ChangeResult:
+        """Cancel a change plan before anything is executed."""
+        plan = self._changes.get(change_id)
+        session = self._get_session(plan.session_id)
+        with session.lock:
+            aborted = self._changes.abort(change_id)
+            self._audit_event(
+                "abort_change",
+                target=session.target,
+                platform=session.platform,
+                outcome="aborted",
+                redactor=session.redactor,
+                session_id=session.session_id,
+                change_id=change_id,
+                hash=plan.hash,
+            )
+            return ChangeResult.from_plan(aborted)
+
+    def finalize_change(self, change_id: str) -> ChangeResult:
+        """Cancel the scheduled reboot or commit the safety net after apply."""
+        plan = self._changes.get(change_id)
+        if plan.state != ChangeState.APPLIED:
+            raise ChangeError(
+                f"change plan {change_id} cannot be finalized from {plan.state.value}"
+            )
+        session = self._get_session(plan.session_id)
+        with session.lock:
+            self._require_ready(session)
+            warnings: list[str] = []
+            output_parts: list[str] = []
+            error: str | None = None
+            try:
+                if plan.safety_net is not None and plan.reboot_cancel_required:
+                    self._run_change_command(
+                        session, plan.safety_net.cancel, output_parts
+                    )
+                    self._changes.set_reboot_required(change_id, False)
+            except Exception as exc:
+                self._changes.mark_failed(change_id)
+                error = session.redactor.redact(str(exc))
+                warnings.append(
+                    "could not cancel the scheduled reboot; the device will "
+                    "reboot on its own (reload cancel command failed)"
+                )
+                self._audit_event(
+                    "finalize_change",
+                    target=session.target,
+                    platform=session.platform,
+                    outcome="failed",
+                    redactor=session.redactor,
+                    session_id=session.session_id,
+                    change_id=change_id,
+                    hash=plan.hash,
+                    error=error,
+                )
+                return ChangeResult.from_plan(
+                    self._changes.get(change_id),
+                    output="\n".join(output_parts),
+                    warnings=warnings,
+                    error=error,
+                )
+            finalized = self._changes.finalize(change_id)
+            self._touch(session)
+            self._audit_event(
+                "finalize_change",
+                target=session.target,
+                platform=session.platform,
+                outcome="completed",
+                redactor=session.redactor,
+                session_id=session.session_id,
+                change_id=change_id,
+                hash=plan.hash,
+                reboot_cancel_required=False,
+            )
+            return ChangeResult.from_plan(
+                finalized, output="\n".join(output_parts), warnings=warnings
+            )
+
+    def _require_writes_allowed(self, session: _ManagedSession) -> None:
+        if not session.target.allow_writes:
+            raise ChangeError(
+                f"changes are not enabled for target {session.target.name!r}; "
+                "set allow_writes: true on the device"
+            )
+        if self._config.policy.defaults.write_change == "deny":
+            raise ChangeError("change plans are denied by policy defaults")
+
+    def _run_change_command(
+        self,
+        session: _ManagedSession,
+        command: str,
+        output_parts: list[str],
+    ) -> None:
+        """Execute one change command, appending its output to the result."""
+        check_structural_safety(command, tool="plan_change")
+        self._require_ready(session)
+        raw_output = self._send_command_until_terminal(session, command)
+        outcome = self._consume_terminal_output(session, raw_output)
+        if outcome.pager_active:
+            raise TransportError(
+                "change command entered a pager; refusing to continue"
+            )
+        if outcome.response_required:
+            raise TransportError(
+                "change command triggered a device confirmation; refusing to "
+                "continue"
+            )
+        output_parts.append(session.redactor.redact(outcome.output))
 
     def _continue_pager(self, session: _ManagedSession, action: str) -> ControlResult:
         if session.pager_pages >= self._config.policy.runtime.max_pager_pages:

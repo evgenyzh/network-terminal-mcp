@@ -54,6 +54,23 @@ def test_resolve_named_device() -> None:
     assert target.host == "192.0.2.1"
     assert target.platform == "cisco_ios"
     assert target.tags == ("lab",)
+    assert target.allow_writes is False
+
+
+def test_resolve_named_device_carries_allow_writes() -> None:
+    config = _config(
+        devices={
+            "sw1": {
+                "host": "192.0.2.1",
+                "platform": "cisco_ios",
+                "credentials": "net",
+                "connection": "direct",
+                "allow_writes": True,
+            }
+        }
+    )
+    target = TargetResolver(config).resolve(name="sw1")
+    assert target.allow_writes is True
 
 
 def test_resolve_unknown_device_raises() -> None:

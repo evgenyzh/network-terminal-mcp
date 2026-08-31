@@ -1,10 +1,10 @@
-# Эксплуатация Этапов 1-4
+# Эксплуатация Этапов 1-4, 7
 
 ## Границы текущей версии
 
 Сервер поддерживает постоянные direct SSH-сессии, один configured SSH-only
 ProxyJump hop, один configured Nested hop (SSH или Telnet) и TCP console
-profiles. Он не поддерживает `raw_input` или запись конфигурации.
+profiles. Он не поддерживает `raw_input`.
 
 Для ProxyJump нужны локальные connection и credential profiles для final target
 и bastion. Обе host key проверяются независимо; bastion должен разрешать
@@ -32,6 +32,34 @@ Telnet-драйвер платформы берётся из `telnet_driver` в 
 выводится как `<driver>_telnet`; если такого класса нет, Telnet/console для
 платформы недоступны.
 
+## Изменения конфигурации
+
+Изменения идут через отдельные инструменты, не через `run_command`:
+
+- `plan_change(session_id, title, commands, safety_net?, auto_approve?)` —
+  регистрирует план без исполнения. Требует `allow_writes: true` на устройстве
+  и `defaults.write_change: allow` в policy.
+- `apply_change(change_id)` — двухшаговый: первый вызов показывает план с
+  `confirmation_required` и не исполняет, второй применяет сохранённые команды.
+- `abort_change(change_id)` — отменяет план до исполнения.
+- `finalize_change(change_id)` — отменяет запланированную перезагрузку или
+  фиксирует страховку.
+
+Опциональная `safety_net` задаётся моделью как `{save, arm, cancel}` — команды,
+которые выполняет сервер без интерпретации. При применении `save` выполняется
+до команд изменений (фиксирует до-изменённое состояние), затем `arm`
+(например `reload in 10` / `schedule reboot delay 10` / `commit confirmed`).
+После этого `close_session` блокируется до `finalize_change`, который выполняет
+`cancel` (reload cancel / undo schedule reboot / commit). Если `cancel` не
+прошёл, устройство перезагрузится само через заданный интервал и вернётся к
+конфигурации, сохранённой командой `save`; сервер докладывает об этом в
+результате и audit. `close_session(force=true)` закрывает сессию при активной
+перезагрузке только в аварийных случаях (аудит `reboot_not_cancelled`).
+
+`auto_approve: true` в `plan_change` позволяет применить план без второго
+подтверждающего вызова, но только если пользователь явно разрешил авторежим
+для этой пары (сессия, устройство) и модель объявила это заранее.
+
 Реализованные MCP tools:
 
 - `open_session`
@@ -43,6 +71,10 @@ Telnet-драйвер платформы берётся из `telnet_driver` в 
 - `read_output`
 - `session_status`
 - `close_session`
+- `plan_change`
+- `apply_change`
+- `abort_change`
+- `finalize_change`
 
 ## Локальная конфигурация
 

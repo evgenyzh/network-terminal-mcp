@@ -45,6 +45,7 @@ def test_device_model_valid() -> None:
     )
     assert device.host == "192.0.2.10"
     assert device.allow_telnet is False
+    assert device.allow_writes is False
 
 
 def test_device_rejects_unknown_field() -> None:
@@ -376,3 +377,4 @@ def test_policy_config_defaults() -> None:
     assert policy.defaults.cli_help == "allow"
     assert policy.defaults.raw_input == "deny"
     assert policy.defaults.telnet == "deny"
+    assert policy.defaults.write_change == "deny"

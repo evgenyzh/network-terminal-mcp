@@ -1,4 +1,4 @@
-# Результаты проверок Этапов 1, 2, 3, 4 и 6
+# Результаты проверок Этапов 1, 2, 3, 4, 6 и 7
 
 ## Scope
 
@@ -119,12 +119,37 @@ Legacy SSH overrides, Telnet и console проверены unit-тестами:
 
 Hardware-проверка Telnet/console на реальном устройстве не выполнялась.
 
+## Этап 7 validation
+
+Изменения конфигурации проверены unit-тестами:
+- `plan_change` требует `allow_writes` на устройстве и `defaults.write_change
+  != deny`; пустой title/список и structural hazards отклоняются; ничего не
+  исполняется.
+- `apply_change` двухшаговый: первый вызов возвращает `confirmation_required`
+  и не исполняет, второй исполняет только сохранённые канонические команды;
+  повторный apply запрещён.
+- `abort_change` отменяет план до исполнения.
+- `safety_net` выполняет `save` до команд изменений и `arm` после, помечает
+  план требующим отмены; `finalize_change` выполняет `cancel` и снимает флаг.
+- `close_session` блокируется при активной запланированной перезагрузке;
+  `force=true` закрывает с аудитом `reboot_not_cancelled`.
+- При pager/confirmation в change-команде план переводится в `failed`;
+  при неудачном `cancel` финализация тоже `failed` с предупреждением о
+  самостоятельной перезагрузке устройства.
+- `auto_approve` пропускает подтверждающий вызов, когда разрешён явно.
+
+Hardware-проверка rollback (Junos `commit confirmed`, Huawei `schedule reboot
+delay`/`undo`, Cisco `reload in 10`/`reload cancel`) не выполнялась и требует
+отдельного явного разрешения на точные команды.
+
 ## Непроверенное
 
 - Interactive confirmations на Junos/Huawei.
 - Anonymized transcripts для platform-specific pager/prompt patterns.
 - `raw_input`.
 - Telnet (прямой и nested) и console на реальном оборудовании — только
+  unit-тесты; hardware-проверка не выполнялась.
+- Изменения конфигурации и rollback на реальном оборудовании — только
   unit-тесты; hardware-проверка не выполнялась.
 - BDCOM, EcoSGE, Eltex и PON adapters.
 - DSA-only SSH.

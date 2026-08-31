@@ -18,6 +18,13 @@
 - Какие устройства доступны через TCP console ports.
 - Требуют ли terminal servers menu/banner interaction до shell.
 
+## Изменения конфигурации
+
+- Какие платформы реально поддерживают `commit confirmed` / Safe Mode /
+  `commit trial`; на каких нужен reload-трюк.
+- Нужен ли отдельный enable secret для change-планов.
+- Какой интервал reload-страховки выбирать по умолчанию для разных семейств.
+
 ## AAA и политика
 
 - Для текущего тестового профиля задан отдельный AAA username; подтвердить,

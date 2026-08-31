@@ -111,6 +111,26 @@ session в `failed`.
 Вывод хранится в ограниченном session buffer; при превышении лимита старые данные
 вытесняются, а `oldest_offset` сообщает доступную начальную позицию.
 
+### Инструменты Этапа 7: изменения конфигурации
+
+`plan_change(session_id, title, commands, safety_net?, auto_approve?)`
+регистрирует план без исполнения. Сервер хранит канонический список команд и
+возвращает `change_id` и hash. Требуется `Device.allow_writes` и
+`defaults.write_change != deny`. Команды проходят структурную безопасность, но
+не keyword-deny (reload/save/commit-команды легитимны внутри плана).
+
+`apply_change(change_id)` двухшаговый: первый вызов возвращает канонический
+список с `confirmation_required` и не исполняет, второй исполняет ровно
+сохранённые команды. Опциональная `safety_net` содержит opaque `save`/`arm`/
+`cancel`: `save` выполняется до команд изменений, `arm` после, после чего план
+помечается как требующий отмены и `close_session` блокируется.
+
+`abort_change(change_id)` отменяет план до исполнения. `finalize_change`
+отправляет `cancel` (reload cancel/undo schedule reboot/commit) и снимает блок;
+если отмена не прошла, сервер докладывает, что устройство перезагрузится само.
+`close_session(force=true)` — аварийный обход блока с аудитом
+`reboot_not_cancelled`.
+
 ### Инструменты следующих этапов
 
 `raw_input` остается отключенным по умолчанию. Policy-confirmation workflow

@@ -24,7 +24,12 @@ devices:
     connection: direct
     tags: [access, lab]
     allow_telnet: false
+    allow_writes: false
 ```
+
+`allow_writes: true` разрешает применение изменений конфигурации на этом
+устройстве (через `plan_change`/`apply_change`); без него изменения всегда
+отклоняются, даже если policy разрешает `write_change`. По умолчанию `false`.
 
 Одноразовый target может передать те же несекретные поля в `open_session`.
 Разрешенные credential и connection profiles по-прежнему берутся из локальной
@@ -110,6 +115,13 @@ Telnet и console требуют двойного gating: `allow_telnet: true` �
 **и** `defaults.telnet: allow` в policy. По умолчанию `telnet: deny`, поэтому
 случайно включить Telnet нельзя. Telnet не проверяет host key и передаёт
 трафик и учётные данные открытым текстом; сессия всегда возвращает warning.
+
+Изменения конфигурации тоже требуют двойного gating: `Device.allow_writes:
+true` **и** `defaults.write_change: allow` в policy (по умолчанию `deny`).
+Инструменты `plan_change`, `apply_change`, `abort_change` и `finalize_change`
+применяют изменения отдельно от `run_command`; команды пишет модель, а сервер
+хранит их канонический список и исполняет один раз. Подробнее в разделе
+[Запись конфигурации](security.md#запись-конфигурации).
 
 ## Credential profile
 
