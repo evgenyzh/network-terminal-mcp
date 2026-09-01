@@ -59,6 +59,9 @@ class _BaseTerminal:
     _initial_delay = 0.25
     _retry_delay = 0.5
     _prompt_retries = 12
+    _prompt_last_read = 0.3
+    _prompt_read_timeout = 5.0
+    _PROMPT_LINE = re.compile(r"\S+[#>$%]\s*$")
 
     def _read_channel(self) -> str:
         raise NotImplementedError
@@ -115,24 +118,32 @@ class _BaseTerminal:
         raise NotImplementedError
 
     def find_prompt(self) -> str:
-        """Send RETURN and return the last line of the terminal output."""
+        """Return the current device prompt.
+
+        Sends RETURN, reads until output stabilizes (timing-based), and returns
+        the last line that looks like a prompt (ends with ``#``, ``>``, ``$`` or
+        ``%``). Banner lines and login residue are skipped by retrying.
+        """
         self._buffer = ""
-        self.write_channel("\n")
-        time.sleep(self._initial_delay)
-        prompt = self._read_any().strip()
-        count = 0
-        while count <= self._prompt_retries and not prompt:
-            if not prompt:
-                self.write_channel("\n")
-                time.sleep(self._retry_delay)
-                prompt = self._read_any().strip()
-            count += 1
-        lines = prompt.splitlines()
-        prompt = lines[-1].strip() if lines else prompt
+        last_prompt = ""
+        for _ in range(self._prompt_retries + 1):
+            self.write_channel("\n")
+            data = self.read_channel_timing(
+                last_read=self._prompt_last_read,
+                read_timeout=self._prompt_read_timeout,
+            )
+            for line in reversed(data.splitlines()):
+                candidate = line.strip()
+                if self._PROMPT_LINE.search(candidate):
+                    last_prompt = candidate
+                    break
+            if last_prompt:
+                break
+            time.sleep(self._retry_delay)
         self._buffer = ""
-        if not prompt:
+        if not last_prompt:
             raise TransportError("unable to find the device prompt")
-        return prompt
+        return last_prompt
 
     def send_command(
         self,

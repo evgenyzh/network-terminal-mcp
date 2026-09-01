@@ -14,6 +14,8 @@ class ScriptedTerminal(_BaseTerminal):
     _initial_delay = 0.001
     _retry_delay = 0.001
     _prompt_retries = 3
+    _prompt_last_read = 0.001
+    _prompt_read_timeout = 0.1
 
     def __init__(self, chunks: list[str]) -> None:
         super().__init__()
