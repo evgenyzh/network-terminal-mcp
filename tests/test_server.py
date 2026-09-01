@@ -84,55 +84,30 @@ class FakeManager:
     def plan_change(
         self,
         session_id: str,
-        title: str,
         commands: list[str],
         *,
         auto_approve: bool = False,
     ) -> ChangeResult:
-        self.calls.append(("plan_change", (session_id, title, commands, auto_approve)))
+        self.calls.append(("plan_change", (session_id, commands, auto_approve)))
         return ChangeResult(
-            change_id="chg-1",
             session_id=session_id,
-            target="sw1",
-            title=title,
             state="proposed",
-            hash="abc",
             commands=[{"command": command} for command in commands],
         )
 
-    def apply_change(self, change_id: str) -> ChangeResult:
-        self.calls.append(("apply_change", change_id))
+    def apply_change(self, session_id: str) -> ChangeResult:
+        self.calls.append(("apply_change", session_id))
         return ChangeResult(
-            change_id=change_id,
-            session_id="session-1",
-            target="sw1",
-            title="t",
+            session_id=session_id,
             state="applied",
-            hash="abc",
             commands=[],
         )
 
-    def abort_change(self, change_id: str) -> ChangeResult:
-        self.calls.append(("abort_change", change_id))
+    def abort_change(self, session_id: str) -> ChangeResult:
+        self.calls.append(("abort_change", session_id))
         return ChangeResult(
-            change_id=change_id,
-            session_id="session-1",
-            target="sw1",
-            title="t",
+            session_id=session_id,
             state="aborted",
-            hash="abc",
-            commands=[],
-        )
-
-    def finalize_change(self, change_id: str) -> ChangeResult:
-        self.calls.append(("finalize_change", change_id))
-        return ChangeResult(
-            change_id=change_id,
-            session_id="session-1",
-            target="sw1",
-            title="t",
-            state="finalized",
-            hash="abc",
             commands=[],
         )
 
@@ -242,32 +217,27 @@ async def test_change_tools() -> None:
         "plan_change",
         {
             "session_id": "session-1",
-            "title": "vlan",
             "commands": ["vlan 100"],
         },
     )
-    applied = await server.call_tool("apply_change", {"change_id": "chg-1"})
-    aborted = await server.call_tool("abort_change", {"change_id": "chg-2"})
-    finalized = await server.call_tool("finalize_change", {"change_id": "chg-3"})
+    applied = await server.call_tool("apply_change", {"session_id": "session-1"})
+    aborted = await server.call_tool("abort_change", {"session_id": "session-1"})
     closed = await server.call_tool("close_session", {"session_id": "session-1"})
 
     assert planned.structured_content["state"] == "proposed"
     assert applied.structured_content["state"] == "applied"
     assert aborted.structured_content["state"] == "aborted"
-    assert finalized.structured_content["state"] == "finalized"
     assert closed.structured_content["state"] == "closed"
     assert manager.calls == [
         (
             "plan_change",
             (
                 "session-1",
-                "vlan",
                 ["vlan 100"],
                 False,
             ),
         ),
-        ("apply_change", "chg-1"),
-        ("abort_change", "chg-2"),
-        ("finalize_change", "chg-3"),
+        ("apply_change", "session-1"),
+        ("abort_change", "session-1"),
         ("close_session", "session-1"),
     ]

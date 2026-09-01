@@ -10,7 +10,7 @@
 ProxyJump hop и один Nested hop, а
 Этап 4 — per-profile legacy SSH algorithm overrides, прямой Telnet, Nested
 Telnet и TCP console profiles. Этап 7 добавляет безопасное применение
-изменений (`plan_change`/`apply_change`/`abort_change`/`finalize_change`) с
+изменений (`plan_change`/`apply_change`/`abort_change`) с
 двухшаговым подтверждением. Откат (reload/commit confirmed) — рекомендация
 модели по собственному усмотрению, а не серверная механика.
 Есть конфигурация, политика,

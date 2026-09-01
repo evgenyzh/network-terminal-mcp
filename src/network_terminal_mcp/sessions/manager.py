@@ -694,14 +694,11 @@ class SessionManager:
     def plan_change(
         self,
         session_id: str,
-        title: str,
         commands: list[str],
         *,
         auto_approve: bool = False,
     ) -> ChangeResult:
         """Register a configuration change plan without executing anything."""
-        if not title.strip():
-            raise ChangeError("change plan title must not be empty")
         if not commands:
             raise ChangeError("change plan must contain at least one command")
         session = self._get_session(session_id)
@@ -711,9 +708,6 @@ class SessionManager:
                 check_structural_safety(command, tool="plan_change")
             plan = self._changes.create(
                 session_id=session_id,
-                target=session.target.name,
-                host=session.target.host,
-                title=title.strip(),
                 commands=commands,
                 auto_approve=auto_approve,
             )
@@ -723,34 +717,29 @@ class SessionManager:
                 outcome="created",
                 redactor=session.redactor,
                 session_id=session_id,
-                change_id=plan.change_id,
-                title=plan.title,
-                hash=plan.hash,
             )
             return ChangeResult.from_plan(plan)
 
-    def apply_change(self, change_id: str) -> ChangeResult:
+    def apply_change(self, session_id: str) -> ChangeResult:
         """Confirm and then execute a change plan in two steps.
 
         The first call returns the canonical command list with
         ``confirmation_required`` and executes nothing. The second call on the
-        same plan executes it. ``auto_approve`` plans skip the confirmation
+        same session executes it. ``auto_approve`` plans skip the confirmation
         step only when the operator pre-authorized auto-approval for this
         session/device pair.
         """
-        plan = self._changes.get(change_id)
-        session = self._get_session(plan.session_id)
+        plan = self._changes.get(session_id)
+        session = self._get_session(session_id)
         with session.lock:
             if plan.state == ChangeState.PROPOSED:
-                confirmed = self._changes.confirm(change_id)
+                confirmed = self._changes.confirm(session_id)
                 self._audit_event(
                     "apply_change",
                     target=session.target,
                     outcome="confirmed",
                     redactor=session.redactor,
                     session_id=session.session_id,
-                    change_id=change_id,
-                    hash=plan.hash,
                 )
                 if not plan.auto_approve:
                     return ChangeResult.from_plan(
@@ -759,18 +748,19 @@ class SessionManager:
                 plan = confirmed
             elif plan.state != ChangeState.CONFIRMED:
                 raise ChangeError(
-                    f"change plan {change_id} cannot be applied from {plan.state.value}"
+                    f"change plan for session {session_id} cannot be applied "
+                    f"from {plan.state.value}"
                 )
 
             self._require_ready(session)
             warnings: list[str] = []
             output_parts: list[str] = []
             try:
-                plan = self._changes.mark_applied(change_id)
+                plan = self._changes.mark_applied(session_id)
                 for command in [cmd.command for cmd in plan.commands]:
                     self._run_change_command(session, command, output_parts)
             except Exception as exc:
-                self._changes.mark_failed(change_id)
+                self._changes.mark_failed(session_id)
                 message = session.redactor.redact(str(exc))
                 self._audit_event(
                     "apply_change",
@@ -778,12 +768,10 @@ class SessionManager:
                     outcome="failed",
                     redactor=session.redactor,
                     session_id=session.session_id,
-                    change_id=change_id,
-                    hash=plan.hash,
                     error=message,
                 )
                 return ChangeResult.from_plan(
-                    self._changes.get(change_id),
+                    self._changes.get(session_id),
                     output="\n".join(output_parts),
                     error=message,
                 )
@@ -796,52 +784,26 @@ class SessionManager:
                 outcome="completed",
                 redactor=session.redactor,
                 session_id=session.session_id,
-                change_id=change_id,
-                hash=plan.hash,
             )
             return ChangeResult.from_plan(
-                self._changes.get(change_id), output=output, warnings=warnings
+                self._changes.get(session_id),
+                output=output,
+                warnings=warnings,
             )
 
-    def abort_change(self, change_id: str) -> ChangeResult:
+    def abort_change(self, session_id: str) -> ChangeResult:
         """Cancel a change plan before anything is executed."""
-        plan = self._changes.get(change_id)
-        session = self._get_session(plan.session_id)
+        session = self._get_session(session_id)
         with session.lock:
-            aborted = self._changes.abort(change_id)
+            aborted = self._changes.abort(session_id)
             self._audit_event(
                 "abort_change",
                 target=session.target,
                 outcome="aborted",
                 redactor=session.redactor,
                 session_id=session.session_id,
-                change_id=change_id,
-                hash=plan.hash,
             )
             return ChangeResult.from_plan(aborted)
-
-    def finalize_change(self, change_id: str) -> ChangeResult:
-        """Mark an applied change plan as finalized."""
-        plan = self._changes.get(change_id)
-        if plan.state != ChangeState.APPLIED:
-            raise ChangeError(
-                f"change plan {change_id} cannot be finalized from {plan.state.value}"
-            )
-        session = self._get_session(plan.session_id)
-        with session.lock:
-            self._require_ready(session)
-            finalized = self._changes.finalize(change_id)
-            self._touch(session)
-            self._audit_event(
-                "finalize_change",
-                target=session.target,
-                outcome="completed",
-                redactor=session.redactor,
-                session_id=session.session_id,
-                change_id=change_id,
-                hash=plan.hash,
-            )
-            return ChangeResult.from_plan(finalized)
 
     def _run_change_command(
         self,
@@ -1163,7 +1125,14 @@ class SessionManager:
 
     @staticmethod
     def _prompt_end_pattern(session: _ManagedSession) -> str:
-        return rf"{re.escape(session.raw_prompt)}\s*\Z"
+        prompt = session.raw_prompt.rstrip()
+        match = re.search(r"(?P<base>.*?)(?P<term>[#>$%])\s*$", prompt)
+        if match is None:
+            return rf"{re.escape(prompt)}\s*\Z"
+        base = re.escape(match.group("base"))
+        # Vendors decorate the prompt in sub-modes, e.g. switch(config-if)#,
+        # and Junos switches the terminator from > to # in edit mode.
+        return rf"{base}(?:\([^)\r\n]*\))?[#>$%]\s*\Z"
 
     @staticmethod
     def _help_prompt_tail_pattern(session: _ManagedSession) -> str:

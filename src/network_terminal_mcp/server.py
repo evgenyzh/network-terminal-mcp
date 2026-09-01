@@ -118,7 +118,6 @@ def create_server(
     @server.tool()
     async def plan_change(
         session_id: str,
-        title: str,
         commands: list[str],
         auto_approve: bool = False,
     ) -> ChangeResult:
@@ -130,30 +129,24 @@ def create_server(
         return await _run_sync(
             session_manager.plan_change,
             session_id,
-            title,
             commands,
             auto_approve=auto_approve,
         )
 
     @server.tool()
-    async def apply_change(change_id: str) -> ChangeResult:
-        """Confirm and then execute a change plan.
+    async def apply_change(session_id: str) -> ChangeResult:
+        """Confirm and then execute a change plan for a session.
 
         The first call returns the canonical command list with
         ``confirmation_required`` and executes nothing; the second call
         executes the plan.
         """
-        return await _run_sync(session_manager.apply_change, change_id)
+        return await _run_sync(session_manager.apply_change, session_id)
 
     @server.tool()
-    async def abort_change(change_id: str) -> ChangeResult:
-        """Cancel a change plan before anything is executed."""
-        return await _run_sync(session_manager.abort_change, change_id)
-
-    @server.tool()
-    async def finalize_change(change_id: str) -> ChangeResult:
-        """Mark an applied change plan as finalized."""
-        return await _run_sync(session_manager.finalize_change, change_id)
+    async def abort_change(session_id: str) -> ChangeResult:
+        """Cancel a change plan for a session before anything is executed."""
+        return await _run_sync(session_manager.abort_change, session_id)
 
     return server
 

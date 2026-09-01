@@ -91,6 +91,7 @@ client round-trip и OpenCode registration остаются задачей Эт�
 - Transcript/output path traversal.
 - `apply_change` с structural hazard в команде.
 - Повторный `apply_change` одного плана.
+- `apply_change` без плана (после рестарта) — fail-closed.
 - `abort_change` после исполнения.
 - Change-команда с pager/confirmation prompt.
 - SOCKS5 с требующейся авторизацией прокси.
