@@ -1,4 +1,4 @@
-"""Direct SSH session manager backed by Netmiko."""
+"""Session manager for raw SSH/Telnet terminal sessions."""
 
 from __future__ import annotations
 
@@ -9,11 +9,9 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 import paramiko
-from netmiko import ConnectHandler
-from netmiko.ssh_dispatcher import redispatch
 
 from network_terminal_mcp.audit import AuditLogger
 from network_terminal_mcp.changes.manager import ChangeManager
@@ -35,7 +33,6 @@ from network_terminal_mcp.config.models import (
 from network_terminal_mcp.credentials.pass_backend import Credentials, PassBackend
 from network_terminal_mcp.errors import ChangeError, PolicyError, SessionError, TransportError
 from network_terminal_mcp.host_keys import HostKeyStatus, HostKeyStore, probe_host_key_socket
-from network_terminal_mcp.platforms import Platform, PlatformRegistry
 from network_terminal_mcp.policy.engine import PolicyEngine, check_structural_safety
 from network_terminal_mcp.redaction import Redactor
 from network_terminal_mcp.sessions.models import (
@@ -49,31 +46,11 @@ from network_terminal_mcp.sessions.models import (
 )
 from network_terminal_mcp.socks import socks5_connect
 from network_terminal_mcp.targets.resolver import Target, TargetResolver
-
-
-class TerminalConnection(Protocol):
-    """Subset of Netmiko's connection API required by the manager."""
-
-    def find_prompt(self) -> str: ...
-
-    def send_command(
-        self,
-        command_string: str,
-        *,
-        expect_string: str | None = None,
-        read_timeout: float,
-        strip_prompt: bool = True,
-        strip_command: bool = True,
-        cmd_verify: bool = True,
-    ) -> str: ...
-
-    def write_channel(self, out_data: str) -> None: ...
-
-    def read_until_pattern(self, pattern: str, *, read_timeout: float) -> str: ...
-
-    def read_channel_timing(self, *, last_read: float, read_timeout: float) -> str: ...
-
-    def disconnect(self) -> None: ...
+from network_terminal_mcp.terminal import (
+    SshTerminal,
+    TelnetTerminal,
+    TerminalConnection,
+)
 
 
 class CredentialResolver(Protocol):
@@ -83,13 +60,12 @@ class CredentialResolver(Protocol):
 
 
 ConnectionFactory = Callable[[dict[str, object]], TerminalConnection]
-NestedRedispatch = Callable[[TerminalConnection, str], None]
 Clock = Callable[[], float]
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _PAGER_END = re.compile(
     r"(?:--more--|<--- more --->|---- more ----|press any key to continue|"
-    r"---\s*\(\s*more\s+\d+\s*%?\s*\)\s*---)\s*\Z",
+    r"---\s*\(\s*more(?:\s+\d+\s*%?)?\s*\)\s*---)\s*\Z",
     re.IGNORECASE,
 )
 _CONFIRMATION_END = re.compile(
@@ -135,12 +111,19 @@ class _OutputFields(TypedDict):
     allowed_responses: list[str]
 
 
-def _netmiko_connection_factory(params: dict[str, object]) -> TerminalConnection:
-    return cast(TerminalConnection, ConnectHandler(**params))
-
-
-def _netmiko_nested_redispatch(connection: TerminalConnection, device_type: str) -> None:
-    redispatch(cast(Any, connection), device_type, session_prep=True)
+def _connection_factory_default(params: dict[str, object]) -> TerminalConnection:
+    """Build a raw terminal from a transport params dict."""
+    transport = params["transport"]
+    connect_params = {k: v for k, v in params.items() if k != "transport"}
+    if transport == "telnet":
+        terminal: SshTerminal | TelnetTerminal = TelnetTerminal()
+        terminal.connect(**connect_params)  # type: ignore[arg-type]
+        return terminal
+    if transport == "ssh":
+        terminal = SshTerminal()
+        terminal.connect(**connect_params)  # type: ignore[arg-type]
+        return terminal
+    raise TransportError(f"unsupported transport {transport!r}")
 
 
 def _disabled_algorithms(profile: DirectConnection) -> dict[str, list[str]] | None:
@@ -168,7 +151,6 @@ def _disabled_algorithms(profile: DirectConnection) -> dict[str, list[str]] | No
 class _ManagedSession:
     session_id: str
     target: Target
-    platform: Platform
     connection: TerminalConnection
     jump_client: paramiko.SSHClient | None
     prompt: str
@@ -196,35 +178,31 @@ class SessionManager:
         self,
         config: AppConfig,
         *,
-        connection_factory: ConnectionFactory = _netmiko_connection_factory,
+        connection_factory: ConnectionFactory = _connection_factory_default,
         credential_resolver: CredentialResolver | None = None,
         audit_logger: AuditLogger | None = None,
         host_keys: HostKeyStore | None = None,
         jump_client_factory: Callable[[], paramiko.SSHClient] = paramiko.SSHClient,
-        nested_redispatch: NestedRedispatch = _netmiko_nested_redispatch,
         change_manager: ChangeManager | None = None,
         clock: Clock = time.monotonic,
     ) -> None:
         self._config = config
         self._targets = TargetResolver(config)
-        self._platforms = PlatformRegistry(config.connections)
         self._policy = PolicyEngine(config.policy)
         self._connection_factory = connection_factory
         self._credentials = credential_resolver or PassBackend()
         self._audit = audit_logger or AuditLogger(config.policy.runtime.audit_file)
         self._host_keys = host_keys or HostKeyStore(config.policy.runtime.known_hosts_file)
         self._jump_client_factory = jump_client_factory
-        self._nested_redispatch = nested_redispatch
         self._changes = change_manager or ChangeManager()
         self._clock = clock
         self._sessions: dict[str, _ManagedSession] = {}
         self._lock = threading.RLock()
 
     def open_session(self, name: str | None = None, **ad_hoc: object) -> SessionInfo:
-        """Open a direct or configured one-hop SSH session."""
+        """Open a configured or ad-hoc raw terminal session."""
         self._cleanup_expired()
         target = self._targets.resolve(name=name, **ad_hoc)
-        platform = self._platforms.resolve(target.platform)
         profile = self._transport_profile(target)
         credentials = self._resolve_credentials(target.credentials)
         intermediate_credentials = (
@@ -277,7 +255,6 @@ class SessionManager:
         self._audit_event(
             "open_session",
             target=target,
-            platform=platform,
             username=credentials.username,
             outcome="started",
             redactor=redactor,
@@ -349,26 +326,30 @@ class SessionManager:
                     for warning in self._host_key_warnings(intermediate_host_key)
                 )
                 connection = self._connection_factory(
-                    self._nested_connection_params(profile, intermediate_credentials)
+                    self._ssh_transport_params(
+                        profile.host,
+                        profile.port or 22,
+                        intermediate_credentials,
+                        sock=None,
+                    )
                 )
                 if profile.next_protocol == "telnet":
                     self._nested_telnet_login(connection, target, credentials, port)
                 else:
                     self._nested_login(connection, target, credentials, port)
-                self._nested_redispatch(connection, platform.driver)
                 host_key = None
                 sock = None
             elif isinstance(profile, DirectConnection) and profile.protocol == "telnet":
                 self._require_telnet_allowed(target)
                 connection = self._connection_factory(
-                    self._telnet_connection_params(target, platform, credentials, port)
+                    self._telnet_transport_params(target, credentials, port)
                 )
                 host_key = None
                 sock = None
             elif isinstance(profile, ConsoleConnection):
                 self._require_telnet_allowed(target)
                 connection = self._connection_factory(
-                    self._telnet_connection_params(target, platform, credentials, port)
+                    self._telnet_transport_params(target, credentials, port)
                 )
                 host_key = None
                 sock = None
@@ -384,8 +365,8 @@ class SessionManager:
                 warnings.extend(self._host_key_warnings(host_key))
             if connection is None:
                 connection = self._connection_factory(
-                    self._connection_params(
-                        target, platform, credentials, port, sock=sock, profile=profile
+                    self._ssh_transport_params(
+                        target.host, port, credentials, sock=sock, profile=profile
                     )
                 )
             prompt = connection.find_prompt()
@@ -399,7 +380,6 @@ class SessionManager:
             self._audit_event(
                 "open_session",
                 target=target,
-                platform=platform,
                 username=credentials.username,
                 outcome="failed",
                 redactor=redactor,
@@ -415,7 +395,6 @@ class SessionManager:
         session = _ManagedSession(
             session_id=uuid.uuid4().hex,
             target=target,
-            platform=platform,
             connection=connection,
             jump_client=jump_client,
             prompt=redactor.redact(prompt),
@@ -438,7 +417,6 @@ class SessionManager:
         self._audit_event(
             "open_session",
             target=target,
-            platform=platform,
             username=credentials.username,
             outcome="completed",
             redactor=redactor,
@@ -536,34 +514,24 @@ class SessionManager:
             )
             help_timeout = float(self._config.policy.runtime.cli_help_timeout)
             try:
-                if session.platform.cli_help_requires_enter:
-                    # Some CLIs (e.g. D-Link) only render the help list after
-                    # Enter. The appended '?' keeps the request non-executing.
-                    outcome = self._consume_terminal_output(
-                        session,
-                        self._send_command_until_terminal(
-                            session, f"{line}?", cmd_verify=False
-                        ),
+                raw_output = self._read_help(session, line)
+                visible = _visible_terminal_text(raw_output)
+                if self._ends_with_pager(visible):
+                    session.state = SessionState.PAGING
+                    session.pending_response = None
+                    session.pager_pages = 1
+                    session.pager_is_help = True
+                    outcome = _TerminalOutcome(output=raw_output, pager_active=True)
+                elif self._ends_with_secret_prompt(visible):
+                    raise SessionError("device requested a secret during CLI help")
+                elif self._ends_with_help_prompt(session, visible):
+                    self._clear_help_tail(session)
+                    outcome = _TerminalOutcome(
+                        output=self._strip_help_prompt(session, raw_output)
                     )
                 else:
-                    raw_output = self._read_help(session, line)
-                    visible = _visible_terminal_text(raw_output)
-                    if self._ends_with_pager(visible):
-                        session.state = SessionState.PAGING
-                        session.pending_response = None
-                        session.pager_pages = 1
-                        session.pager_is_help = True
-                        outcome = _TerminalOutcome(output=raw_output, pager_active=True)
-                    elif self._ends_with_secret_prompt(visible):
-                        raise SessionError("device requested a secret during CLI help")
-                    elif self._ends_with_help_prompt(session, visible):
-                        self._clear_help_tail(session)
-                        outcome = _TerminalOutcome(
-                            output=self._strip_help_prompt(session, raw_output)
-                        )
-                    else:
-                        self._return_to_prompt(session, timeout=help_timeout)
-                        outcome = _TerminalOutcome(output=raw_output)
+                    self._return_to_prompt(session, timeout=help_timeout)
+                    outcome = _TerminalOutcome(output=raw_output)
             except Exception as exc:
                 self._fail_session(session)
                 message = session.redactor.redact(str(exc))
@@ -694,41 +662,7 @@ class SessionManager:
         with session.lock:
             return self._session_info(session)
 
-    def set_platform(self, session_id: str, platform: str) -> SessionInfo:
-        """Switch an active session to another device platform/driver.
-
-        The model usually opens an ad-hoc session with a best-guess platform,
-        reads the output, and switches to the real driver when the guess was
-        wrong. Redispatches the underlying Netmiko connection and updates the
-        session metadata in place; the SSH connection itself is kept.
-        """
-        session = self._get_session(session_id)
-        new_platform = self._platforms.resolve(platform)
-        with session.lock:
-            self._require_ready(session)
-            previous = session.platform
-            self._nested_redispatch(session.connection, new_platform.driver)
-            session.platform = new_platform
-            self._touch(session)
-            self._audit_event(
-                "set_platform",
-                target=session.target,
-                platform=session.platform,
-                outcome="completed",
-                redactor=session.redactor,
-                session_id=session.session_id,
-                previous_platform=previous.name,
-                previous_dialect=previous.dialect,
-            )
-            return self._session_info(session)
-
     def close_session(self, session_id: str, *, force: bool = False) -> SessionInfo:
-        """Disconnect and permanently remove a session.
-
-        Refuses to close while a scheduled reboot from an applied change plan
-        is still pending cancellation; ``force=True`` overrides for emergency
-        cases and logs a ``reboot_not_cancelled`` audit warning.
-        """
         active = self._changes.has_active_reboot(session_id)
         if active is not None and not force:
             raise SessionError(
@@ -745,7 +679,6 @@ class SessionManager:
             self._audit_event(
                 "close_session",
                 target=session.target,
-                platform=session.platform,
                 outcome="started",
                 redactor=session.redactor,
                 session_id=session_id,
@@ -762,7 +695,6 @@ class SessionManager:
                 self._audit_event(
                     "reboot_not_cancelled",
                     target=session.target,
-                    platform=session.platform,
                     outcome="warning",
                     redactor=session.redactor,
                     session_id=session_id,
@@ -772,7 +704,6 @@ class SessionManager:
             self._audit_event(
                 "close_session",
                 target=session.target,
-                platform=session.platform,
                 outcome=outcome,
                 redactor=session.redactor,
                 session_id=session_id,
@@ -812,7 +743,6 @@ class SessionManager:
                 session_id=session_id,
                 target=session.target.name,
                 host=session.target.host,
-                platform=session.platform.name,
                 title=title.strip(),
                 commands=commands,
                 safety_net=resolved_safety,
@@ -821,7 +751,6 @@ class SessionManager:
             self._audit_event(
                 "plan_change",
                 target=session.target,
-                platform=session.platform,
                 outcome="created",
                 redactor=session.redactor,
                 session_id=session_id,
@@ -849,7 +778,6 @@ class SessionManager:
                 self._audit_event(
                     "apply_change",
                     target=session.target,
-                    platform=session.platform,
                     outcome="confirmed",
                     redactor=session.redactor,
                     session_id=session.session_id,
@@ -893,7 +821,6 @@ class SessionManager:
                 self._audit_event(
                     "apply_change",
                     target=session.target,
-                    platform=session.platform,
                     outcome="failed",
                     redactor=session.redactor,
                     session_id=session.session_id,
@@ -912,7 +839,6 @@ class SessionManager:
             self._audit_event(
                 "apply_change",
                 target=session.target,
-                platform=session.platform,
                 outcome="completed",
                 redactor=session.redactor,
                 session_id=session.session_id,
@@ -933,7 +859,6 @@ class SessionManager:
             self._audit_event(
                 "abort_change",
                 target=session.target,
-                platform=session.platform,
                 outcome="aborted",
                 redactor=session.redactor,
                 session_id=session.session_id,
@@ -971,7 +896,6 @@ class SessionManager:
                 self._audit_event(
                     "finalize_change",
                     target=session.target,
-                    platform=session.platform,
                     outcome="failed",
                     redactor=session.redactor,
                     session_id=session.session_id,
@@ -990,7 +914,6 @@ class SessionManager:
             self._audit_event(
                 "finalize_change",
                 target=session.target,
-                platform=session.platform,
                 outcome="completed",
                 redactor=session.redactor,
                 session_id=session.session_id,
@@ -1375,7 +1298,6 @@ class SessionManager:
         self._audit_event(
             event,
             target=session.target,
-            platform=session.platform,
             outcome=outcome,
             redactor=session.redactor,
             session_id=session.session_id,
@@ -1470,37 +1392,31 @@ class SessionManager:
         if jump_client is not None:
             jump_client.close()
 
-    def _connection_params(
+    def _ssh_transport_params(
         self,
-        target: Target,
-        platform: Platform,
-        credentials: Credentials,
+        host: str,
         port: int,
+        credentials: Credentials,
         *,
         sock: object | None = None,
         profile: ConnectionProfile | None = None,
     ) -> dict[str, object]:
         timeout = float(self._config.policy.runtime.command_timeout)
         params: dict[str, object] = {
-            "device_type": platform.driver,
-            "host": target.host,
+            "transport": "ssh",
+            "host": host,
             "port": port,
             "username": credentials.username,
+            "known_hosts_file": str(self._host_keys.path),
             "conn_timeout": timeout,
             "banner_timeout": timeout,
             "auth_timeout": timeout,
-            "fast_cli": False,
-            "ssh_strict": True,
-            "system_host_keys": False,
-            "alt_host_keys": True,
-            "alt_key_file": str(self._host_keys.path),
         }
         if isinstance(profile, DirectConnection):
             disabled = _disabled_algorithms(profile)
             if disabled is not None:
                 params["disabled_algorithms"] = disabled
         if credentials.key_file is not None:
-            params["use_keys"] = True
             params["key_file"] = credentials.key_file
             if credentials.key_passphrase is not None:
                 params["passphrase"] = credentials.key_passphrase
@@ -1512,27 +1428,19 @@ class SessionManager:
             params["sock"] = sock
         return params
 
-    def _telnet_connection_params(
-        self, target: Target, platform: Platform, credentials: Credentials, port: int
+    def _telnet_transport_params(
+        self, target: Target, credentials: Credentials, port: int
     ) -> dict[str, object]:
-        if platform.telnet_driver is None:
-            raise TransportError(
-                f"platform {platform.name!r} has no Telnet driver; "
-                "set telnet_driver in connections.yml"
-            )
         if credentials.password is None:
             raise TransportError("Telnet target credential has no password")
         timeout = float(self._config.policy.runtime.command_timeout)
         return {
-            "device_type": platform.telnet_driver,
+            "transport": "telnet",
             "host": target.host,
             "port": port,
             "username": credentials.username,
             "password": credentials.password,
             "conn_timeout": timeout,
-            "banner_timeout": timeout,
-            "auth_timeout": timeout,
-            "fast_cli": False,
         }
 
     def _require_telnet_allowed(self, target: Target) -> None:
@@ -1543,35 +1451,6 @@ class SessionManager:
             )
         if self._config.policy.defaults.telnet == "deny":
             raise TransportError("Telnet is denied by policy defaults")
-
-    def _nested_connection_params(
-        self, profile: NestedConnection, credentials: Credentials
-    ) -> dict[str, object]:
-        timeout = float(self._config.policy.runtime.command_timeout)
-        params: dict[str, object] = {
-            "device_type": "generic_termserver",
-            "host": profile.host,
-            "port": profile.port or 22,
-            "username": credentials.username,
-            "conn_timeout": timeout,
-            "banner_timeout": timeout,
-            "auth_timeout": timeout,
-            "fast_cli": False,
-            "ssh_strict": True,
-            "system_host_keys": False,
-            "alt_host_keys": True,
-            "alt_key_file": str(self._host_keys.path),
-        }
-        if credentials.key_file is not None:
-            params["use_keys"] = True
-            params["key_file"] = credentials.key_file
-            if credentials.key_passphrase is not None:
-                params["passphrase"] = credentials.key_passphrase
-        elif credentials.password is not None:
-            params["password"] = credentials.password
-        else:
-            raise TransportError("nested intermediate credential has no password or SSH key")
-        return params
 
     def _nested_login(
         self,
@@ -1720,7 +1599,6 @@ class SessionManager:
                 self._audit_event(
                     "close_session",
                     target=session.target,
-                    platform=session.platform,
                     outcome="expired",
                     redactor=session.redactor,
                     session_id=session.session_id,
@@ -1747,8 +1625,6 @@ class SessionManager:
             session_id=session.session_id,
             target=session.target.name,
             host=session.target.host,
-            platform=session.platform.name,
-            dialect=session.platform.dialect,
             prompt=session.prompt,
             state=session.state,
             created_at=session.created_at,
@@ -1767,7 +1643,6 @@ class SessionManager:
         self._audit_event(
             "run_command",
             target=session.target,
-            platform=session.platform,
             outcome=outcome,
             redactor=session.redactor,
             session_id=session.session_id,
@@ -1781,7 +1656,6 @@ class SessionManager:
         event: str,
         *,
         target: Target,
-        platform: Platform,
         outcome: str,
         redactor: Redactor,
         **details: object,
@@ -1791,8 +1665,6 @@ class SessionManager:
             "outcome": outcome,
             "target": target.name,
             "host": target.host,
-            "platform": platform.name,
-            "dialect": platform.dialect,
             "connection_profile": target.connection,
         }
         record.update(details)

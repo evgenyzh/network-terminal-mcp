@@ -5,8 +5,8 @@
 
 ## Оборудование
 
-- SNR old и eNOS проверены через `cisco_ios`; собрать transcripts перед
-  добавлением platform-specific исключений.
+- SNR old и eNOS проверены; собрать transcripts для новых семейств перед
+  фиксацией механики их терминала.
 - Какие семейства BDCOM используют Huawei-like и Cisco-like CLI.
 - Модели Eltex, SNR и BDCOM PON.
 - Версия EcoSGE и пример login/prompt/paging.

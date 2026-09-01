@@ -13,8 +13,8 @@ SOCKS5-прокси (`proxyjump` с полем `socks`) и TCP console profiles.
 
 Для Nested нужны локальные connection и credential profiles для intermediate
 host и final target. Сервер подключается к intermediate host через
-`generic_termserver`, выполняет из его shell `ssh` до final target и
-`redispatch` на платформу цели. Host key intermediate host проверяется локально;
+`generic_termserver` и выполняет из его shell `ssh` до final target.
+Host key intermediate host проверяется локально;
 inner SSH использует SSH-клиент intermediate host, поэтому host key final target
 проверяется им. При ошибке connection закрывается.
 
@@ -37,32 +37,24 @@ key; каждая сессия возвращает warning. Nested Telnet вы�
 shell промежуточного хоста, поэтому host key цели также не проверяется.
 `console` требует заданный `port`; `connect_command` не поддерживается.
 
-Telnet-драйвер платформы берётся из `telnet_driver` в platform alias, иначе
-выводится как `<driver>_telnet`; если такого класса нет, Telnet/console для
-платформы недоступны.
-
 ## Ad-hoc доступ
 
 Сетевые устройства обычно достигаются ad-hoc, без записей в `devices`:
-`open_session(host="192.0.2.2", platform="snr_29xx")`. Поля `credentials` и
-`connection` необязательны — берутся из `default_credentials` /
-`default_connection` в инвентаре.
+`open_session(host="192.0.2.2")`. Поля `credentials` и `connection`
+необязательны — берутся из `default_credentials` / `default_connection` в
+инвентаре. Платформа не передаётся: тип оборудования модель определяет по
+выводу уже после открытия сессии.
 
-Тип оборудования модели может быть неверен с первого раза. В этом случае
-модель читает вывод (`show version` / `display version` и т.п.), распознаёт
-вендора и вызывает `set_platform(session_id, platform)`, который
-переустанавливает Netmiko-драйвер на той же SSH-сессии (соединение не
-закрывается). Платформа должна быть известной (stock Netmiko driver или
-локальный alias). `set_platform` записывает audit-событие и возвращает
-обновлённые метаданные сессии.
+Модель читает banner и команды (`show version` / `display version` и т.п.),
+распознаёт вендора по выводу и работает с тем CLI, который видит, без
+переключения драйверов.
 
 Пример флоу:
 
 ```
-open_session(host=192.0.2.4, platform=cisco_ios)   # предполагаем Cisco
-run_command(show version)                            # вывод показывает SNR
-set_platform(session_id, snr_29xx)                   # переключаем драйвер
-run_command(show version)                            # продолжение с правильным драйвером
+open_session(host=192.0.2.4)   # подключение без платформы
+run_command(show version)        # определяем вендора и CLI по выводу
+run_command(show version)        # продолжаем в том же CLI
 ```
 
 ## Изменения конфигурации
@@ -106,7 +98,6 @@ run_command(show version)                            # продолжение с
 - `respond`
 - `read_output`
 - `session_status`
-- `set_platform`
 - `close_session`
 - `plan_change`
 - `apply_change`
@@ -196,10 +187,10 @@ Ctrl-U, не нажимая Enter. Для остальных непостран�
 не общим таймаутом команды.
 
 Проверено на оборудовании: `cli_help` работает на Cisco IOS и SNR eNOS
-(Cisco-подобный CLI). Для CLI, где помощь показывается только после Enter
-(например, D-Link), задайте платформе `cli_help_requires_enter: true` в
-`connections.yml`; тогда сервер отправит `<line>?` и Enter, `?` в конце не даст
-строке выполниться.
+(Cisco-подобный CLI). `cli_help` всегда отправляет `<line>?` без Enter. Для CLI,
+где подсказка показывается только после Enter (например, D-Link), помощь может
+не вернуться; в этом случае модель повторяет запрос, отправляя Enter сама, —
+завершающий `?` в строке не даёт команде выполниться.
 
 На SNR old help идёт через pager: `cli_help` возвращает первый экран с
 `pager_active: true`, дальше листайте `send_control("space")` и выходите `q`.
@@ -207,7 +198,7 @@ Ctrl-U, не нажимая Enter. Для остальных непостран�
 Надёжная клавиша выхода из help-pager — `q`; при нераспознанном возврате к
 prompt сессия безопасно переводится в `failed`.
 
-Netmiko `session_preparation` отключает pager на проверенных Junos и Huawei
+Подготовка сессии отключает pager на проверенных Junos и Huawei
 VRP. Их help возвращается одним ответом, но оставляет набранную строку; сервер
 очищает её последовательностью Ctrl-C, Ctrl-U перед следующей командой.
 

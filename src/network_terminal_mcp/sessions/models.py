@@ -29,8 +29,6 @@ class SessionInfo(BaseModel):
     session_id: str
     target: str
     host: str
-    platform: str
-    dialect: str
     prompt: str
     state: SessionState
     created_at: datetime

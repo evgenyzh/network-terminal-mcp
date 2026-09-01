@@ -31,7 +31,6 @@ class StrictModel(BaseModel):
 
 class Device(StrictModel):
     host: str
-    platform: str
     credentials: str
     connection: str
     tags: list[str] = Field(default_factory=list)
@@ -128,16 +127,8 @@ ConnectionProfile = Annotated[
 ]
 
 
-class PlatformAlias(StrictModel):
-    driver: str
-    dialect: str | None = None
-    cli_help_requires_enter: bool = False
-    telnet_driver: str | None = None
-
-
 class ConnectionsConfig(StrictModel):
     connections: dict[str, ConnectionProfile] = Field(default_factory=dict)
-    platforms: dict[str, PlatformAlias] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

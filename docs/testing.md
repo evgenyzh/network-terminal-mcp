@@ -12,16 +12,19 @@
 - `cli_help` cleanup, pager/control transitions, confirmation allowlist и
   отказ от secret prompt.
 - Host key store: strict unknown host, TOFU enrollment и nonstandard SSH port.
+- Transport params: построение ssh/telnet dict без `device_type`; передача
+  `sock` (SOCKS/jump), `disabled_algorithms` и timeouts в `SshTerminal`/
+  `TelnetTerminal`.
 - MCP tool registration, Pydantic input validation и worker-thread dispatch.
 
 ### Transcript replay
 
-- Prompt discovery.
-- `session_preparation`.
+- Prompt discovery (`find_prompt`).
+- Терминальный expect-loop: `read_until_pattern` с таймаутом, `send_command`
+  с expect и strip prompt/command, overflow обратно в buffer.
 - `cli_help` без Enter и последующая очистка строки.
 - Обычная команда, длинный вывод и pager.
 - Потеря соединения на каждом этапе nested route.
-- Custom BDCOM/EcoSGE/PON adapters.
 
 ### Integration
 
@@ -34,7 +37,7 @@
 
 Только после явного разрешения пользователя для точных targets:
 
-- одна платформа за прогон;
+- одно устройство за прогон;
 - только диагностические команды;
 - сначала console/management reachability;
 - никаких production config transitions без отдельного разрешения;
@@ -45,14 +48,14 @@
 Проведена только после явного разрешения пользователя и без добавления IP,
 hostname, serial number или fingerprint в репозиторий.
 
-| Семейство | Driver | Проверенный путь | Статус |
+| Семейство | CLI-характер | Проверенный путь | Статус |
 | --- | --- | --- | --- |
-| Cisco IOS, legacy SSH | `cisco_ios` | TOFU, strict reconnect, `show version` | пройден |
-| SNR old | `cisco_ios` + `snr_29xx` dialect | login, preparation, `show version` | пройден |
-| SNR eNOS | `cisco_ios` + `snr_52xx` dialect | login, preparation, `show version` | пройден |
-| D-Link DES | `dlink_ds` | login, preparation, `show switch` | пройден |
-| Huawei VRP | `huawei_vrp` | login, preparation, `display version` | пройден |
-| Juniper Junos | `juniper_junos` | login, preparation, `show version` | пройден |
+| Cisco IOS, legacy SSH | Cisco-like | TOFU, strict reconnect, `show version` | пройден |
+| SNR old | Cisco-like | login, prompt detection, `show version` | пройден |
+| SNR eNOS | Cisco-like | login, prompt detection, `show version` | пройден |
+| D-Link DES | D-Link CLI | login, prompt detection, `show switch` | пройден |
+| Huawei VRP | VRP | login, prompt detection, `display version` | пройден |
+| Juniper Junos | Junos | login, prompt detection, `show version` | пройден |
 
 Проверялся путь `MCPServer.call_tool`: `open_session` → `run_command` →
 `read_output` → `close_session`. В Этапе 2 локальные scripted tests дополнительно
@@ -62,12 +65,12 @@ client round-trip и OpenCode registration остаются задачей Эт�
 
 ## Матрица приемки
 
-Для каждой платформы фиксируются:
+Для каждого устройства фиксируются:
 
 | Проверка | Ожидаемый результат |
 | --- | --- |
 | Login | prompt определен, секрет не залогирован |
-| Session preparation | paging отключен или включен fallback |
+| Prompt detection | prompt распознан, вывод установился |
 | `cli_help` | подсказка прочитана, строка отменена, prompt восстановлен |
 | Single command | вывод завершен по prompt |
 | Multiple commands | одна TCP/terminal session |
@@ -96,8 +99,6 @@ client round-trip и OpenCode registration остаются задачей Эт�
 - SOCKS5 при недоступном прокси/цели.
 - `proxyjump` с `socks` и `jump_host` одновременно.
 - Ad-hoc без `default_credentials`/`default_connection`.
-- `set_platform` с неизвестной платформой.
-- `set_platform` после закрытия сессии.
 
 ## Команды проверки
 

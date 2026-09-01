@@ -26,10 +26,11 @@
 ## Engineering Rules
 
 - Use Python 3.12+ and `uv`.
-- Prefer Netmiko public APIs and subclasses. Do not fork or patch the installed Netmiko package.
-- Pin the supported Netmiko major version and cover custom adapters with transcript-based tests.
-- Keep command knowledge out of transport adapters. Adapters handle prompts, modes, paging,
-  line endings, and session preparation only.
+- Terminal transport is implemented directly on Paramiko (SSH) and telnetlib3
+  (Telnet/console) in `src/network_terminal_mcp/terminal.py`. Do not reintroduce
+  a vendor-driver abstraction; the model identifies the device type from output.
+- Keep command knowledge out of the transport layer. The transport handles
+  writes, reads, prompt detection, and timeouts only.
 - Validate configuration with Pydantic before opening any network connection.
 - Use structured errors and redact secrets before logging or returning failures.
 

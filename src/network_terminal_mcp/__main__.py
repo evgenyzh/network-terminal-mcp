@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.device:
             target = TargetResolver(config).resolve(name=args.device)
             print(
-                f"{target.name}: host={target.host} platform={target.platform} "
+                f"{target.name}: host={target.host} "
                 f"credentials={target.credentials} connection={target.connection}"
             )
         else:

@@ -184,7 +184,6 @@ class MutableClock:
 
 def _config(
     *,
-    help_enter: bool = False,
     proxyjump: bool = False,
     socks: bool = False,
     jump_key: bool = False,
@@ -265,7 +264,6 @@ def _config(
     inventory_devices = {
         "sw1": {
             "host": "192.0.2.1",
-            "platform": "snr_29xx",
             "credentials": "net",
             "connection": connection_name,
         }
@@ -283,16 +281,7 @@ def _config(
             {"devices": inventory_devices}
         ),
         connections=ConnectionsConfig.model_validate(
-            {
-                "connections": connections,
-                "platforms": {
-                    "snr_29xx": {
-                        "driver": "cisco_ios",
-                        "dialect": "snr_29xx",
-                        "cli_help_requires_enter": help_enter,
-                    }
-                },
-            }
+            {"connections": connections}
         ),
         credentials=CredentialsConfig.model_validate(
             {
@@ -309,7 +298,6 @@ def _manager(
     audit: FakeAudit,
     clock: MutableClock | None = None,
     *,
-    help_enter: bool = False,
     allow_telnet: bool = False,
     telnet: bool = False,
     console: bool = False,
@@ -317,7 +305,6 @@ def _manager(
 ) -> SessionManager:
     return SessionManager(
         _config(
-            help_enter=help_enter,
             allow_telnet=allow_telnet,
             telnet=telnet,
             console=console,
@@ -394,15 +381,13 @@ def _nested_manager(
     connection: FakeConnection,
     audit: FakeAudit,
     *,
-    redispatch_device_types: list[str] | None = None,
     connection_error: Exception | None = None,
     host_keys: FakeHostKeys | None = None,
     clock: MutableClock | None = None,
     nested_telnet: bool = False,
-) -> tuple[SessionManager, FakeHostKeys, list[dict[str, object]], list[str]]:
+) -> tuple[SessionManager, FakeHostKeys, list[dict[str, object]]]:
     resolved_host_keys = host_keys or FakeHostKeys()
     params: list[dict[str, object]] = []
-    redispatched = redispatch_device_types if redispatch_device_types is not None else []
 
     def factory(connection_params: dict[str, object]) -> FakeConnection:
         params.append(connection_params)
@@ -410,42 +395,15 @@ def _nested_manager(
             raise connection_error
         return connection
 
-    def fake_redispatch(conn: object, device_type: str) -> None:
-        redispatched.append(device_type)
-
     manager = SessionManager(
         _config(nested=True, nested_telnet=nested_telnet, allow_telnet=True),
         connection_factory=factory,
         credential_resolver=FakeCredentials(),
         audit_logger=audit,  # type: ignore[arg-type]
         host_keys=resolved_host_keys,  # type: ignore[arg-type]
-        nested_redispatch=fake_redispatch,  # type: ignore[arg-type]
         clock=clock or MutableClock(),
     )
-    return manager, resolved_host_keys, params, redispatched
-
-
-def _set_platform_manager(
-    connection: FakeConnection,
-    audit: FakeAudit,
-    *,
-    redispatch_device_types: list[str] | None = None,
-) -> tuple[SessionManager, list[str]]:
-    redispatched = redispatch_device_types if redispatch_device_types is not None else []
-
-    def fake_redispatch(conn: object, device_type: str) -> None:
-        redispatched.append(device_type)
-
-    manager = SessionManager(
-        _config(socks=True),
-        connection_factory=lambda params: connection,
-        credential_resolver=FakeCredentials(),
-        audit_logger=audit,  # type: ignore[arg-type]
-        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
-        nested_redispatch=fake_redispatch,  # type: ignore[arg-type]
-        clock=MutableClock(),
-    )
-    return manager, redispatched
+    return manager, resolved_host_keys, params
 
 
 
@@ -454,7 +412,6 @@ def test_open_session_resolves_alias_and_uses_factory() -> None:
     manager = _manager(connection, FakeAudit())
     info = manager.open_session("sw1")
     assert info.state is SessionState.READY
-    assert info.dialect == "snr_29xx"
     assert info.prompt == "switch#"
 
 
@@ -538,49 +495,6 @@ def test_socks_proxyjump_reaches_target_through_a_socks_socket(
 
     manager.close_session(info.session_id)
     assert connection.disconnected is True
-
-
-def test_set_platform_redispatches_and_updates_session_metadata() -> None:
-    connection = FakeConnection()
-    audit = FakeAudit()
-    manager, redispatched = _set_platform_manager(connection, audit)
-
-    info = manager.open_session("sw1")
-    assert info.platform == "snr_29xx"
-
-    updated = manager.set_platform(info.session_id, "dlink_ds")
-
-    assert redispatched == ["dlink_ds"]
-    assert updated.platform == "dlink_ds"
-    assert updated.session_id == info.session_id
-    assert any(r["event"] == "set_platform" for r in audit.records)
-
-    manager.close_session(info.session_id)
-
-
-def test_set_platform_requires_a_ready_session() -> None:
-    connection = FakeConnection()
-    audit = FakeAudit()
-    manager, _ = _set_platform_manager(connection, audit)
-
-    info = manager.open_session("sw1")
-    manager.close_session(info.session_id)
-
-    with pytest.raises(SessionError, match="unknown or expired session"):
-        manager.set_platform(info.session_id, "dlink_ds")
-
-
-def test_set_platform_rejects_unknown_platform() -> None:
-    connection = FakeConnection()
-    audit = FakeAudit()
-    manager, _ = _set_platform_manager(connection, audit)
-
-    info = manager.open_session("sw1")
-
-    with pytest.raises(TransportError, match="unsupported platform"):
-        manager.set_platform(info.session_id, "not_a_real_platform")
-
-    manager.close_session(info.session_id)
 
 
 def test_socks_proxyjump_does_not_connect_an_ssh_bastion() -> None:
@@ -694,20 +608,19 @@ def test_proxyjump_closes_the_jump_client_when_a_session_expires() -> None:
     assert jump_client.closed is True
 
 
-def test_nested_connects_to_the_intermediate_host_and_redispatches() -> None:
+def test_nested_connects_to_the_intermediate_host_and_reads_the_target() -> None:
     connection = FakeConnection()
     audit = FakeAudit()
-    manager, host_keys, params, redispatched = _nested_manager(connection, audit)
+    manager, host_keys, params = _nested_manager(connection, audit)
 
     info = manager.open_session("sw1")
 
     assert host_keys.calls == [("192.0.2.254", 22, "strict", False)]
-    assert params[0]["device_type"] == "generic_termserver"
+    assert params[0]["transport"] == "ssh"
     assert params[0]["host"] == "192.0.2.254"
     assert params[0]["username"] == "term-operator"
     assert params[0]["password"] == "intermediate-secret"
     assert "sock" not in params[0]
-    assert redispatched == ["cisco_ios"]
     assert info.prompt == "switch#"
     assert audit.records[0]["route"] == "nested"
     assert any(w == "nested SSH uses the intermediate host's SSH client"
@@ -719,7 +632,7 @@ def test_nested_connects_to_the_intermediate_host_and_redispatches() -> None:
 
 def test_nested_login_sends_the_ssh_command_and_target_password() -> None:
     connection = FakeConnection()
-    manager, _, _, _ = _nested_manager(connection, FakeAudit())
+    manager, _, _ = _nested_manager(connection, FakeAudit())
 
     manager.open_session("sw1")
 
@@ -732,7 +645,7 @@ def test_nested_login_sends_the_ssh_command_and_target_password() -> None:
 
 def test_nested_telnet_login_sends_telnet_command_and_credentials() -> None:
     connection = FakeConnection()
-    manager, _, _, _ = _nested_manager(connection, FakeAudit(), nested_telnet=True)
+    manager, _, _ = _nested_manager(connection, FakeAudit(), nested_telnet=True)
 
     info = manager.open_session("sw1")
 
@@ -762,8 +675,7 @@ def test_direct_telnet_requires_policy_allow() -> None:
         {
             "connections": {
                 "direct-telnet": {"type": "direct", "protocol": "telnet"}
-            },
-            "platforms": {"snr_29xx": {"driver": "cisco_ios"}},
+            }
         }
     )
     manager = SessionManager(
@@ -773,7 +685,6 @@ def test_direct_telnet_requires_policy_allow() -> None:
                     "devices": {
                         "sw1": {
                             "host": "192.0.2.1",
-                            "platform": "snr_29xx",
                             "credentials": "net",
                             "connection": "direct-telnet",
                             "allow_telnet": True,
@@ -822,11 +733,9 @@ def test_direct_telnet_uses_the_telnet_driver_without_host_key_check() -> None:
 
     info = manager.open_session("sw1")
 
-    assert params[0]["device_type"] == "cisco_ios_telnet"
+    assert params[0]["transport"] == "telnet"
     assert params[0]["port"] == 23
     assert params[0]["password"] == "hunter2"
-    assert "ssh_strict" not in params[0]
-    assert "alt_key_file" not in params[0]
     assert "sock" not in params[0]
     assert host_keys.calls == []
     assert info.prompt == "switch#"
@@ -850,8 +759,7 @@ def test_direct_telnet_uses_a_custom_port() -> None:
         {
             "connections": {
                 "direct-telnet": {"type": "direct", "protocol": "telnet", "port": 2002}
-            },
-            "platforms": {"snr_29xx": {"driver": "cisco_ios"}},
+            }
         }
     )
     manager = SessionManager(
@@ -861,7 +769,6 @@ def test_direct_telnet_uses_a_custom_port() -> None:
                     "devices": {
                         "sw1": {
                             "host": "192.0.2.1",
-                            "platform": "snr_29xx",
                             "credentials": "net",
                             "connection": "direct-telnet",
                             "allow_telnet": True,
@@ -911,9 +818,9 @@ def test_console_requires_allow_telnet_and_uses_the_telnet_driver() -> None:
 
     info = manager.open_session("sw1")
 
-    assert params[0]["device_type"] == "cisco_ios_telnet"
+    assert params[0]["transport"] == "telnet"
     assert params[0]["port"] == 2002
-    assert "ssh_strict" not in params[0]
+    assert "sock" not in params[0]
     assert any("console access transmits credentials and traffic in cleartext"
                for warning in info.warnings)
     assert audit.records[0]["route"] == "console"
@@ -945,8 +852,7 @@ def test_legacy_direct_applies_disabled_algorithms_from_the_allowlist() -> None:
                     "kex_algorithms": ["diffie-hellman-group1-sha1"],
                     "ciphers": ["aes128-cbc"],
                 }
-            },
-            "platforms": {"snr_29xx": {"driver": "cisco_ios"}},
+            }
         }
     )
     manager = SessionManager(
@@ -956,7 +862,6 @@ def test_legacy_direct_applies_disabled_algorithms_from_the_allowlist() -> None:
                     "devices": {
                         "sw1": {
                             "host": "192.0.2.1",
-                            "platform": "snr_29xx",
                             "credentials": "net",
                             "connection": "legacy",
                         }
@@ -992,7 +897,7 @@ def test_legacy_direct_applies_disabled_algorithms_from_the_allowlist() -> None:
     assert any("legacy SSH profile in use" for warning in info.warnings)
     connection = FakeConnection()
     host_keys = FakeHostKeys()
-    manager, host_keys, _, _ = _nested_manager(
+    manager, host_keys, _ = _nested_manager(
         connection, FakeAudit(), host_keys=host_keys
     )
 
@@ -1004,7 +909,7 @@ def test_legacy_direct_applies_disabled_algorithms_from_the_allowlist() -> None:
 def test_nested_disconnects_the_connection_when_target_login_fails() -> None:
     connection = FakeConnection()
     connection.read_error = RuntimeError("intermediate login failed with intermediate-secret")
-    manager, _, _, _ = _nested_manager(connection, FakeAudit())
+    manager, _, _ = _nested_manager(connection, FakeAudit())
 
     with pytest.raises(TransportError, match="intermediate login failed") as error:
         manager.open_session("sw1")
@@ -1016,7 +921,7 @@ def test_nested_disconnects_the_connection_when_target_login_fails() -> None:
 def test_nested_redacts_target_password_when_factory_fails() -> None:
     connection = FakeConnection()
     audit = FakeAudit()
-    manager, _, _, _ = _nested_manager(
+    manager, _, _ = _nested_manager(
         connection,
         audit,
         connection_error=RuntimeError("target login failed with hunter2"),
@@ -1032,7 +937,7 @@ def test_nested_redacts_target_password_when_factory_fails() -> None:
 def test_nested_session_expires_and_disconnects() -> None:
     connection = FakeConnection()
     clock = MutableClock()
-    manager, _, _, _ = _nested_manager(
+    manager, _, _ = _nested_manager(
         connection, FakeAudit(), clock=clock
     )
     info = manager.open_session("sw1")
@@ -1056,9 +961,6 @@ def test_nested_telnet_requires_allow_telnet_on_the_device() -> None:
                     "next_protocol": "telnet",
                 }
             },
-            "platforms": {
-                "snr_29xx": {"driver": "cisco_ios", "dialect": "snr_29xx"}
-            },
         }
     )
     manager = SessionManager(
@@ -1068,7 +970,6 @@ def test_nested_telnet_requires_allow_telnet_on_the_device() -> None:
                     "devices": {
                         "sw1": {
                             "host": "192.0.2.1",
-                            "platform": "snr_29xx",
                             "credentials": "net",
                             "connection": "nested-term",
                         }
@@ -1111,9 +1012,6 @@ def test_nested_telnet_requires_policy_allow_even_with_allow_telnet() -> None:
                     "next_protocol": "telnet",
                 }
             },
-            "platforms": {
-                "snr_29xx": {"driver": "cisco_ios", "dialect": "snr_29xx"}
-            },
         }
     )
     manager = SessionManager(
@@ -1123,7 +1021,6 @@ def test_nested_telnet_requires_policy_allow_even_with_allow_telnet() -> None:
                     "devices": {
                         "sw1": {
                             "host": "192.0.2.1",
-                            "platform": "snr_29xx",
                             "credentials": "net",
                             "connection": "nested-term",
                             "allow_telnet": True,
@@ -1239,21 +1136,6 @@ def test_cli_help_rejects_unsafe_or_ambiguous_input(line: str) -> None:
         manager.cli_help(info.session_id, line)
 
     assert connection.writes == []
-
-
-def test_cli_help_with_enter_platform_sends_enter_and_skips_ctrl_c() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show ?"] = "Command list\nswitch#"
-    manager = _manager(connection, FakeAudit(), help_enter=True)
-    info = manager.open_session("sw1")
-
-    result = manager.cli_help(info.session_id, "show ")
-
-    assert result.executed is True
-    assert result.output == "Command list\n"
-    assert connection.commands == ["show ?"]
-    assert connection.writes == []
-    assert manager.session_status(info.session_id).state is SessionState.READY
 
 
 def test_cli_help_fails_the_session_when_cleanup_cannot_restore_prompt() -> None:
@@ -1381,6 +1263,24 @@ def test_pager_requires_explicit_space_and_returns_to_ready() -> None:
     assert second.output == "second page\n"
     assert second.pager_active is False
     assert connection.writes == [" "]
+    assert manager.session_status(info.session_id).state is SessionState.READY
+
+
+def test_pager_detects_junos_more_marker_without_a_page_number() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["show interfaces"] = "lines\n---(more)---"
+    connection.read_outputs = ["next\nswitch#"]
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session("sw1")
+
+    first = manager.run_command(info.session_id, "show interfaces")
+
+    assert first.pager_active is True
+    assert first.output == "lines\n---(more)---"
+    assert manager.session_status(info.session_id).state is SessionState.PAGING
+
+    second = manager.send_control(info.session_id, "space")
+    assert second.pager_active is False
     assert manager.session_status(info.session_id).state is SessionState.READY
 
 

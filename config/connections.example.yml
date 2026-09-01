@@ -62,19 +62,3 @@ connections:
   console:
     type: console
     port: 2002
-
-platforms:
-  snr_29xx:
-    driver: cisco_ios
-    dialect: snr_29xx
-
-  snr_52xx:
-    driver: cisco_ios
-    dialect: snr_52xx
-
-  dlink_ds:
-    driver: dlink_ds
-    dialect: dlink_ds
-    cli_help_requires_enter: true
-    # Optional Telnet driver override; defaults to <driver>_telnet.
-    telnet_driver: dlink_ds_telnet

@@ -21,8 +21,7 @@ store contents намеренно не записываются в репози�
 
 Проверенный Cisco предлагает только `diffie-hellman-group1-sha1`, `ssh-rsa`,
 `3des-cbc` и `hmac-sha1`. Локальный OpenSSH 10.2 не смог с ним договориться;
-Paramiko 4.0 в составе Netmiko подключился успешно. Поэтому отдельный oldssh не
-добавлялся.
+Paramiko 4.0 подключился успешно. Поэтому отдельный oldssh не добавлялся.
 
 ## MCP acceptance
 
@@ -33,8 +32,8 @@ open_session -> run_command -> read_output -> close_session
 ```
 
 Первое подключение через явный `accept_new` сохраняет ключ в локальный
-`known_hosts`. Последующие соединения выполняются с `ssh_strict=True` и
-передают этот файл Netmiko как `alt_key_file`.
+`known_hosts`. Последующие соединения выполняются с `host_key_policy: strict` и
+передают этот файл `SshTerminal` как `known_hosts_file`.
 
 ## Hardware validation Этапа 2
 
@@ -92,27 +91,22 @@ SOCKS-маршрут покрыт unit-тестами:
 - обёртка ошибок подключения в `TransportError`;
 - конфиг-валидация `proxyjump` с полем `socks`: дефолты, взаимоисключение
   `socks` и `jump_host`, обязательность `socks` или `jump_host`;
-- менеджер: сокет из `socks5_connect` передаётся Netmiko как `sock`, route в
-  audit `socks`, SSH-бастион не создаётся, host key цели проверяется через
-  SOCKS-сокет. Probe выполняется до открытия connection-сокета: некоторые
+- менеджер: сокет из `socks5_connect` передаётся `SshTerminal` как `sock`,
+  route в audit `socks`, SSH-бастион не создаётся, host key цели проверяется
+  через SOCKS-сокет. Probe выполняется до открытия connection-сокета: некоторые
   старые устройства (SNR old) не выдерживают второе одновременное SSH-соединение
   через тот же туннель, и обратный порядок даёт EOF на handshake.
 
 Проверка на реальном оборудовании через живой локальный SOCKS-прокси
 описывается в этом разделе при её выполнении.
 
-## Ad-hoc и set_platform validation
+## Ad-hoc validation
 
 - `_resolve_ad_hoc` подставляет `default_credentials` / `default_connection`,
   когда модель не передала их явно; без дефолтов ad-hoc требует их явно.
-- `set_platform` переключает драйвер существующей сессии через redispatch,
-  обновляет метаданные и пишет audit; требует готовой сессии и известной
-  платформы.
-- Негативные: неизвестная платформа отклоняется; вызов после закрытия сессии
-  отклоняется.
 
-Живой ad-hoc доступ (open_session по IP через дефолты + set_platform по выводу)
-проверяется на реальном оборудовании при его выполнении.
+Живой ad-hoc доступ (open_session по IP через дефолты) проверяется на реальном
+оборудовании при его выполнении.
 
 ## One-hop ProxyJump validation
 
@@ -142,11 +136,11 @@ Legacy SSH overrides, Telnet и console проверены unit-тестами:
   host key checking остаётся включенным.
 - Прямой Telnet требует `allow_telnet: true` на устройстве и
   `defaults.telnet: allow`; при нарушении любого из условий сессия не
-  открывается. Telnet использует `telnet_driver` платформы, не проверяет host
-  key и возвращает cleartext warning.
+  открывается. Telnet использует `TelnetTerminal`, не проверяет host key и
+  возвращает cleartext warning.
 - Nested Telnet (`next_protocol: telnet`) выполняет `telnet` из shell
   промежуточного хоста и тоже требует двойного gating.
-- `console` profile требует заданный `port`, использует Telnet-драйвер и не
+- `console` profile требует заданный `port`, использует `TelnetTerminal` и не
   поддерживает `connect_command`.
 
 Hardware-проверка Telnet/console на реальном устройстве не выполнялась.
@@ -178,13 +172,13 @@ delay`/`undo`, Cisco `reload in 10`/`reload cancel`) не выполнялась
 ## Непроверенное
 
 - Interactive confirmations на Junos/Huawei.
-- Anonymized transcripts для platform-specific pager/prompt patterns.
+- Anonymized transcripts для device-specific pager/prompt patterns.
 - `raw_input`.
 - Telnet (прямой и nested) и console на реальном оборудовании — только
   unit-тесты; hardware-проверка не выполнялась.
 - Изменения конфигурации и rollback на реальном оборудовании — только
   unit-тесты; hardware-проверка не выполнялась.
-- BDCOM, EcoSGE, Eltex и PON adapters.
+- BDCOM, EcoSGE, Eltex и PON на реальном оборудовании через generic tools.
 - DSA-only SSH.
 - Per-device legacy algorithm override на реальной лабораторной цели (логика
   покрыта unit-тестами через `disabled_algorithms`).

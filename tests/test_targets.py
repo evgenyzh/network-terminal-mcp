@@ -46,7 +46,6 @@ def test_resolve_named_device() -> None:
         devices={
             "sw1": {
                 "host": "192.0.2.1",
-                "platform": "cisco_ios",
                 "credentials": "net",
                 "connection": "direct",
                 "tags": ["lab"],
@@ -56,7 +55,6 @@ def test_resolve_named_device() -> None:
     target = TargetResolver(config).resolve(name="sw1")
     assert target.name == "sw1"
     assert target.host == "192.0.2.1"
-    assert target.platform == "cisco_ios"
     assert target.tags == ("lab",)
     assert target.allow_writes is False
 
@@ -66,7 +64,6 @@ def test_resolve_named_device_carries_allow_writes() -> None:
         devices={
             "sw1": {
                 "host": "192.0.2.1",
-                "platform": "cisco_ios",
                 "credentials": "net",
                 "connection": "direct",
                 "allow_writes": True,
@@ -86,18 +83,17 @@ def test_resolve_ad_hoc_target() -> None:
     config = _config()
     target = TargetResolver(config).resolve(
         host="192.0.2.5",
-        platform="huawei_vrp",
         credentials="net",
         connection="direct",
     )
     assert target.host == "192.0.2.5"
-    assert target.platform == "huawei_vrp"
+    assert target.name == "<ad-hoc>"
 
 
 def test_ad_hoc_requires_host() -> None:
     with pytest.raises(TargetError, match="host"):
         TargetResolver(_config()).resolve(
-            platform="cisco_ios", credentials="net", connection="direct"
+            credentials="net", connection="direct"
         )
 
 
@@ -106,41 +102,41 @@ def test_ad_hoc_uses_configured_defaults_for_credentials_and_connection() -> Non
         default_credentials="net",
         default_connection="direct",
     )
-    target = TargetResolver(config).resolve(host="192.0.2.7", platform="cisco_ios")
+    target = TargetResolver(config).resolve(host="192.0.2.7")
     assert target.credentials == "net"
     assert target.connection == "direct"
     assert target.host == "192.0.2.7"
 
 
-def test_ad_hoc_requires_platform_even_with_defaults() -> None:
-    config = _config(default_credentials="net", default_connection="direct")
-    with pytest.raises(TargetError, match="platform"):
+def test_ad_hoc_requires_credentials_without_default() -> None:
+    config = _config()
+    with pytest.raises(TargetError, match="credentials"):
         TargetResolver(config).resolve(host="192.0.2.7")
 
 
 def test_ad_hoc_rejects_unknown_fields() -> None:
     with pytest.raises(TargetError, match="unsupported ad-hoc"):
         TargetResolver(_config()).resolve(
-            host="h", platform="p", credentials="net", connection="direct", password="x"
+            host="h", credentials="net", connection="direct", password="x"
         )
 
 
 def test_ad_hoc_rejects_unknown_credentials_profile() -> None:
     with pytest.raises(TargetError, match="unknown credential profile"):
         TargetResolver(_config()).resolve(
-            host="h", platform="p", credentials="nope", connection="direct"
+            host="h", credentials="nope", connection="direct"
         )
 
 
 def test_ad_hoc_rejects_unknown_connection_profile() -> None:
     with pytest.raises(TargetError, match="unknown connection profile"):
         TargetResolver(_config()).resolve(
-            host="h", platform="p", credentials="net", connection="nope"
+            host="h", credentials="net", connection="nope"
         )
 
 
 def test_ad_hoc_port_must_be_int() -> None:
     with pytest.raises(TargetError, match="integer"):
         TargetResolver(_config()).resolve(
-            host="h", platform="p", credentials="net", connection="direct", port="22"
+            host="h", credentials="net", connection="direct", port="22"
         )

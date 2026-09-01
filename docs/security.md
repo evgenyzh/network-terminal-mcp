@@ -35,7 +35,7 @@ authorization. Предпочтительна отдельная read-only AAA-�
 Результат проверки: `allow`, `ask` или `deny`.
 
 - `run_command` исполняет только `allow`.
-- Диагностические `show`, `display` и эквиваленты разрешаются platform policy.
+- Диагностические `show`, `display` и эквиваленты разрешаются командной policy.
 - Неизвестные exec-команды и config mode получают `ask`, но пока не исполняются.
 - Перезагрузка, factory reset, удаление конфигурации и файлов запрещены.
 - Тяжелые команды вроде полного tech-support могут быть запрещены или `ask`.
@@ -50,7 +50,7 @@ default policy и не принимает `?`, control characters или structu
 последовательность используется для непостраничного help, который уже вернул
 prompt с остатком строки. Если pager не вернулся к распознанному prompt, сессия
 переводится в `failed`, а не оставляется в неизвестном состоянии. Для CLI с
-помощью только после Enter (D-Link) разрешён явный per-platform
+помощью только после Enter (D-Link) разрешён явный per-device
 `cli_help_requires_enter`; завершающий `?` не даёт строке выполниться.
 Generic `raw_input` остается отключенным.
 
@@ -73,7 +73,7 @@ Generic `raw_input` остается отключенным.
 
 - время и session ID;
 - логическое имя устройства и адрес;
-- connection profile и platform;
+- connection profile;
 - пользователя AAA, но не пароль;
 - event/tool, команду, help line, control action или allowlisted response;
 - решение policy, outcome и размер вывода для выполненной команды;
@@ -97,7 +97,7 @@ key checking остается включенным: default `host_key_policy: st
 явный `accept_new` (TOFU), который сохраняет fingerprint в аудит; затем профиль
 нужно вернуть в `strict`.
 
-`accept_changed` — слабый доверительный режим для платформ, у которых host key
+`accept_changed` — слабый доверительный режим для устройств, у которых host key
 заведомо меняется при каждой загрузке (например, некоторые SNR). Он допустим
 только как явный opt-in для конкретного profile и при каждой смене ключа пишет
 в audit предупреждение со старым и новым fingerprint. Этот режим не защищает от
@@ -124,9 +124,9 @@ login закрывают весь маршрут fail-closed.
 
 ## Nested SSH
 
-Nested profile подключается к intermediate host через `generic_termserver`,
-затем из его shell выполняет `ssh` до final target и `redispatch` на платформу
-цели. Host key intermediate host проверяется локальным `known_hosts_file` с
+Nested profile подключается к intermediate host через SSH/Telnet terminal,
+затем из его shell выполняет `ssh` (или `telnet`) до final target. Host key
+intermediate host проверяется локальным `known_hosts_file` с
 политикой `host_key_policy` профиля. Inner SSH выполняется SSH-клиентом
 intermediate host: host key final target проверяется именно им, а не локальным
 store, поэтому nested маршрут по умолчанию доверяет SSH-конфигурации

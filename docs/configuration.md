@@ -19,13 +19,16 @@ Runtime-файлы располагаются в `~/.config/network-terminal-mcp
 devices:
   access-snr-01:
     host: 192.0.2.10
-    platform: snr_29xx
     credentials: network-tacacs
     connection: direct
     tags: [access, lab]
     allow_telnet: false
+    port: 22
     allow_writes: false
 ```
+
+Поля модели `Device`: `host`, `credentials`, `connection`, `tags`,
+`allow_telnet`, `port`, `allow_writes`.
 
 `allow_writes: true` разрешает применение изменений конфигурации на этом
 устройстве (через `plan_change`/`apply_change`); без него изменения всегда
@@ -33,8 +36,8 @@ devices:
 
 Инвентарь предназначен для инфраструктуры, а не для каждого устройства.
 Сетевые устройства (коммутаторы и т.п.) обычно достигаются ad-hoc через
-`open_session(host=..., platform=...)` без записи в `devices`. Для ad-hoc
-подключений `credentials` и `connection` берутся из дефолтов:
+`open_session(host=...)` без записи в `devices` и без указания платформы. Для
+ad-hoc подключений `credentials` и `connection` берутся из дефолтов:
 
 ```yaml
 default_credentials: network-tacacs
@@ -42,14 +45,14 @@ default_connection: through-jump
 ```
 
 `default_credentials` и `default_connection` — опциональные имена профилей,
-которые подставляются в ad-hoc `open_session`, когда модель не передала их
-явно. Оба должны существовать среди профилей. Одноразовый target может
-передать те же несекретные поля в `open_session`. Разрешенные credential и
+которые подставляются в ad-hoc `open_session(host=...)`, когда модель не
+передала их явно. Оба должны существовать среди профилей. Одноразовый target
+может передать те же несекретные поля в `open_session`. Разрешенные credential и
 connection profiles по-прежнему берутся из локальной конфигурации.
 
-Тип оборудования ad-hoc может быть неверен с первого раза: модель открывает
-сессию с предполагаемым `platform`, читает вывод и при необходимости меняет
-драйвер инструментом `set_platform` (см. операции), не закрывая сессию.
+Тип оборудования ad-hoc определяется по выводу уже после открытия сессии:
+модель читает banner и команды (`show version` / `display version` и т.п.) и
+работает с тем CLI, который видит. Платформа не передаётся и не переключается.
 
 ## Connection profile
 
@@ -101,18 +104,18 @@ connections:
 SSH-only `proxyjump` hop, один `nested` hop (`next_protocol: ssh` или
 `telnet`) и TCP `console` profile. ProxyJump аутентифицируется на
 `jump_host`, открывает `direct-tcpip` channel к final target и передаёт его
-Netmiko как socket. `jump_port` относится к bastion; final target использует
+как socket. `jump_port` относится к bastion; final target использует
 `Device.port` или ad-hoc `port`, затем fallback profile `port`, затем 22.
 
 Nested подключается к `host` через `generic_termserver`, затем из shell
 промежуточного хоста выполняет `ssh` (или `telnet`, если
-`next_protocol: telnet`) до final target с credentials целевого устройства и
-переключает драйвер `redispatch` на платформу цели. Inner SSH
+`next_protocol: telnet`) до final target с credentials целевого устройства.
+Inner SSH
 использует SSH-клиент промежуточного хоста: host key цели проверяется им, а не
 локальным `known_hosts_file`. Inner Telnet вообще не проверяет host key цели.
 
 `console` profile подключается к TCP console port терминального сервера
-(`port` обязателен) через Telnet-драйвер платформы. Поле `connect_command`
+(`port` обязателен) через Telnet. Поле `connect_command`
 намеренно не поддерживается: произвольная shell-строка противоречит модели
 безопасности. Console требует того же gating, что и Telnet.
 
@@ -185,40 +188,6 @@ credentials:
 target используйте отдельный `pass` profile, даже если jump host использует key.
 Для зашифрованного private key добавьте `key_passphrase_entry`: его первая строка
 также читается из `pass`, redacted и не передается в MCP arguments.
-
-## Platform aliases
-
-```yaml
-platforms:
-  snr_29xx:
-    driver: cisco_ios
-    dialect: snr_29xx
-
-  snr_52xx:
-    driver: cisco_ios
-    dialect: snr_52xx
-
-  dlink_ds:
-    driver: dlink_ds
-    dialect: dlink_ds
-    cli_help_requires_enter: true
-    telnet_driver: dlink_ds_telnet
-
-  bdcom-new:
-    driver: local:bdcom_huawei_like
-    dialect: bdcom_huawei_like
-```
-
-`cli_help_requires_enter` включает режим подсказки, в котором `cli_help`
-отправляет `<line>?` и Enter. Нужен для CLI (например, D-Link), где список
-подсказки показывается только после Enter; `?` в конце не позволяет выполнить
-строку. По умолчанию `false`: обычные CLI (Cisco, SNR) показывают помощь без
-Enter, и сервер отменяет строку Ctrl-C.
-
-`telnet_driver` задаёт Netmiko-драйвер для Telnet/console соединений платформы.
-По умолчанию используется `<driver>_telnet` (например, `cisco_ios_telnet`);
-для платформ, где такого класса нет, задайте его явно или оставьте `null`,
-тогда Telnet/console для платформы будут недоступны.
 
 ## Runtime defaults
 

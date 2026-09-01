@@ -161,7 +161,6 @@ async def test_ad_hoc_open_session_tool() -> None:
         "open_session",
         {
             "host": "192.0.2.2",
-            "platform": "cisco_ios",
             "credentials": "net",
             "connection": "direct",
         },
@@ -172,7 +171,6 @@ async def test_ad_hoc_open_session_tool() -> None:
             "open_session",
             {
                 "host": "192.0.2.2",
-                "platform": "cisco_ios",
                 "credentials": "net",
                 "connection": "direct",
             },

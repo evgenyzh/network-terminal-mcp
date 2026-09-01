@@ -5,7 +5,7 @@
 - Сначала read-only диагностика, затем контролируемые изменения.
 - Сначала прямой SSH на тестовом оборудовании, затем сложные маршруты.
 - Не писать vendor-команды в транспортном слое.
-- Каждый новый транспорт или адаптер должен иметь воспроизводимый transcript и
+- Каждый новый транспорт должен иметь воспроизводимый transcript и
   негативные тесты.
 
 ## Этап 0. Каркас проекта
@@ -23,19 +23,19 @@ pass credential backend, policy, audit/redaction, target resolver и unit tests.
 
 ## Этап 1. Прямой SSH и постоянные сессии
 
-Статус: выполнен для direct SSH. Реализованы Netmiko session manager, output
-buffer, idle/hard lifetime, JSONL audit, `known_hosts` и шесть stdio MCP tools.
-Через зарегистрированные MCP tools проверены Cisco IOS (включая legacy
-`group1`/`ssh-rsa`), SNR old/eNOS через `cisco_ios`, D-Link через `dlink_ds`,
-Huawei VRP и Juniper Junos. Первичная регистрация host key требует явного
-`host_key_policy: accept_new`; последующие соединения используют `strict`.
+Статус: выполнен для direct SSH. Реализованы session manager на Paramiko,
+output buffer, idle/hard lifetime, JSONL audit, `known_hosts` и шесть stdio MCP
+tools. Через зарегистрированные MCP tools проверены Cisco IOS (включая legacy
+`group1`/`ssh-rsa`), SNR old/eNOS, D-Link, Huawei VRP и Juniper Junos. Первичная
+регистрация host key требует явного `host_key_policy: accept_new`; последующие
+соединения используют `strict`.
 
 - Реализовать `pass` credential backend.
 - Добавить session manager с timeout, lock и ограничением вывода.
 - Реализовать `open_session`, `run_command`, `run_commands`, `session_status`,
   `read_output`, `close_session`.
-- Подключить Cisco IOS, Huawei VRP и Juniper Junos через Netmiko.
-- Проверить автоматический session preparation и paging.
+- Подключить Cisco IOS, Huawei VRP и Juniper Junos.
+- Проверить автоматическую подготовку сессии и обработку paging.
 
 Критерий завершения: MCP tools выполняют несколько диагностических команд в
 одной сессии на трех тестовых платформах, не получая пароль. Регистрация MCP в
@@ -45,15 +45,14 @@ OpenCode остается задачей Этапа 6.
 
 Статус: реализован, покрыт local scripted tests и проверен на оборудовании.
 Добавлены `cli_help`, `send_control`, `respond`, состояния
-`paging`/`awaiting_response` и bounded pager flow. SNR dialect metadata уже была
-добавлена в Этапе 1.
+`paging`/`awaiting_response` и bounded pager flow. SNR уже был подключён в
+Этапе 1.
 
 Hardware findings:
-- `cli_help` работает на Cisco IOS и SNR eNOS; D-Link поддержан через
-  `cli_help_requires_enter: true` (`<line>?` + Enter).
+- `cli_help` работает на Cisco IOS, SNR eNOS и D-Link.
 - SNR old возвращает настоящий help-pager; `space` листает, `q` возвращает к
   prompt, после чего Ctrl-C и Ctrl-U очищают неполную строку.
-- Netmiko отключает pager на проверенных Junos/Huawei. Их help заканчивается
+- На проверенных Junos/Huawei pager отключён. Их help заканчивается
   `prompt + набранная строка`; Ctrl-C и Ctrl-U очищают её без нового вывода,
   после чего следующая команда проходит в той же сессии.
 - SNR old меняет host key при каждой загрузке; добавлена per-profile политика
@@ -72,16 +71,15 @@ Hardware findings:
 
 Критерий завершения: модель может найти неизвестную команду через `?`, очистить
 строку и выполнить найденную команду без переподключения. Read-only hardware
-validation выполнена; anonymized transcripts нужны при добавлении новых
-platform-specific pager/prompt patterns.
+validation выполнена; anonymized transcripts нужны для валидации новых
+pager/prompt patterns.
 
 ## Этап 3. Маршруты доступа
 
 Статус: реализован и проверен на реальном bastion. Один configured SSH-only
-ProxyJump hop работает через Paramiko `direct-tcpip` и Netmiko `sock`, с
-независимыми host-key checks и cleanup обоих hops. Поддерживаются password и
-explicit `ssh_key` (включая encrypted key c passphrase из `pass`) credential
-profiles. Nested SSH реализован через `generic_termserver` + `redispatch` и
+ProxyJump hop работает через Paramiko `direct-tcpip`, с независимыми host-key
+checks и cleanup обоих hops. Поддерживаются password и explicit `ssh_key`
+(включая encrypted key c passphrase из `pass`) credential profiles. Nested SSH
 проверен на реальной паре intermediate host + SNR old target. Hardware
 validation пройдена через OpenCode MCP для обоих маршрутов.
 
@@ -98,15 +96,15 @@ terminal-server целей.
 Статус: реализован. Per-profile legacy SSH algorithm overrides применяются как
 allowlist через Paramiko `disabled_algorithms` только к перечисленным
 категориям. Прямой Telnet и `console` profiles поддерживают только явный
-двойной gating (`allow_telnet: true` + `defaults.telnet: allow`), Telnet-драйвер
-платформы задаётся через `telnet_driver` (по умолчанию `<driver>_telnet`).
-Nested Telnet выполняется через `telnet` из shell промежуточного хоста.
+двойной gating (`allow_telnet: true` + `defaults.telnet: allow`); транспорт
+Telnet/console — telnetlib3. Nested Telnet выполняется через `telnet` из shell
+промежуточного хоста.
 Telnet и console проверены unit-тестами; hardware-проверка Telnet на реальной
 цели не выполнялась.
 
 - Реализовать host-scoped SSH algorithm profiles.
 - Проверить `ssh-rsa`, SHA1 KEX и CBC на лабораторной цели.
-- Добавить прямые Telnet-драйверы и обязательное security warning.
+- Добавить прямой Telnet и обязательное security warning.
 - Оценить отдельный OpenSSH PTY backend для случаев, которые не поддерживает
   Paramiko.
 - Не реализовывать DSA-only compatibility до появления реального устройства.
@@ -116,20 +114,26 @@ Telnet и console проверены unit-тестами; hardware-провер�
 
 ## Этап 5. Нестандартные платформы
 
+Отдельные драйверы не пишутся. Семейства устройств (BDCOM, EcoSGE, PON и т.п.)
+определяет модель по баннеру и первичному выводу; механика терминала
+обрабатывается универсальным транспортным слоем и state machine сервера.
+Нестандартное поведение исследуется через `cli_help` и `send_control`, а при
+необходимости обобщается в транспортном слое или в skill.
+
 - Собрать безопасные login/session transcripts с BDCOM, EcoSGE и PON.
-- Реализовать только необходимые adapters: prompt, paging, modes, line ending.
-- Разделить BDCOM Huawei-like и Cisco legacy.
+- Валидировать transcripts на универсальном транспорте.
 - Добавлять варианты SNR только если различается механика терминала, а не команды.
 
 Критерий завершения: каждая заявленная платформа проходит общий acceptance
-suite и собственные transcript-тесты.
+suite на базе transcript-тестов без отдельного кода под вендора.
 
 ## Этап 6. Интеграция OpenCode
 
 Статус: выполнен для текущего global OpenCode profile. Local stdio MCP
 `network-terminal` зарегистрирован с рабочим каталогом проекта и timeout 65
-секунд. Global skill направляет диагностику только через MCP, требует inventory
-target, read-only command и закрытие session.
+секунд. Global skill направляет диагностику только через MCP, открывает
+`open_session(host=...)` по IP/имени, определяет семейство устройства по
+баннеру/выводу и требует read-only command и закрытие session.
 
 `opencode mcp list` подтвердил подключение, а read-only round-trip
 `open_session -> run_command -> close_session` выполнен через OpenCode.
@@ -156,7 +160,7 @@ reload/commit confirmed: `save` фиксирует до-изменённое с�
 - Сохранять конфигурацию и состояние до изменений.
 - Использовать нативный rollback: Junos commit confirmed, RouterOS Safe Mode и
   доступные vendor-механизмы.
-- Для платформ без надежного rollback требовать рабочий console path.
+- Для устройств без надежного rollback требовать рабочий console path.
 - Добавить отдельное подтверждение пользователя и per-device `allow_writes`.
 
 Критерий завершения: модель не может применить изменение одним вызовом без

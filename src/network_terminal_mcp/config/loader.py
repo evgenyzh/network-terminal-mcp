@@ -120,12 +120,11 @@ class AppConfig:
         devices = len(self.inventory.devices)
         groups = len(self.inventory.groups)
         connections = len(self.connections.connections)
-        platforms = len(self.connections.platforms)
         credentials = len(self.credentials.credentials)
         rules = len(self.policy.rules)
         return (
             f"devices={devices} groups={groups} "
-            f"connections={connections} platforms={platforms} "
+            f"connections={connections} "
             f"credentials={credentials} policy_rules={rules}"
         )
 

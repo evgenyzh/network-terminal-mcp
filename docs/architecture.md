@@ -6,7 +6,9 @@
 не набор заранее подготовленных vendor-команд. Модель сама исследует CLI через
 `?`, читает ошибки синтаксиса и продолжает работу в той же сессии.
 
-Netmiko используется как транспортный и терминальный двигатель. Он не переводит
+Транспорт реализован в `src/network_terminal_mcp/terminal.py` как сырой
+терминальный слой: `SshTerminal` (Paramiko `invoke_shell`) и `TelnetTerminal`
+(telnetlib3) без vendor-драйверов и без понятия «платформа». Слой не переводит
 запросы пользователя в команды и не является инвентарем или NMS.
 
 ## Компоненты
@@ -27,32 +29,28 @@ MCP tools
   |
   v
 connection backend (implemented)
-  +-- Netmiko direct SSH
-   +-- Paramiko one-hop proxyjump -> Netmiko target session
-  |
-  v
-platform registry
-  +-- stock Netmiko drivers and configured aliases
-  +-- local BDCOM/EcoSGE/PON adapters (planned)
+  +-- SshTerminal (Paramiko invoke_shell) --- direct SSH / proxyjump / nested
+  +-- TelnetTerminal (telnetlib3) ----------- direct Telnet / console TCP
 ```
 
 Реализованы direct SSH, один configured SSH-only ProxyJump hop, один configured
-Nested hop (SSH или Telnet через `generic_termserver` + `redispatch`), прямой
-Telnet и TCP console profiles. OpenSSH PTY fallback и local adapters остаются
-отдельными transport backends следующих этапов.
+Nested hop (SSH или Telnet через клиент промежуточного хоста), прямой Telnet и
+TCP console profiles. Тип устройства заранее не известен и не требуется: модель
+читает banner/вывод и определяет CLI сама через generic tools.
 
 ## MCP-инструменты Этапов 1-2
 
 ### `open_session`
 
 Открывает direct, configured one-hop ProxyJump, configured one-hop Nested,
-Telnet или console-соединение и возвращает непрозрачный `session_id`, platform,
-dialect, prompt и transport warnings. Перед соединением SSH-ключ проверяется
-через локальный `known_hosts`; у ProxyJump отдельно проверяются ключи bastion и
-final target, у Nested — ключ intermediate host. Telnet/console не проверяют
-host key.
+Telnet или console-соединение и возвращает непрозрачный `session_id`, target,
+host, prompt, state и transport warnings. Тип оборудования заранее неизвестен:
+модель определяет его по banner/выводу и работает generic tools. Перед
+соединением SSH-ключ проверяется через локальный `known_hosts`; у ProxyJump
+отдельно проверяются ключи bastion и final target, у Nested — ключ intermediate
+host. Telnet/console не проверяют host key.
 
-Цель задается именем из инвентаря или одноразовым описанием `host`, `platform`,
+Цель задается именем из инвентаря или одноразовым описанием `host`,
 `credentials`, `connection`, `port`. Одноразовая цель не содержит пароль и
 может ссылаться только на локальные profiles.
 
@@ -86,7 +84,7 @@ structural command hazards.
 После непостраничной помощи CLI может либо ждать Ctrl-C и вернуть чистый
 prompt, либо уже показать `prompt + остаток строки` (Junos/Huawei). Во втором
 случае сервер распознаёт этот хвост, посылает Ctrl-C и Ctrl-U без ожидания
-нового вывода: эти платформы очищают line buffer молча. Для CLI, показывающих
+нового вывода: эти CLI очищают line buffer молча. Для CLI, показывающих
 помощь только после Enter (D-Link), используется `cli_help_requires_enter`
 (`<line>?` + Enter).
 
@@ -110,14 +108,6 @@ session в `failed`.
 Возвращают накопленный вывод частями, состояние либо закрывают соединение.
 Вывод хранится в ограниченном session buffer; при превышении лимита старые данные
 вытесняются, а `oldest_offset` сообщает доступную начальную позицию.
-
-### `set_platform`
-
-`set_platform(session_id, platform)` переключает драйвер существующей сессии на
-лету через Netmiko `redispatch` (тот же механизм, что и для nested). Используется
-при ad-hoc доступе, когда модель ошиблась в типе оборудования: открывает сессию
-с предполагаемым `platform`, читает вывод, затем корректирует драйвер, не теряя
-SSH-соединение. Обновляет `session.platform` и пишет audit `set_platform`.
 
 ### Инструменты Этапа 7: изменения конфигурации
 
@@ -162,16 +152,11 @@ connecting -> ready -> paging ------------+
 
 ## Подготовка терминала и paging
 
-После подключения Netmiko запускает `session_preparation` выбранного драйвера:
-
-- Cisco IOS: terminal width и `terminal length 0`.
-- Huawei: `screen-length 0 temporary`.
-- Junos: `set cli screen-length 0` и screen width.
-- Остальные штатные платформы используют собственную реализацию.
-
-После вложенного SSH/Telnet сначала используется `generic_termserver`, затем
-`redispatch(..., session_prep=True)`. Поэтому подготовка выполняется именно на
-конечном устройстве.
+После подключения терминал определяет prompt первым Enter и ждет, пока вывод
+установится. Специфичной per-driver подготовки (session_preparation) нет:
+отключение pager или пролистывание выполняет сама модель generic инструментами
+(`cli_help`, `send_control`) по наблюдаемому выводу. После вложенного SSH/Telnet
+сессия переходит на final target через клиент промежуточного хоста.
 
 Этап 2 добавляет консервативное распознавание распространенных pager markers
 (включая Junos `---(more N%)---`). Pager не продолжается автоматически: tool
@@ -181,56 +166,51 @@ page limit прерывается `q`. В help-flow совпадение prompt 
 (`prompt + остаток строки`) только для `cli_help`; этот хвост очищается
 Ctrl-C и Ctrl-U без Enter. Вне help-flow совпадение prompt строгое.
 
-## Платформы и диалекты
+## Определение устройства по выводу
 
-Платформа описывает механику соединения. Диалект дает модели контекст о CLI, но
-не обязан иметь отдельный класс.
+Проект не знает тип устройства заранее и нигде его не хранит: поля platform нет
+ни на Device, ни в SessionInfo, ни в audit, ни в аргументах MCP-инструментов.
+`open_session` открывает любой SSH/Telnet/console-терминал без `device_type`.
+Модель сама определяет производителя и синтаксис CLI по banner и первым выводам,
+затем работает generic tools: `cli_help` (команда + `?`), чтение ошибок
+синтаксиса и корректировка следующей команды в той же сессии.
 
-```text
-snr_29xx -> CiscoIos transport + snr_29xx dialect
-snr_52xx -> CiscoIos transport + snr_52xx dialect
-```
-
-Разница между `show mac address-table` и `show mac-address-table` не является
-причиной писать новый Netmiko-драйвер. Модель определяет синтаксис через
-`cli_help`.
-
-BDCOM делится как минимум на `bdcom_huawei_like` и `bdcom_cisco_legacy`, потому
-что там может различаться сама механика базового CLI.
+Разница между `show mac address-table` и `show mac-address-table` не требует
+никаких драйверов: модель выясняет синтаксис через `cli_help` на живом CLI.
 
 ## Транспортные маршруты
 
-- `direct` SSH: реализован; `legacy_ssh` использует Paramiko/Netmiko.
-  Per-profile allowlists (`host_key_algorithms`/`kex_algorithms`/`ciphers`)
-  становятся Paramiko `disabled_algorithms` и не ослабляют host key checking.
+- `direct` SSH: реализован `SshTerminal` на Paramiko `invoke_shell`;
+  `legacy_ssh` использует тот же Paramiko напрямую. Per-profile allowlists
+  (`host_key_algorithms`/`kex_algorithms`/`ciphers`) становятся Paramiko
+  `disabled_algorithms` и не ослабляют host key checking.
 - `proxyjump`: один configured SSH hop реализован через Paramiko `direct-tcpip`
-  channel и Netmiko `sock`; arbitrary `ProxyCommand` не поддерживается. С полем
-  `socks: {host, port}` вместо `jump_host` тот же профиль маршрутизирует final
-  target через локальный SOCKS5-прокси (обычно локальный SSH dynamic forward);
-  целевой сокет создаётся модулем `socks` и передаётся Netmiko как `sock`, а
-  host key цели проверяется через тот же SOCKS-сокет.
-- `nested`: один configured hop реализован через `generic_termserver` +
-  `redispatch`; `next_protocol` поддерживает `ssh` и `telnet`. Inner SSH
-  выполняется SSH-клиентом промежуточного хоста, поэтому host key final target
-  проверяет именно он; inner Telnet host key не проверяет.
-- `direct` Telnet: реализован с двойным gating
-  (`allow_telnet` на устройстве и `defaults.telnet: allow`), использует
-  `telnet_driver` платформы, host key не проверяется.
+  channel, переданный `SshTerminal` как `sock`; arbitrary `ProxyCommand` не
+  поддерживается. С полем `socks: {host, port}` вместо `jump_host` тот же
+  профиль маршрутизирует final target через локальный SOCKS5-прокси (обычно
+  локальный SSH dynamic forward); целевой сокет создаётся модулем `socks` и
+  передаётся `SshTerminal` как `sock`, а host key цели проверяется через тот же
+  SOCKS-сокет.
+- `nested`: один configured hop; `next_protocol` поддерживает `ssh` и `telnet`.
+  Inner SSH выполняется SSH-клиентом промежуточного хоста, поэтому host key
+  final target проверяет именно он; inner Telnet host key не проверяет.
+- `direct` Telnet: реализован `TelnetTerminal` на telnetlib3 с двойным gating
+  (`allow_telnet` на устройстве и `defaults.telnet: allow`), host key не
+  проверяется.
 - `console`: реализован как TCP console port терминального сервера через
-  Telnet-драйвер; требует заданный `port` и тот же gating.
+  `TelnetTerminal`; требует заданный `port` и тот же gating.
 
 Маршруты состоят только из заранее определенных connection profiles. Модель не
 может передать произвольную shell-команду перехода.
 
-## Расширение Netmiko
+## Сырой терминальный слой
 
-Netmiko распространяется под MIT. Проект использует его как зависимость и не
-изменяет установленный пакет.
-
-Собственный registry разрешает штатный `device_type` либо alias из
-`connections.yml`. Локальные драйверы будут наследоваться от ближайшего
-штатного класса; в Этапе 1 local adapters пока возвращают понятную ошибку.
-Версия Netmiko ограничена major-версией 4, потому что драйверы используют часть
-его protected API. Interactive flow использует только public `send_command`,
-`write_channel`, `read_until_pattern` и `read_channel_timing`. Обновление
-выполняется только после tests transcript replay.
+`SshTerminal` и `TelnetTerminal` реализуют общий `TerminalConnection` protocol:
+`find_prompt`, `send_command`, `write_channel`, `read_until_pattern`,
+`read_channel_timing`, `disconnect`. SessionManager собирает transport params и
+передает их в подходящий класс: ключи `transport` ("ssh"|"telnet"), `host`,
+`port`, `username`, `password`/`key_file`/`passphrase`, `known_hosts_file`,
+`conn_timeout`/`banner_timeout`/`auth_timeout`, опциональный `sock` (SOCKS/jump)
+и опциональный `disabled_algorithms`. Среди параметров нет `device_type`: слой
+открывает любой ssh/telnet/console терминал, читает banner/вывод, а
+интерпретацию оставляет модели.

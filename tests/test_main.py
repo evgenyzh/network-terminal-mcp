@@ -29,7 +29,6 @@ def _base_config(config_dir: Path) -> None:
             "devices": {
                 "sw1": {
                     "host": "192.0.2.1",
-                    "platform": "cisco_ios",
                     "credentials": "net",
                     "connection": "direct",
                 }
@@ -65,7 +64,7 @@ def test_check_device(config_dir: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert main(["--config-dir", str(config_dir), "check", "--device", "sw1"]) == 0
     out = capsys.readouterr().out
     assert "host=192.0.2.1" in out
-    assert "platform=cisco_ios" in out
+    assert "credentials=net" in out
 
 
 def test_check_device_unknown_fails(config_dir: Path) -> None:

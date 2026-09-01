@@ -7,13 +7,14 @@
 `sshpass`-команд и одноразовых скриптов.
 
 Статус: Этапы 1, 2, 3, 4, 6 и 7 реализованы; Этап 3 поддерживает один SSH-only
-ProxyJump hop и один Nested hop (`generic_termserver` + `redispatch`), а
+ProxyJump hop и один Nested hop, а
 Этап 4 — per-profile legacy SSH algorithm overrides, прямой Telnet, Nested
 Telnet и TCP console profiles. Этап 7 добавляет безопасное применение
 изменений (`plan_change`/`apply_change`/`abort_change`/`finalize_change`) с
 двойным gating, двухшаговым подтверждением и опциональным reload-откатом.
 Есть конфигурация, политика,
-аудит, credential backend, known_hosts, постоянные Netmiko-сессии, безопасный
+аудит, credential backend, known_hosts, постоянные сессии на собственном
+терминальном слое (Paramiko + telnetlib3, без драйверов), безопасный
 `cli_help`, pager/control state machine и stdio MCP tools. Direct SSH проверен
 на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Junos. `cli_help` подтвержден
 на всех этих платформах: SNR old поддерживает `space`/`q` pager flow, а
@@ -41,8 +42,9 @@ schedule reboot delay) не выполнялась.
   один раз, затем модель продолжает работать с тем же prompt.
 - Точные команды выбирает модель. MCP не переводит абстрактные операции в
   vendor CLI и не хранит полный каталог команд.
-- Netmiko отвечает за SSH/Telnet-канал, prompt, paging и подготовку терминала.
-- Дополнительные адаптеры описывают только механику нестандартного CLI.
+- Собственный терминальный слой на Paramiko и telnetlib3 предоставляет модель
+  сырой ssh/telnet/console интерфейс; тип устройства модель определяет сама по
+  баннеру и выводу.
 - Пароли загружаются из `pass`/GPG и не попадают в аргументы MCP или ответы.
 - Все команды и результаты подключения журналируются без секретов.
 - Диагностика доступна по умолчанию; изменение конфигурации отделено и требует

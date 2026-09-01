@@ -1,12 +1,12 @@
 ---
 # Inventory is infrastructure-only: bastion/jump hosts, and defaults for ad-hoc
 # device access. Network devices themselves are reached ad-hoc by the model via
-# open_session(host=..., platform=...), where credentials and connection fall
-# back to the defaults below.
+# open_session(host=...), where credentials and connection fall back to the
+# defaults below.
 #
 # For a fleet of thousands of switches there is no per-switch record here. The
-# model decides how to connect each time, specifying the platform (or guessing
-# it and correcting with set_platform after reading the output).
+# model decides how to connect each time and identifies the device type from
+# its banner or output after the session opens.
 default_credentials: network-tacacs
 default_connection: through-jump
 
@@ -15,7 +15,6 @@ devices:
   # or a handful of lab devices for debugging. Most devices are ad-hoc.
   lab-cisco:
     host: 192.0.2.10
-    platform: cisco_ios
     credentials: network-tacacs
     connection: through-jump
     tags: [lab, cisco]

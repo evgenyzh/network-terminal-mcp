@@ -1,92 +1,46 @@
-# Адаптеры платформ
+# Транспорт и определение типа устройства
 
-## Когда нужен адаптер
+## Нет слоя адаптеров
 
-Новый адаптер нужен только если отличается механика терминала:
+Проект не имеет адаптерного или драйверного слоя. Транспорт унифицирован для
+любых ssh/telnet/console-устройств и реализован в
+`src/network_terminal_mcp/terminal.py`:
 
-- login flow;
-- prompt или режимы;
-- отключение paging;
-- line endings;
-- обработка enable/config mode;
-- ANSI/control sequences;
-- завершение команды или confirmation prompts.
+- SSH — Paramiko;
+- Telnet и console — telnetlib3.
 
-Различие vendor-команд само по себе не является причиной писать драйвер.
+Понятия `platform`, `dialect`, `driver`, `generic_termserver` и `redispatch`
+отсутствуют. Нет ни поля `platform`, ни инструмента `set_platform`.
 
-Например, SNR 29xx и 52xx могут использовать Cisco IOS driver, даже если
-команды MAC/VLAN отличаются. Разницу исследует модель через `cli_help`.
+## Как определяется тип устройства
 
-Этап 1 подтвердил этот подход на SNR old и SNR eNOS: обе линейки прошли login,
-session preparation и `show version` через `cisco_ios`. Имена `snr_29xx` и
-`snr_52xx` остаются dialect metadata; отдельный Netmiko driver не требуется.
+`open_session(host=...)` не принимает аргумент `platform`. Модель определяет
+семейство устройства по баннеру и первичному выводу, а затем взаимодействует
+через универсальные инструменты:
 
-## Реализация
+- `run_command` / `run_commands` — диагностические команды;
+- `cli_help` — инспекция синтаксиса: всегда отправляет `line?` без Enter
+  (флаг `cli_help_requires_enter` удалён);
+- `send_control` — `space`/`q` для pager, `ctrl-c` для pager или
+  confirmation prompt;
+- `respond` — ответ на уже распознанный confirmation prompt.
 
-Локальный класс наследуется от ближайшего Netmiko-драйвера и переопределяет
-минимум методов:
+## Механика терминала
 
-```python
-class ExamplePlatformSSH(CiscoIosBase):
-    def session_preparation(self) -> None:
-        self._test_channel_read(pattern=r"[>#]")
-        self.set_base_prompt()
-        self.disable_paging(command="terminal length 0")
-```
+Различия между устройствами касаются только механики терминала:
 
-Это только иллюстрация. Реальная реализация должна исходить из transcript и
-проверяться на устройстве.
+- paging и пролистывание;
+- отображение help;
+- очистка неполной строки после help;
+- confirmation prompts.
 
-Не следует копировать целый vendor driver ради одной команды paging.
+Вся эта механика обрабатывается единообразно: state machine сервера отслеживает
+paging и ожидание ответа, остальное решает модель по выводу. Vendor-специфичного
+кода нет: `cli_help` работает одинаково для любого устройства.
 
-## Registry
+## Специфичное поведение
 
-Собственный registry сопоставляет platform name с:
-
-- штатным Netmiko `device_type`; или
-- локальным SSH/Telnet-классом;
-- dialect metadata;
-- pager/control patterns;
-- capability flags.
-
-Не требуется изменять `netmiko.ssh_dispatcher.CLASS_MAPPER` или monkey-patch
-установленного пакета.
-
-## BDCOM
-
-Начальные семейства:
-
-- `bdcom_huawei_like`;
-- `bdcom_cisco_legacy`.
-
-До реализации нужны обезличенные transcripts:
-
-- login до первого prompt;
-- пустой Enter;
-- команда версии;
-- команда отключения paging;
-- вывод с pager;
-- вход/выход из enable и config без применения конфигурации;
-- `?` и очистка строки.
-
-## EcoSGE
-
-EcoSGE имеет SSH CLI и TACACS+. Сначала пробуется ближайший generic/Cisco-like
-механизм. Отдельный адаптер добавляется только после проверки prompt, paging и
-режимов на установленной версии ПО.
-
-## PON
-
-Huawei OLT начинает со штатного `huawei_olt`. BDCOM, Eltex и SNR PON нельзя
-объединять в один общий `pon` driver: адаптер выбирается по фактической CLI-
-механике и версии.
-
-## Transcript fixtures
-
-Transcripts для тестов должны быть обезличены:
-
-- заменить hostnames, IP, MAC, serial numbers и usernames;
-- удалить banners с внутренними названиями;
-- никогда не записывать password prompts вместе с отправленным секретом;
-- сохранить управляющие символы в escaped-виде;
-- отметить ожидаемый prompt и точки записи клиента.
+Если позже потребуется специфичное для устройства поведение, его место — в
+универсальном терминальном слое (`terminal.py`) или в skill, а не в
+vendor-драйвере. Такое поведение должно проверяться на transcript'ах и не
+дублироваться для каждого вендора.

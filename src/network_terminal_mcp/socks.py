@@ -6,8 +6,8 @@ forward ``ssh -D``). This module implements only the parts of RFC 1928 that we
 need to open a CONNECT tunnel: no auth, no UDP, no domain-name resolution on
 the proxy side (targets are always resolved by the caller and sent as IPs).
 
-The returned socket has a socket-like interface, so it can be handed to Netmiko
-as the ``sock`` argument and to paramiko for an unauthenticated host-key probe.
+The returned socket has a socket-like interface, so it can be handed to paramiko
+for the SSH transport and for an unauthenticated host-key probe.
 """
 
 from __future__ import annotations

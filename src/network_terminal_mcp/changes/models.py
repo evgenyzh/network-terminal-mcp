@@ -49,7 +49,6 @@ class ChangePlan(BaseModel):
     session_id: str
     target: str
     host: str
-    platform: str
     title: str
     commands: list[ChangeCommand]
     hash: str
@@ -70,7 +69,6 @@ class ChangeResult(BaseModel):
     change_id: str
     session_id: str
     target: str
-    platform: str
     title: str
     state: ChangeState
     hash: str
@@ -97,7 +95,6 @@ class ChangeResult(BaseModel):
             change_id=plan.change_id,
             session_id=plan.session_id,
             target=plan.target,
-            platform=plan.platform,
             title=plan.title,
             state=plan.state,
             hash=plan.hash,

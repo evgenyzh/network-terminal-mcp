@@ -20,7 +20,6 @@ class Target:
 
     name: str
     host: str
-    platform: str
     credentials: str
     connection: str
     port: int | None = None
@@ -38,8 +37,8 @@ class TargetResolver:
     def resolve(self, name: str | None = None, **ad_hoc: object) -> Target:
         """Resolve a target by inventory name or from ad-hoc keyword fields.
 
-        Exactly one of ``name`` or ``host`` (plus ``platform``,
-        ``credentials``, ``connection``) must be provided.
+        Exactly one of ``name`` or ``host`` (plus ``credentials`` and
+        ``connection``) must be provided.
         """
         if name is not None:
             return self._resolve_named(name)
@@ -52,7 +51,7 @@ class TargetResolver:
         return self._from_device(name, device)
 
     def _resolve_ad_hoc(self, fields: dict[str, object]) -> Target:
-        unknown = set(fields) - {"host", "platform", "credentials", "connection", "port"}
+        unknown = set(fields) - {"host", "credentials", "connection", "port"}
         if unknown:
             raise TargetError(
                 f"unsupported ad-hoc target fields: {', '.join(sorted(unknown))}"
@@ -60,11 +59,8 @@ class TargetResolver:
         host = fields.get("host")
         if not isinstance(host, str) or not host:
             raise TargetError("ad-hoc target requires 'host'")
-        platform = fields.get("platform")
         credentials = fields.get("credentials")
         connection = fields.get("connection")
-        if not isinstance(platform, str) or not platform:
-            raise TargetError("ad-hoc target requires 'platform'")
         if credentials is None:
             credentials = self._config.inventory.default_credentials
         if connection is None:
@@ -91,7 +87,6 @@ class TargetResolver:
         return Target(
             name="<ad-hoc>",
             host=host,
-            platform=platform,
             credentials=credentials,
             connection=connection,
             port=port,
@@ -102,7 +97,6 @@ class TargetResolver:
         return Target(
             name=name,
             host=device.host,
-            platform=device.platform,
             credentials=device.credentials,
             connection=device.connection,
             port=device.port,

@@ -74,7 +74,6 @@ def _config(*, allow_writes: bool = True, write_change: str = "allow") -> AppCon
                 "devices": {
                     "sw1": {
                         "host": "192.0.2.1",
-                        "platform": "snr_29xx",
                         "credentials": "net",
                         "connection": "direct",
                         "allow_writes": allow_writes,
@@ -85,9 +84,6 @@ def _config(*, allow_writes: bool = True, write_change: str = "allow") -> AppCon
         connections=ConnectionsConfig.model_validate(
             {
                 "connections": {"direct": {"type": "direct", "protocol": "ssh"}},
-                "platforms": {
-                    "snr_29xx": {"driver": "cisco_ios", "dialect": "snr_29xx"}
-                },
             }
         ),
         credentials=CredentialsConfig.model_validate(

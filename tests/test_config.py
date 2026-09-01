@@ -37,7 +37,6 @@ def test_device_model_valid() -> None:
     device = Device.model_validate(
         {
             "host": "192.0.2.10",
-            "platform": "snr_29xx",
             "credentials": "network-tacacs",
             "connection": "direct",
             "tags": ["lab"],
@@ -50,7 +49,7 @@ def test_device_model_valid() -> None:
 
 def test_device_rejects_unknown_field() -> None:
     with pytest.raises(Exception, match="Extra inputs are not permitted"):
-        Device.model_validate({"host": "h", "platform": "p", "typo": 1})
+        Device.model_validate({"host": "h", "typo": 1})
 
 
 def test_connection_discriminated_union_direct() -> None:
@@ -266,7 +265,6 @@ def test_load_full_config(config_dir: Path) -> None:
             "devices": {
                 "sw1": {
                     "host": "192.0.2.1",
-                    "platform": "cisco_ios",
                     "credentials": "net",
                     "connection": "direct",
                 }
@@ -305,7 +303,7 @@ def test_load_rejects_unknown_fields(config_dir: Path) -> None:
     _write(
         config_dir,
         "inventory.yml",
-        {"devices": {"sw1": {"host": "h", "platform": "p", "typo": True}}},
+        {"devices": {"sw1": {"host": "h", "typo": True}}},
     )
     with pytest.raises(ConfigError, match="invalid inventory.yml"):
         load_config(config_dir)
@@ -319,7 +317,6 @@ def test_reference_validation_catches_missing_profiles(config_dir: Path) -> None
             "devices": {
                 "sw1": {
                     "host": "192.0.2.1",
-                    "platform": "cisco_ios",
                     "credentials": "missing-creds",
                     "connection": "missing-conn",
                 }
@@ -338,7 +335,6 @@ def test_reference_validation_catches_missing_jump_credentials(config_dir: Path)
             "devices": {
                 "sw1": {
                     "host": "192.0.2.1",
-                    "platform": "cisco_ios",
                     "credentials": "net",
                     "connection": "jump",
                 }
@@ -376,7 +372,6 @@ def test_reference_validation_catches_missing_nested_credentials(config_dir: Pat
             "devices": {
                 "sw1": {
                     "host": "192.0.2.1",
-                    "platform": "cisco_ios",
                     "credentials": "net",
                     "connection": "nested-term",
                 }
@@ -408,7 +403,7 @@ def test_reference_validation_catches_missing_nested_credentials(config_dir: Pat
 
 
 def test_inventory_config_roundtrip() -> None:
-    data = {"devices": {"a": {"host": "h", "platform": "p", "credentials": "c", "connection": "d"}}}
+    data = {"devices": {"a": {"host": "h", "credentials": "c", "connection": "d"}}}
     inventory = InventoryConfig.model_validate(data)
     assert list(inventory.devices) == ["a"]
 
