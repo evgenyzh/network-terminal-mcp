@@ -89,10 +89,11 @@ client round-trip и OpenCode registration остаются задачей Эт�
 - Legacy algorithms для host вне профиля.
 - Невозможность записи audit-файла.
 - Transcript/output path traversal.
-- `apply_change` с structural hazard в команде.
-- Повторный `apply_change` одного плана.
-- `apply_change` без плана (после рестарта) — fail-closed.
-- `abort_change` после исполнения.
+- `run_change` с structural hazard в команде.
+- `run_change` с пустым списком команд.
+- `run_change` останавливается на первой упавшей команде (остальные не
+  выполняются).
+- `run_change` без живой сессии (после рестарта) — fail-closed.
 - Change-команда с pager/confirmation prompt.
 - SOCKS5 с требующейся авторизацией прокси.
 - SOCKS5 с не-IP target.

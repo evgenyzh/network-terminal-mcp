@@ -116,37 +116,13 @@ def create_server(
         return await _run_sync(session_manager.close_session, session_id)
 
     @server.tool()
-    async def plan_change(
-        session_id: str,
-        commands: list[str],
-        auto_approve: bool = False,
-    ) -> ChangeResult:
-        """Register a configuration change plan without executing anything.
+    async def run_change(session_id: str, commands: list[str]) -> ChangeResult:
+        """Execute policy-allowed configuration change commands immediately.
 
-        Commands are validated for structural safety. Applying the plan always
-        requires explicit confirmation via ``apply_change``.
+        Commands are validated for structural safety and run in order. A
+        device confirmation or pager aborts the run and reports it as failed.
         """
-        return await _run_sync(
-            session_manager.plan_change,
-            session_id,
-            commands,
-            auto_approve=auto_approve,
-        )
-
-    @server.tool()
-    async def apply_change(session_id: str) -> ChangeResult:
-        """Confirm and then execute a change plan for a session.
-
-        The first call returns the canonical command list with
-        ``confirmation_required`` and executes nothing; the second call
-        executes the plan.
-        """
-        return await _run_sync(session_manager.apply_change, session_id)
-
-    @server.tool()
-    async def abort_change(session_id: str) -> ChangeResult:
-        """Cancel a change plan for a session before anything is executed."""
-        return await _run_sync(session_manager.abort_change, session_id)
+        return await _run_sync(session_manager.run_change, session_id, commands)
 
     return server
 

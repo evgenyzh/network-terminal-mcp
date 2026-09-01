@@ -154,16 +154,24 @@ Hardware-проверка Telnet/console на реальном устройст�
 ## Этап 7 validation
 
 Изменения конфигурации проверены unit-тестами:
-- `plan_change` отклоняет пустой список и structural hazards; ничего не
+- `run_change` отклоняет пустой список и structural hazards; ничего не
   исполняется.
-- `apply_change` двухшаговый: первый вызов возвращает `confirmation_required`
-  и не исполняет, второй исполняет только сохранённые канонические команды;
-  повторный apply запрещён.
-- `apply_change` без плана отвечает «no pending change plan» (fail-closed:
-  после рестарта сервера изменение не выполняется и не повторяется).
-- `abort_change` отменяет план до исполнения.
-- При pager/confirmation в change-команде план переводится в `failed`.
-- `auto_approve` пропускает подтверждающий вызов, когда разрешён явно.
+- `run_change` исполняет все команды в порядке перечисления и отмечает
+  per-command статус.
+- `run_change` останавливается на первой упавшей команде (pager, device
+  confirmation, ошибка соединения): следующие команды не исполняются, событие в
+  аудите получает `failed`.
+- `run_change` без живой сессии завершается ошибкой (fail-closed: после
+  рестарта сервера изменение не выполняется и не повторяется).
+
+Подтверждение изменения — нативный permission-попап OpenCode
+(`permission: { "network-terminal_run_change": "ask" }`); на сервере механизма
+подтверждения нет.
+
+Hardware-проверка на реальном оборудовании выполнена: на Cisco IOS
+(Krupskoy_16_5pod_u, WS-C2950G-48-EI, IOS 12.1(22)EA13) `run_change` применил
+и откатил `description` на интерфейсе; сессия закрыта, изменения остались
+только в running-config.
 
 Откат (Junos `commit confirmed`, Huawei `schedule reboot delay`/`undo`, Cisco
 `reload in 10`/`reload cancel`) — рекомендация модели, а не серверная механика;
@@ -177,8 +185,8 @@ hardware-проверка не выполнялась и требует отде
 - `raw_input`.
 - Telnet (прямой и nested) и console на реальном оборудовании — только
   unit-тесты; hardware-проверка не выполнялась.
-- Изменения конфигурации и rollback на реальном оборудовании — только
-  unit-тесты; hardware-проверка не выполнялась.
+- Rollback (`commit confirmed`, `schedule reboot delay`, `reload in`) на
+  реальном оборудовании — только unit-тесты; hardware-проверка не выполнялась.
 - BDCOM, EcoSGE, Eltex и PON на реальном оборудовании через generic tools.
 - DSA-only SSH.
 - Per-device legacy algorithm override на реальной лабораторной цели (логика

@@ -1,4 +1,4 @@
-"""Unit tests for configuration change plan lifecycle."""
+"""Unit tests for configuration change execution."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from network_terminal_mcp.config.models import (
     PolicyConfig,
 )
 from network_terminal_mcp.credentials.pass_backend import Credentials
-from network_terminal_mcp.errors import ChangeError, PolicyError, SessionError
+from network_terminal_mcp.errors import PolicyError, SessionError
 from network_terminal_mcp.sessions import SessionManager
 
 
@@ -130,48 +130,13 @@ def _manager(
     )
 
 
-def test_plan_change_creates_a_proposed_plan_without_executing() -> None:
+def test_run_change_executes_all_commands() -> None:
     connection = FakeConnection()
     audit = FakeAudit()
     manager = _manager(connection, audit)
     info = manager.open_session("sw1")
 
-    result = manager.plan_change(
-        info.session_id,
-        ["access-list 100 permit ip 192.0.2.0/24 any"],
-    )
-
-    assert result.state.value == "proposed"
-    assert result.confirmation_required is False
-    assert connection.commands == []
-    assert audit.records[-1]["event"] == "plan_change"
-    assert audit.records[-1]["outcome"] == "created"
-
-
-def test_plan_change_rejects_empty_commands() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    with pytest.raises(ChangeError, match="at least one command"):
-        manager.plan_change(info.session_id, [])
-
-
-def test_plan_change_rejects_structural_hazards() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    with pytest.raises(PolicyError, match="command chaining"):
-        manager.plan_change(info.session_id, ["show version; reload"])
-
-
-def test_apply_change_is_two_step_and_executes_only_the_canonical_commands() -> None:
-    connection = FakeConnection()
-    audit = FakeAudit()
-    manager = _manager(connection, audit)
-    info = manager.open_session("sw1")
-    manager.plan_change(
+    result = manager.run_change(
         info.session_id,
         [
             "configure terminal",
@@ -179,115 +144,80 @@ def test_apply_change_is_two_step_and_executes_only_the_canonical_commands() -> 
         ],
     )
 
-    first = manager.apply_change(info.session_id)
-    assert first.confirmation_required is True
-    assert first.state.value == "confirmed"
-    assert connection.commands == []
-
-    second = manager.apply_change(info.session_id)
-    assert second.state.value == "applied"
-    assert second.confirmation_required is False
+    assert result.error is None
+    assert [command.command for command in result.commands] == [
+        "configure terminal",
+        "access-list 100 permit ip 192.0.2.0/24 any",
+    ]
+    assert all(command.executed for command in result.commands)
     assert connection.commands == [
         "configure terminal",
         "access-list 100 permit ip 192.0.2.0/24 any",
     ]
-    assert "output for configure terminal" in second.output
-    assert audit.records[-1]["event"] == "apply_change"
+    assert "output for configure terminal" in result.output
+    assert audit.records[-1]["event"] == "run_change"
     assert audit.records[-1]["outcome"] == "completed"
 
 
-def test_apply_change_cannot_be_reapplied() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    manager.plan_change(info.session_id, ["configure terminal"])
-    manager.apply_change(info.session_id)
-    manager.apply_change(info.session_id)
-
-    with pytest.raises(ChangeError, match="cannot be applied"):
-        manager.apply_change(info.session_id)
-
-
-def test_apply_change_without_a_plan_fails_closed() -> None:
+def test_run_change_rejects_empty_commands() -> None:
     connection = FakeConnection()
     manager = _manager(connection, FakeAudit())
     info = manager.open_session("sw1")
 
-    with pytest.raises(ChangeError, match="no pending change plan"):
-        manager.apply_change(info.session_id)
+    with pytest.raises(PolicyError, match="at least one command"):
+        manager.run_change(info.session_id, [])
 
-
-def test_abort_change_prevents_execution() -> None:
-    connection = FakeConnection()
-    audit = FakeAudit()
-    manager = _manager(connection, audit)
-    info = manager.open_session("sw1")
-    manager.plan_change(info.session_id, ["configure terminal"])
-
-    result = manager.abort_change(info.session_id)
-
-    assert result.state.value == "aborted"
     assert connection.commands == []
-    assert audit.records[-1]["event"] == "abort_change"
-
-    with pytest.raises(ChangeError, match="cannot be applied"):
-        manager.apply_change(info.session_id)
 
 
-def test_auto_approve_skips_the_confirmation_step() -> None:
+def test_run_change_rejects_structural_hazards_before_executing() -> None:
     connection = FakeConnection()
     manager = _manager(connection, FakeAudit())
     info = manager.open_session("sw1")
-    manager.plan_change(
-        info.session_id,
-        ["configure terminal"],
-        auto_approve=True,
-    )
 
-    result = manager.apply_change(info.session_id)
+    with pytest.raises(PolicyError, match="command chaining"):
+        manager.run_change(info.session_id, ["show version; reload"])
 
-    assert result.state.value == "applied"
-    assert result.confirmation_required is False
-    assert connection.commands == ["configure terminal"]
+    assert connection.commands == []
 
 
-def test_plan_change_requires_a_ready_session() -> None:
+def test_run_change_requires_a_ready_session() -> None:
     connection = FakeConnection()
     manager = _manager(connection, FakeAudit())
     info = manager.open_session("sw1")
     manager.close_session(info.session_id)
 
     with pytest.raises(SessionError):
-        manager.plan_change(info.session_id, ["show version"])
+        manager.run_change(info.session_id, ["show version"])
 
 
-def test_apply_change_rejects_a_structural_hazard_in_a_command() -> None:
+def test_run_change_rejects_a_structural_hazard_in_a_command() -> None:
     connection = FakeConnection()
     manager = _manager(connection, FakeAudit())
     info = manager.open_session("sw1")
 
     with pytest.raises(PolicyError, match="command chaining"):
-        manager.plan_change(info.session_id, ["vlan 100; rm -rf /"])
+        manager.run_change(info.session_id, ["vlan 100; rm -rf /"])
+
+    assert connection.commands == []
 
 
-def test_apply_change_fails_closed_when_a_command_enters_a_pager() -> None:
+def test_run_change_fails_closed_when_a_command_enters_a_pager() -> None:
     connection = FakeConnection()
     connection.command_outputs["show run"] = "line1\n--More--\n"
     audit = FakeAudit()
     manager = _manager(connection, audit)
     info = manager.open_session("sw1")
-    manager.plan_change(info.session_id, ["show run"])
-    manager.apply_change(info.session_id)
 
-    result = manager.apply_change(info.session_id)
+    result = manager.run_change(info.session_id, ["show run"])
 
-    assert result.state.value == "failed"
     assert result.error is not None
-    assert any(record["event"] == "apply_change" and record["outcome"] == "failed"
+    assert result.commands[0].executed is False
+    assert any(record["event"] == "run_change" and record["outcome"] == "failed"
                for record in audit.records)
 
 
-def test_apply_change_fails_closed_when_a_command_triggers_confirmation() -> None:
+def test_run_change_fails_closed_when_a_command_triggers_confirmation() -> None:
     connection = FakeConnection()
     connection.command_outputs["delete file"] = (
         "Are you sure you want to delete? [y/n]:"
@@ -295,13 +225,50 @@ def test_apply_change_fails_closed_when_a_command_triggers_confirmation() -> Non
     audit = FakeAudit()
     manager = _manager(connection, audit)
     info = manager.open_session("sw1")
-    manager.plan_change(info.session_id, ["delete file"])
-    manager.apply_change(info.session_id)
 
-    result = manager.apply_change(info.session_id)
+    result = manager.run_change(info.session_id, ["delete file"])
 
-    assert result.state.value == "failed"
-    assert any(record["event"] == "apply_change" and record["outcome"] == "failed"
+    assert result.error is not None
+    assert result.commands[0].executed is False
+    assert any(record["event"] == "run_change" and record["outcome"] == "failed"
+               for record in audit.records)
+
+
+def test_run_change_stops_at_the_first_failed_command() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["configure terminal"] = (
+        "Are you sure? [y/n]:"
+    )
+    audit = FakeAudit()
+    manager = _manager(connection, audit)
+    info = manager.open_session("sw1")
+
+    result = manager.run_change(
+        info.session_id,
+        ["configure terminal", "interface FastEthernet0/13"],
+    )
+
+    assert result.error is not None
+    assert [command.command for command in result.commands] == [
+        "configure terminal",
+        "interface FastEthernet0/13",
+    ]
+    assert result.commands[0].executed is False
+    assert result.commands[1].executed is False
+    assert connection.commands == ["configure terminal"]
+
+
+def test_run_change_records_a_failed_connection_error() -> None:
+    connection = FakeConnection()
+    connection.command_outputs["configure terminal"] = RuntimeError("socket closed")
+    audit = FakeAudit()
+    manager = _manager(connection, audit)
+    info = manager.open_session("sw1")
+
+    result = manager.run_change(info.session_id, ["configure terminal"])
+
+    assert result.error is not None
+    assert any(record["event"] == "run_change" and record["outcome"] == "failed"
                for record in audit.records)
 
 

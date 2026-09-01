@@ -14,11 +14,7 @@ from typing import Literal, Protocol, TypedDict, cast
 import paramiko
 
 from network_terminal_mcp.audit import AuditLogger
-from network_terminal_mcp.changes.manager import ChangeManager
-from network_terminal_mcp.changes.models import (
-    ChangeResult,
-    ChangeState,
-)
+from network_terminal_mcp.changes.models import ChangeCommand, ChangeResult
 from network_terminal_mcp.config.loader import AppConfig
 from network_terminal_mcp.config.models import (
     Action,
@@ -30,7 +26,7 @@ from network_terminal_mcp.config.models import (
     ProxyJumpConnection,
 )
 from network_terminal_mcp.credentials.pass_backend import Credentials, PassBackend
-from network_terminal_mcp.errors import ChangeError, PolicyError, SessionError, TransportError
+from network_terminal_mcp.errors import PolicyError, SessionError, TransportError
 from network_terminal_mcp.host_keys import HostKeyStatus, HostKeyStore, probe_host_key_socket
 from network_terminal_mcp.policy.engine import PolicyEngine, check_structural_safety
 from network_terminal_mcp.redaction import Redactor
@@ -182,7 +178,6 @@ class SessionManager:
         audit_logger: AuditLogger | None = None,
         host_keys: HostKeyStore | None = None,
         jump_client_factory: Callable[[], paramiko.SSHClient] = paramiko.SSHClient,
-        change_manager: ChangeManager | None = None,
         clock: Clock = time.monotonic,
     ) -> None:
         self._config = config
@@ -193,7 +188,6 @@ class SessionManager:
         self._audit = audit_logger or AuditLogger(config.policy.runtime.audit_file)
         self._host_keys = host_keys or HostKeyStore(config.policy.runtime.known_hosts_file)
         self._jump_client_factory = jump_client_factory
-        self._changes = change_manager or ChangeManager()
         self._clock = clock
         self._sessions: dict[str, _ManagedSession] = {}
         self._lock = threading.RLock()
@@ -691,130 +685,73 @@ class SessionManager:
             )
             return self._session_info(session)
 
-    def plan_change(
-        self,
-        session_id: str,
-        commands: list[str],
-        *,
-        auto_approve: bool = False,
-    ) -> ChangeResult:
-        """Register a configuration change plan without executing anything."""
-        if not commands:
-            raise ChangeError("change plan must contain at least one command")
-        session = self._get_session(session_id)
-        with session.lock:
-            self._require_ready(session)
-            for command in commands:
-                check_structural_safety(command, tool="plan_change")
-            plan = self._changes.create(
-                session_id=session_id,
-                commands=commands,
-                auto_approve=auto_approve,
-            )
-            self._audit_event(
-                "plan_change",
-                target=session.target,
-                outcome="created",
-                redactor=session.redactor,
-                session_id=session_id,
-            )
-            return ChangeResult.from_plan(plan)
+    def run_change(self, session_id: str, commands: list[str]) -> ChangeResult:
+        """Execute policy-allowed configuration change commands immediately.
 
-    def apply_change(self, session_id: str) -> ChangeResult:
-        """Confirm and then execute a change plan in two steps.
-
-        The first call returns the canonical command list with
-        ``confirmation_required`` and executes nothing. The second call on the
-        same session executes it. ``auto_approve`` plans skip the confirmation
-        step only when the operator pre-authorized auto-approval for this
-        session/device pair.
+        Commands are validated for structural safety and run in order against
+        the session's device. Any command that raises is fail-closed: the run
+        stops, remaining commands are left unexecuted, and the outcome is
+        recorded in the audit log.
         """
-        plan = self._changes.get(session_id)
+        if not commands:
+            raise PolicyError("run_change requires at least one command")
         session = self._get_session(session_id)
+        results: list[ChangeCommand] = [
+            ChangeCommand(command=command) for command in commands
+        ]
         with session.lock:
-            if plan.state == ChangeState.PROPOSED:
-                confirmed = self._changes.confirm(session_id)
-                self._audit_event(
-                    "apply_change",
-                    target=session.target,
-                    outcome="confirmed",
-                    redactor=session.redactor,
-                    session_id=session.session_id,
-                )
-                if not plan.auto_approve:
-                    return ChangeResult.from_plan(
-                        confirmed, confirmation_required=True
-                    )
-                plan = confirmed
-            elif plan.state != ChangeState.CONFIRMED:
-                raise ChangeError(
-                    f"change plan for session {session_id} cannot be applied "
-                    f"from {plan.state.value}"
-                )
-
             self._require_ready(session)
-            warnings: list[str] = []
+            for result in results:
+                check_structural_safety(result.command, tool="run_change")
             output_parts: list[str] = []
             try:
-                plan = self._changes.mark_applied(session_id)
-                for command in [cmd.command for cmd in plan.commands]:
-                    self._run_change_command(session, command, output_parts)
+                for index, result in enumerate(results):
+                    executed = self._run_change_command(
+                        session, result, output_parts
+                    )
+                    if executed is not result:
+                        results[index] = executed
             except Exception as exc:
-                self._changes.mark_failed(session_id)
                 message = session.redactor.redact(str(exc))
                 self._audit_event(
-                    "apply_change",
+                    "run_change",
                     target=session.target,
                     outcome="failed",
                     redactor=session.redactor,
                     session_id=session.session_id,
                     error=message,
                 )
-                return ChangeResult.from_plan(
-                    self._changes.get(session_id),
+                return ChangeResult(
+                    session_id=session.session_id,
+                    commands=results,
                     output="\n".join(output_parts),
                     error=message,
                 )
 
             self._touch(session)
-            output = "\n".join(output_parts)
             self._audit_event(
-                "apply_change",
+                "run_change",
                 target=session.target,
                 outcome="completed",
                 redactor=session.redactor,
                 session_id=session.session_id,
             )
-            return ChangeResult.from_plan(
-                self._changes.get(session_id),
-                output=output,
-                warnings=warnings,
-            )
-
-    def abort_change(self, session_id: str) -> ChangeResult:
-        """Cancel a change plan before anything is executed."""
-        session = self._get_session(session_id)
-        with session.lock:
-            aborted = self._changes.abort(session_id)
-            self._audit_event(
-                "abort_change",
-                target=session.target,
-                outcome="aborted",
-                redactor=session.redactor,
+            return ChangeResult(
                 session_id=session.session_id,
+                commands=results,
+                output="\n".join(output_parts),
             )
-            return ChangeResult.from_plan(aborted)
 
     def _run_change_command(
         self,
         session: _ManagedSession,
-        command: str,
+        result: ChangeCommand,
         output_parts: list[str],
-    ) -> None:
-        """Execute one change command, appending its output to the result."""
-        check_structural_safety(command, tool="plan_change")
+    ) -> ChangeCommand:
+        """Execute one change command, returning it marked executed."""
+        check_structural_safety(result.command, tool="run_change")
         self._require_ready(session)
-        raw_output = self._send_command_until_terminal(session, command)
+        raw_output = self._send_command_until_terminal(session, result.command)
         outcome = self._consume_terminal_output(session, raw_output)
         if outcome.pager_active:
             raise TransportError(
@@ -826,6 +763,7 @@ class SessionManager:
                 "continue"
             )
         output_parts.append(session.redactor.redact(outcome.output))
+        return result.model_copy(update={"executed": True})
 
     def _continue_pager(self, session: _ManagedSession, action: str) -> ControlResult:
         if session.pager_pages >= self._config.policy.runtime.max_pager_pages:

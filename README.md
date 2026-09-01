@@ -10,8 +10,9 @@
 ProxyJump hop и один Nested hop, а
 Этап 4 — per-profile legacy SSH algorithm overrides, прямой Telnet, Nested
 Telnet и TCP console profiles. Этап 7 добавляет безопасное применение
-изменений (`plan_change`/`apply_change`/`abort_change`) с
-двухшаговым подтверждением. Откат (reload/commit confirmed) — рекомендация
+изменений (`run_change`) с нативным подтверждением через permission-механику
+opencode (всплывающее окно `ask`, а не серверный диалог). Откат (reload/commit
+confirmed) — рекомендация
 модели по собственному усмотрению, а не серверная механика.
 Есть конфигурация, политика,
 аудит, credential backend, known_hosts, постоянные сессии на собственном
@@ -31,8 +32,9 @@ policy-решением `ask` возвращает `confirmation_required`, но
 `respond` отвечает только на уже распознанный prompt устройства и не является
 механизмом policy confirmation. Telnet и console требуют двойного gating
 (`allow_telnet` на устройстве и `defaults.telnet: allow`) и проверены только
-unit-тестами, без hardware-подтверждения. Изменения конфигурации проверены
-unit-тестами; hardware-проверка rollback (Junos commit confirmed, Huawei
+unit-тестами, без hardware-подтверждения. `run_change` проверен unit-тестами и
+на живом Cisco IOS (применение и откат description); hardware-проверка rollback
+(Junos commit confirmed, Huawei
 schedule reboot delay) не выполнялась.
 
 ## Основные цели

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from network_terminal_mcp.changes.models import ChangeResult
+from network_terminal_mcp.changes.models import ChangeCommand, ChangeResult
 from network_terminal_mcp.server import create_server
 from network_terminal_mcp.sessions import (
     CliHelpResult,
@@ -81,34 +81,12 @@ class FakeManager:
         self.calls.append(("close_session", session_id))
         return self.info.model_copy(update={"state": SessionState.CLOSED})
 
-    def plan_change(
-        self,
-        session_id: str,
-        commands: list[str],
-        *,
-        auto_approve: bool = False,
-    ) -> ChangeResult:
-        self.calls.append(("plan_change", (session_id, commands, auto_approve)))
+    def run_change(self, session_id: str, commands: list[str]) -> ChangeResult:
+        self.calls.append(("run_change", (session_id, commands)))
         return ChangeResult(
             session_id=session_id,
-            state="proposed",
-            commands=[{"command": command} for command in commands],
-        )
-
-    def apply_change(self, session_id: str) -> ChangeResult:
-        self.calls.append(("apply_change", session_id))
-        return ChangeResult(
-            session_id=session_id,
-            state="applied",
-            commands=[],
-        )
-
-    def abort_change(self, session_id: str) -> ChangeResult:
-        self.calls.append(("abort_change", session_id))
-        return ChangeResult(
-            session_id=session_id,
-            state="aborted",
-            commands=[],
+            commands=[ChangeCommand(command=command) for command in commands],
+            output="ok",
         )
 
 
@@ -213,31 +191,18 @@ async def test_change_tools() -> None:
     manager = FakeManager()
     server = create_server(manager=manager)  # type: ignore[arg-type]
 
-    planned = await server.call_tool(
-        "plan_change",
+    changed = await server.call_tool(
+        "run_change",
         {
             "session_id": "session-1",
             "commands": ["vlan 100"],
         },
     )
-    applied = await server.call_tool("apply_change", {"session_id": "session-1"})
-    aborted = await server.call_tool("abort_change", {"session_id": "session-1"})
     closed = await server.call_tool("close_session", {"session_id": "session-1"})
 
-    assert planned.structured_content["state"] == "proposed"
-    assert applied.structured_content["state"] == "applied"
-    assert aborted.structured_content["state"] == "aborted"
+    assert changed.structured_content["commands"][0]["command"] == "vlan 100"
     assert closed.structured_content["state"] == "closed"
     assert manager.calls == [
-        (
-            "plan_change",
-            (
-                "session-1",
-                ["vlan 100"],
-                False,
-            ),
-        ),
-        ("apply_change", "session-1"),
-        ("abort_change", "session-1"),
+        ("run_change", ("session-1", ["vlan 100"])),
         ("close_session", "session-1"),
     ]
