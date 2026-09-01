@@ -146,7 +146,8 @@ target, read-only command и закрытие session.
 gating (`allow_writes` на устройстве и `defaults.write_change` в policy).
 `apply_change` двухшаговый, хранит канонический список команд на сервере и
 исполняет один раз. Опциональная `safety_net` (save/arm/cancel) даёт откат через
-reload/commit confirmed: `save` выполняется до команд изменений, `arm` после,
+reload/commit confirmed: `save` фиксирует до-изменённое состояние и `arm`
+планирует откат до команд изменений (провал команды не отменяет страховку),
 `finalize_change` отменяет страховку, а блокировка `close_session` гарантирует,
 что запланированная перезагрузка не будет забыта.
 
