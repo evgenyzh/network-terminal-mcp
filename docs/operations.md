@@ -12,8 +12,8 @@ SOCKS5-прокси (`proxyjump` с полем `socks`) и TCP console profiles.
 `direct-tcpip` forwarding. При ошибке любого hop обе SSH-сессии закрываются.
 
 Для Nested нужны локальные connection и credential profiles для intermediate
-host и final target. Сервер подключается к intermediate host через
-`generic_termserver` и выполняет из его shell `ssh` до final target.
+host и final target. Сервер подключается к intermediate host по SSH и выполняет
+из его shell `ssh` до final target.
 Host key intermediate host проверяется локально;
 inner SSH использует SSH-клиент intermediate host, поэтому host key final target
 проверяется им. При ошибке connection закрывается.
@@ -61,28 +61,18 @@ run_command(show version)        # продолжаем в том же CLI
 
 Изменения идут через отдельные инструменты, не через `run_command`:
 
-- `plan_change(session_id, title, commands, safety_net?, auto_approve?)` —
-  регистрирует план без исполнения. Требует `allow_writes: true` на устройстве
-  и `defaults.write_change: allow` в policy.
+- `plan_change(session_id, title, commands, auto_approve?)` —
+  регистрирует план без исполнения.
 - `apply_change(change_id)` — двухшаговый: первый вызов показывает план с
   `confirmation_required` и не исполняет, второй применяет сохранённые команды.
 - `abort_change(change_id)` — отменяет план до исполнения.
-- `finalize_change(change_id)` — отменяет запланированную перезагрузку или
-  фиксирует страховку.
+- `finalize_change(change_id)` — помечает применённый план завершённым.
 
-Опциональная `safety_net` задаётся моделью как `{save, arm, cancel}` — команды,
-которые выполняет сервер без интерпретации. При применении `save` выполняется
-первой (фиксирует до-изменённое состояние), затем `arm`
-(например `reload in 10` / `schedule reboot delay 10` / `commit confirmed`)
-сразу планирует откат ещё до команд изменений — поэтому даже провал любой
-команды оставляет запланированный reload, и устройство всё равно вернётся к
-сохранённому состоянию. После этого `close_session` блокируется до
-`finalize_change`, который выполняет
-`cancel` (reload cancel / undo schedule reboot / commit). Если `cancel` не
-прошёл, устройство перезагрузится само через заданный интервал и вернётся к
-конфигурации, сохранённой командой `save`; сервер докладывает об этом в
-результате и audit. `close_session(force=true)` закрывает сессию при активной
-перезагрузке только в аварийных случаях (аудит `reboot_not_cancelled`).
+Отдельный гейт разрешения изменений отсутствует: безопасность держится на
+двухшаговом `apply_change` и явном подтверждении человеком. Откат
+(reload/commit confirmed) — рекомендация модели по собственному усмотрению, а
+не серверная механика; модель сама решает, взводить ли его и какую команду
+использовать, и отменяет после проверки.
 
 `auto_approve: true` в `plan_change` позволяет применить план без второго
 подтверждающего вызова, но только если пользователь явно разрешил авторежим
@@ -198,9 +188,11 @@ Ctrl-U, не нажимая Enter. Для остальных непостран�
 Надёжная клавиша выхода из help-pager — `q`; при нераспознанном возврате к
 prompt сессия безопасно переводится в `failed`.
 
-Подготовка сессии отключает pager на проверенных Junos и Huawei
-VRP. Их help возвращается одним ответом, но оставляет набранную строку; сервер
-очищает её последовательностью Ctrl-C, Ctrl-U перед следующей командой.
+Pager не отключается автоматически: на Junos и Huawei VRP help возвращается
+одним ответом, но оставляет набранную строку; сервер очищает её
+последовательностью Ctrl-C, Ctrl-U перед следующей командой. Большие выводы на
+всех устройствах возвращаются с `pager_active: true`, и модель листает их
+`send_control`.
 
 При pager `run_command` возвращает `pager_active: true` и состояние `paging`.
 Продолжайте только одной страницей: `send_control(session_id, "space")`.

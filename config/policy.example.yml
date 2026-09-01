@@ -7,9 +7,6 @@ defaults:
   # Global Telnet switch: keep deny unless Telnet/console access is required,
   # and even then only for devices with allow_telnet: true.
   telnet: deny
-  # Configuration changes go through plan_change/apply_change only. Keep deny
-  # unless changes are wanted, and even then only on allow_writes devices.
-  write_change: deny
 
 rules:
   - id: common-read-only

@@ -11,7 +11,6 @@ from network_terminal_mcp.terminal import SshTerminal, _BaseTerminal
 class ScriptedTerminal(_BaseTerminal):
     """A _BaseTerminal whose reads come from a scripted chunk queue."""
 
-    _initial_delay = 0.001
     _retry_delay = 0.001
     _prompt_retries = 3
     _prompt_last_read = 0.001

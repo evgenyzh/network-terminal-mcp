@@ -15,7 +15,7 @@ from network_terminal_mcp.config.models import (
 )
 from network_terminal_mcp.credentials.pass_backend import Credentials
 from network_terminal_mcp.errors import ChangeError, PolicyError, SessionError
-from network_terminal_mcp.sessions import SessionManager, SessionState
+from network_terminal_mcp.sessions import SessionManager
 
 
 class FakeConnection:
@@ -67,7 +67,7 @@ class FakeAudit:
         self.records.append(record)
 
 
-def _config(*, allow_writes: bool = True, write_change: str = "allow") -> AppConfig:
+def _config() -> AppConfig:
     return AppConfig(
         inventory=InventoryConfig.model_validate(
             {
@@ -76,7 +76,6 @@ def _config(*, allow_writes: bool = True, write_change: str = "allow") -> AppCon
                         "host": "192.0.2.1",
                         "credentials": "net",
                         "connection": "direct",
-                        "allow_writes": allow_writes,
                     }
                 }
             }
@@ -93,7 +92,7 @@ def _config(*, allow_writes: bool = True, write_change: str = "allow") -> AppCon
                 }
             }
         ),
-        policy=PolicyConfig.model_validate({"defaults": {"write_change": write_change}}),
+        policy=PolicyConfig(),
         config_dir=Path("."),
     )
 
@@ -121,10 +120,9 @@ class FakeHostKeys:
 def _manager(
     connection: FakeConnection,
     audit: FakeAudit,
-    **config_kwargs: object,
 ) -> SessionManager:
     return SessionManager(
-        _config(**config_kwargs),
+        _config(),
         connection_factory=lambda params: connection,
         credential_resolver=FakeCredentials(),
         audit_logger=audit,  # type: ignore[arg-type]
@@ -150,24 +148,6 @@ def test_plan_change_creates_a_proposed_plan_without_executing() -> None:
     assert connection.commands == []
     assert audit.records[-1]["event"] == "plan_change"
     assert audit.records[-1]["outcome"] == "created"
-
-
-def test_plan_change_requires_allow_writes() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit(), allow_writes=False)
-    info = manager.open_session("sw1")
-
-    with pytest.raises(ChangeError, match="allow_writes"):
-        manager.plan_change(info.session_id, "t", ["show version"])
-
-
-def test_plan_change_requires_policy_allow() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit(), write_change="deny")
-    info = manager.open_session("sw1")
-
-    with pytest.raises(ChangeError, match="denied by policy"):
-        manager.plan_change(info.session_id, "t", ["show version"])
 
 
 def test_plan_change_rejects_empty_title_and_commands() -> None:
@@ -250,115 +230,21 @@ def test_abort_change_prevents_execution() -> None:
         manager.apply_change(plan.change_id)
 
 
-def test_safety_net_saves_arms_and_finalize_cancels() -> None:
+def test_finalize_change_marks_applied_plan_finalized() -> None:
     connection = FakeConnection()
     audit = FakeAudit()
     manager = _manager(connection, audit)
     info = manager.open_session("sw1")
-    plan = manager.plan_change(
-        info.session_id,
-        "vlan change with reload rollback",
-        ["vlan 100", "exit"],
-        safety_net={
-            "save": "copy running-config startup-config",
-            "arm": "reload in 10",
-            "cancel": "reload cancel",
-        },
-    )
-
+    plan = manager.plan_change(info.session_id, "t", ["vlan 100"])
     manager.apply_change(plan.change_id)
-    second = manager.apply_change(plan.change_id)
-
-    assert second.reboot_cancel_required is True
-    assert connection.commands == [
-        "copy running-config startup-config",
-        "reload in 10",
-        "vlan 100",
-        "exit",
-    ]
-    assert any("scheduled reboot armed" in w for w in second.warnings)
+    manager.apply_change(plan.change_id)
 
     finalized = manager.finalize_change(plan.change_id)
 
     assert finalized.state.value == "finalized"
-    assert finalized.reboot_cancel_required is False
-    assert connection.commands == [
-        "copy running-config startup-config",
-        "reload in 10",
-        "vlan 100",
-        "exit",
-        "reload cancel",
-    ]
-
-
-def test_close_session_is_blocked_until_reboot_is_cancelled() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    plan = manager.plan_change(
-        info.session_id,
-        "t",
-        ["vlan 100"],
-        safety_net={
-            "save": "copy running-config startup-config",
-            "arm": "reload in 10",
-            "cancel": "reload cancel",
-        },
-    )
-    manager.apply_change(plan.change_id)
-    manager.apply_change(plan.change_id)
-
-    with pytest.raises(SessionError, match="active scheduled reboot"):
-        manager.close_session(info.session_id)
-
-    assert connection.disconnected is False
-
-
-def test_force_close_is_allowed_with_reboot_pending() -> None:
-    connection = FakeConnection()
-    audit = FakeAudit()
-    manager = _manager(connection, audit)
-    info = manager.open_session("sw1")
-    plan = manager.plan_change(
-        info.session_id,
-        "t",
-        ["vlan 100"],
-        safety_net={
-            "save": "copy running-config startup-config",
-            "arm": "reload in 10",
-            "cancel": "reload cancel",
-        },
-    )
-    manager.apply_change(plan.change_id)
-    manager.apply_change(plan.change_id)
-
-    closed = manager.close_session(info.session_id, force=True)
-
-    assert closed.state is SessionState.CLOSED
-    assert connection.disconnected is True
-    assert any(
-        record["event"] == "reboot_not_cancelled"
-        for record in audit.records
-    )
-
-
-def test_finalize_change_after_cancel_is_noop_but_finalizes() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    plan = manager.plan_change(
-        info.session_id,
-        "t",
-        ["vlan 100"],
-        safety_net={
-            "save": "copy running-config startup-config",
-            "arm": "reload in 10",
-            "cancel": "reload cancel",
-        },
-    )
-    manager.apply_change(plan.change_id)
-    manager.apply_change(plan.change_id)
-    manager.finalize_change(plan.change_id)
+    assert connection.commands == ["vlan 100"]
+    assert audit.records[-1]["event"] == "finalize_change"
+    assert audit.records[-1]["outcome"] == "completed"
 
     with pytest.raises(ChangeError, match="cannot be finalized"):
         manager.finalize_change(plan.change_id)
@@ -392,22 +278,13 @@ def test_plan_change_requires_a_ready_session() -> None:
         manager.plan_change(info.session_id, "t", ["show version"])
 
 
-def test_apply_change_rejects_a_structural_hazard_in_safety_net() -> None:
+def test_apply_change_rejects_a_structural_hazard_in_a_command() -> None:
     connection = FakeConnection()
     manager = _manager(connection, FakeAudit())
     info = manager.open_session("sw1")
 
     with pytest.raises(PolicyError, match="command chaining"):
-        manager.plan_change(
-            info.session_id,
-            "t",
-            ["vlan 100"],
-            safety_net={
-                "save": "copy running-config startup-config",
-                "arm": "reload in 10; rm -rf /",
-                "cancel": "reload cancel",
-            },
-        )
+        manager.plan_change(info.session_id, "t", ["vlan 100; rm -rf /"])
 
 
 def test_apply_change_fails_closed_when_a_command_enters_a_pager() -> None:
@@ -416,13 +293,7 @@ def test_apply_change_fails_closed_when_a_command_enters_a_pager() -> None:
     audit = FakeAudit()
     manager = _manager(connection, audit)
     info = manager.open_session("sw1")
-    plan = manager.plan_change(
-        info.session_id, "t", ["show run"], safety_net={
-            "save": "copy running-config startup-config",
-            "arm": "reload in 10",
-            "cancel": "reload cancel",
-        }
-    )
+    plan = manager.plan_change(info.session_id, "t", ["show run"])
     manager.apply_change(plan.change_id)
 
     result = manager.apply_change(plan.change_id)
@@ -441,47 +312,11 @@ def test_apply_change_fails_closed_when_a_command_triggers_confirmation() -> Non
     audit = FakeAudit()
     manager = _manager(connection, audit)
     info = manager.open_session("sw1")
-    plan = manager.plan_change(
-        info.session_id,
-        "t",
-        ["delete file"],
-        safety_net={
-            "save": "copy running-config startup-config",
-            "arm": "reload in 10",
-            "cancel": "reload cancel",
-        },
-    )
+    plan = manager.plan_change(info.session_id, "t", ["delete file"])
     manager.apply_change(plan.change_id)
 
     result = manager.apply_change(plan.change_id)
 
     assert result.state.value == "failed"
     assert any(record["event"] == "apply_change" and record["outcome"] == "failed"
-               for record in audit.records)
-
-
-def test_finalize_change_marks_failed_when_cancel_command_fails() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["reload cancel"] = RuntimeError("device gone")
-    audit = FakeAudit()
-    manager = _manager(connection, audit)
-    info = manager.open_session("sw1")
-    plan = manager.plan_change(
-        info.session_id,
-        "t",
-        ["vlan 100"],
-        safety_net={
-            "save": "copy running-config startup-config",
-            "arm": "reload in 10",
-            "cancel": "reload cancel",
-        },
-    )
-    manager.apply_change(plan.change_id)
-    manager.apply_change(plan.change_id)
-
-    result = manager.finalize_change(plan.change_id)
-
-    assert result.state.value == "failed"
-    assert any("could not cancel the scheduled reboot" in w for w in result.warnings)
-    assert any(record["event"] == "finalize_change" and record["outcome"] == "failed"
                for record in audit.records)

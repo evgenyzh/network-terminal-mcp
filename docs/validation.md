@@ -6,16 +6,20 @@
 семейства. Адреса, hostnames, serial numbers, usernames, fingerprints и password
 store contents намеренно не записываются в репозиторий.
 
-## Подтвержденные платформы
+## Подтвержденные устройства
 
-| Семейство | Механика | Driver | Результат |
-| --- | --- | --- | --- |
-| Cisco IOS старого поколения | legacy SSH | `cisco_ios` | успешные login, session preparation, `show version` |
-| SNR S2985 | Cisco-like CLI | `cisco_ios`, dialect `snr_29xx` | успешные login, preparation, `show version` |
-| SNR S5210 eNOS | Cisco-like CLI | `cisco_ios`, dialect `snr_52xx` | успешные login, preparation, `show version` |
-| D-Link DES | D-Link CLI | `dlink_ds` | успешные login, preparation, `show switch` |
-| Huawei S6730 | VRP | `huawei_vrp` | успешные login, preparation, `display version` |
-| Juniper MX204 | Junos | `juniper_junos` | успешные login, preparation, `show version` |
+Проверен представитель каждого семейства CLI. Драйверы не используются: тип
+устройства и механика CLI определяются моделью по выводу уже после открытия
+сессии.
+
+| Семейство | Механика CLI | Результат |
+| --- | --- | --- |
+| Cisco IOS старого поколения | Cisco IOS (legacy SSH) | успешные login, session preparation, `show version` |
+| SNR S2985 | Cisco-like CLI | успешные login, preparation, `show version` |
+| SNR S5210 eNOS | Cisco-like CLI | успешные login, preparation, `show version` |
+| D-Link DES | D-Link CLI | успешные login, preparation, `show switch` |
+| Huawei S6730 | VRP | успешные login, preparation, `display version` |
+| Juniper MX204 | Junos | успешные login, preparation, `show version` |
 
 ## Legacy SSH
 
@@ -43,10 +47,10 @@ Read-only проверки через `MCPServer.call_tool` на реально�
 | --- | --- | --- | --- |
 | Cisco IOS | работает | работает | `show ?` возвращает подсказку, Ctrl-C восстанавливает prompt |
 | SNR eNOS | работает | работает | корректная форма `show interface ?` / `show interface brief` |
-| D-Link DES | работает | работает | через `cli_help_requires_enter: true` — `show ?` + Enter показывают подсказку |
+| D-Link DES | работает | работает | через `cli_help` без Enter — подсказка не возвращается; модель повторяет запрос с Enter (`show ?` + Enter), завершающий `?` не даёт команде выполниться |
 | SNR old | работает | работает | help-pager поддерживает `space`/`q`; host key меняется при каждой загрузке, профиль `direct-snr` использует `accept_changed` |
-| Huawei VRP | работает | работает | `session_preparation` отключает pager; help возвращает `prompt + display `, Ctrl-C + Ctrl-U очищают строку |
-| Juniper Junos | работает | работает | `session_preparation` отключает pager; help возвращает `prompt + show ` с backspace bytes, Ctrl-C + Ctrl-U очищают строку |
+| Huawei VRP | работает | работает | help возвращает `prompt + display `, Ctrl-C + Ctrl-U очищают строку |
+| Juniper Junos | работает | работает | help возвращает `prompt + show ` с backspace bytes, Ctrl-C + Ctrl-U очищают строку |
 
 На SNR old проверены flows `cli_help -> space -> q -> run_command`,
 `show interface -> space -> q -> show version` и естественное завершение
@@ -55,8 +59,10 @@ Read-only проверки через `MCPServer.call_tool` на реально�
 Ctrl-C/Ctrl-U cleanup. Если help-pager не возвращает распознанный prompt,
 сессия всё ещё безопасно переводится в `failed`.
 
-Netmiko `session_preparation` отключает pager на проверенных Junos и Huawei,
-но SNR old сохраняет его для help и больших команд (`show interface`).
+Pager на проверенных Junos и Huawei не отключается автоматически: большие
+выводы возвращаются с `pager_active: true`, и модель листает их
+`send_control("space")` или завершает `q`. SNR old сохраняет pager для help
+и больших команд (`show interface`).
 
 Проверка `respond` на реальном оборудовании не проводилась: confirmation
 prompts обычно предшествуют write/destructive действиям.
@@ -122,8 +128,8 @@ jump host key после TOFU enrollment проверяется в `strict`, tar
 
 Проверен реальный маршрут local -> intermediate host (password profile) -> SNR
 old target. Intermediate host — Linux shell; из его shell выполняется `ssh` до
-final target с credentials целевого устройства, затем `redispatch` на
-`cisco_ios`. Flow `open_session -> show version -> close_session` выполнен в
+final target с credentials целевого устройства. Flow
+`open_session -> show version -> close_session` выполнен в
 одной session; intermediate host key проверяется в `strict`. Inner SSH
 использует SSH-клиент промежуточного хоста, поэтому host key final target
 проверяется им, а не локальным store.
@@ -148,26 +154,21 @@ Hardware-проверка Telnet/console на реальном устройст�
 ## Этап 7 validation
 
 Изменения конфигурации проверены unit-тестами:
-- `plan_change` требует `allow_writes` на устройстве и `defaults.write_change
-  != deny`; пустой title/список и structural hazards отклоняются; ничего не
+- `plan_change` отклоняет пустой title/список и structural hazards; ничего не
   исполняется.
 - `apply_change` двухшаговый: первый вызов возвращает `confirmation_required`
   и не исполняет, второй исполняет только сохранённые канонические команды;
   повторный apply запрещён.
 - `abort_change` отменяет план до исполнения.
-- `safety_net` выполняет `save` и `arm` до команд изменений (откат запланирован
-  до любых изменений, поэтому провал команды не отменяет страховку), помечает
-  план требующим отмены; `finalize_change` выполняет `cancel` и снимает флаг.
-- `close_session` блокируется при активной запланированной перезагрузке;
-  `force=true` закрывает с аудитом `reboot_not_cancelled`.
-- При pager/confirmation в change-команде план переводится в `failed`;
-  при неудачном `cancel` финализация тоже `failed` с предупреждением о
-  самостоятельной перезагрузке устройства.
+- `finalize_change` помечает применённый план завершённым; повторная
+  финализация запрещена.
+- При pager/confirmation в change-команде план переводится в `failed`.
 - `auto_approve` пропускает подтверждающий вызов, когда разрешён явно.
 
-Hardware-проверка rollback (Junos `commit confirmed`, Huawei `schedule reboot
-delay`/`undo`, Cisco `reload in 10`/`reload cancel`) не выполнялась и требует
-отдельного явного разрешения на точные команды.
+Откат (Junos `commit confirmed`, Huawei `schedule reboot delay`/`undo`, Cisco
+`reload in 10`/`reload cancel`) — рекомендация модели, а не серверная механика;
+hardware-проверка не выполнялась и требует отдельного явного разрешения на
+точные команды.
 
 ## Непроверенное
 

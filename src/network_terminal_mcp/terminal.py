@@ -56,7 +56,6 @@ class _BaseTerminal:
     """
 
     _buffer = ""
-    _initial_delay = 0.25
     _retry_delay = 0.5
     _prompt_retries = 12
     _prompt_last_read = 0.3

@@ -17,7 +17,6 @@ from network_terminal_mcp.changes.models import (
     ChangeCommand,
     ChangePlan,
     ChangeState,
-    SafetyNet,
 )
 from network_terminal_mcp.errors import ChangeError
 
@@ -52,7 +51,6 @@ class ChangeManager:
         host: str,
         title: str,
         commands: list[str],
-        safety_net: SafetyNet | None,
         auto_approve: bool,
     ) -> ChangePlan:
         plan = ChangePlan(
@@ -63,7 +61,6 @@ class ChangeManager:
             title=title,
             commands=[ChangeCommand(command=command) for command in commands],
             hash=plan_hash(commands),
-            safety_net=safety_net,
             auto_approve=auto_approve,
             created_at=self._now(),
         )
@@ -144,37 +141,7 @@ class ChangeManager:
                 update={
                     "state": ChangeState.FINALIZED,
                     "finalized_at": self._now(),
-                    "reboot_cancel_required": False,
                 }
             )
             self._plans[change_id] = plan
         return plan
-
-    def set_reboot_required(self, change_id: str, required: bool) -> ChangePlan:
-        with self._lock:
-            plan = self._plans.get(change_id)
-            if plan is None:
-                raise ChangeError(f"unknown or expired change plan {change_id}")
-            plan = plan.model_copy(update={"reboot_cancel_required": required})
-            self._plans[change_id] = plan
-        return plan
-
-    def plans_for_session(self, session_id: str) -> list[ChangePlan]:
-        with self._lock:
-            return [
-                plan
-                for plan in self._plans.values()
-                if plan.session_id == session_id
-            ]
-
-    def has_active_reboot(self, session_id: str) -> ChangePlan | None:
-        """Return a plan that still requires the scheduled reboot to be cancelled."""
-        with self._lock:
-            for plan in self._plans.values():
-                if (
-                    plan.session_id == session_id
-                    and plan.reboot_cancel_required
-                    and plan.state in (ChangeState.CONFIRMED, ChangeState.APPLIED)
-                ):
-                    return plan
-        return None

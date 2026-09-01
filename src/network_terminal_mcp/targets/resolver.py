@@ -24,7 +24,6 @@ class Target:
     connection: str
     port: int | None = None
     allow_telnet: bool = False
-    allow_writes: bool = False
     tags: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -101,6 +100,5 @@ class TargetResolver:
             connection=device.connection,
             port=device.port,
             allow_telnet=device.allow_telnet,
-            allow_writes=device.allow_writes,
             tags=tuple(device.tags),
         )

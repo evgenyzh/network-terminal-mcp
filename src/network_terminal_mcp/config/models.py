@@ -36,7 +36,6 @@ class Device(StrictModel):
     tags: list[str] = Field(default_factory=list)
     allow_telnet: bool = False
     port: int | None = None
-    allow_writes: bool = False
 
 
 class Group(StrictModel):
@@ -182,7 +181,6 @@ class PolicyDefaults(StrictModel):
     config_mode: Action = "ask"
     raw_input: Action = "deny"
     telnet: Action = "deny"
-    write_change: Action = "deny"
 
 
 class PolicyRule(StrictModel):

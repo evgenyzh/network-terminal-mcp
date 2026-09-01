@@ -27,8 +27,6 @@ class FakeManager:
             session_id="session-1",
             target="sw1",
             host="192.0.2.1",
-            platform="cisco_ios",
-            dialect="cisco_ios",
             prompt="sw1#",
             state=SessionState.READY,
             created_at=datetime.now(UTC),
@@ -79,8 +77,8 @@ class FakeManager:
         self.calls.append(("session_status", session_id))
         return self.info
 
-    def close_session(self, session_id: str, *, force: bool = False) -> SessionInfo:
-        self.calls.append(("close_session", (session_id, force)))
+    def close_session(self, session_id: str) -> SessionInfo:
+        self.calls.append(("close_session", session_id))
         return self.info.model_copy(update={"state": SessionState.CLOSED})
 
     def plan_change(
@@ -89,15 +87,13 @@ class FakeManager:
         title: str,
         commands: list[str],
         *,
-        safety_net: object | None = None,
         auto_approve: bool = False,
     ) -> ChangeResult:
-        self.calls.append(("plan_change", (session_id, title, commands, safety_net, auto_approve)))
+        self.calls.append(("plan_change", (session_id, title, commands, auto_approve)))
         return ChangeResult(
             change_id="chg-1",
             session_id=session_id,
             target="sw1",
-            platform="cisco_ios",
             title=title,
             state="proposed",
             hash="abc",
@@ -110,7 +106,6 @@ class FakeManager:
             change_id=change_id,
             session_id="session-1",
             target="sw1",
-            platform="cisco_ios",
             title="t",
             state="applied",
             hash="abc",
@@ -123,7 +118,6 @@ class FakeManager:
             change_id=change_id,
             session_id="session-1",
             target="sw1",
-            platform="cisco_ios",
             title="t",
             state="aborted",
             hash="abc",
@@ -136,7 +130,6 @@ class FakeManager:
             change_id=change_id,
             session_id="session-1",
             target="sw1",
-            platform="cisco_ios",
             title="t",
             state="finalized",
             hash="abc",
@@ -251,25 +244,18 @@ async def test_change_tools() -> None:
             "session_id": "session-1",
             "title": "vlan",
             "commands": ["vlan 100"],
-            "safety_net": {
-                "save": "copy running-config startup-config",
-                "arm": "reload in 10",
-                "cancel": "reload cancel",
-            },
         },
     )
     applied = await server.call_tool("apply_change", {"change_id": "chg-1"})
     aborted = await server.call_tool("abort_change", {"change_id": "chg-2"})
     finalized = await server.call_tool("finalize_change", {"change_id": "chg-3"})
-    forced = await server.call_tool(
-        "close_session", {"session_id": "session-1", "force": True}
-    )
+    closed = await server.call_tool("close_session", {"session_id": "session-1"})
 
     assert planned.structured_content["state"] == "proposed"
     assert applied.structured_content["state"] == "applied"
     assert aborted.structured_content["state"] == "aborted"
     assert finalized.structured_content["state"] == "finalized"
-    assert forced.structured_content["state"] == "closed"
+    assert closed.structured_content["state"] == "closed"
     assert manager.calls == [
         (
             "plan_change",
@@ -277,16 +263,11 @@ async def test_change_tools() -> None:
                 "session-1",
                 "vlan",
                 ["vlan 100"],
-                {
-                    "save": "copy running-config startup-config",
-                    "arm": "reload in 10",
-                    "cancel": "reload cancel",
-                },
                 False,
             ),
         ),
         ("apply_change", "chg-1"),
         ("abort_change", "chg-2"),
         ("finalize_change", "chg-3"),
-        ("close_session", ("session-1", True)),
+        ("close_session", "session-1"),
     ]

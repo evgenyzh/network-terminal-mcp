@@ -18,7 +18,6 @@ from network_terminal_mcp.changes.manager import ChangeManager
 from network_terminal_mcp.changes.models import (
     ChangeResult,
     ChangeState,
-    SafetyNet,
 )
 from network_terminal_mcp.config.loader import AppConfig
 from network_terminal_mcp.config.models import (
@@ -662,14 +661,7 @@ class SessionManager:
         with session.lock:
             return self._session_info(session)
 
-    def close_session(self, session_id: str, *, force: bool = False) -> SessionInfo:
-        active = self._changes.has_active_reboot(session_id)
-        if active is not None and not force:
-            raise SessionError(
-                f"session {session_id} has an active scheduled reboot from change "
-                f"plan {active.change_id}; call finalize_change first or "
-                "close with force=true"
-            )
+    def close_session(self, session_id: str) -> SessionInfo:
         with self._lock:
             session = self._sessions.pop(session_id, None)
         if session is None:
@@ -690,21 +682,10 @@ class SessionManager:
                 session.jump_client = None
                 session.state = SessionState.CLOSED
                 self._touch(session)
-            outcome = "completed"
-            if active is not None:
-                self._audit_event(
-                    "reboot_not_cancelled",
-                    target=session.target,
-                    outcome="warning",
-                    redactor=session.redactor,
-                    session_id=session_id,
-                    change_id=active.change_id,
-                )
-                outcome = "completed_with_reboot_pending"
             self._audit_event(
                 "close_session",
                 target=session.target,
-                outcome=outcome,
+                outcome="completed",
                 redactor=session.redactor,
                 session_id=session_id,
             )
@@ -716,7 +697,6 @@ class SessionManager:
         title: str,
         commands: list[str],
         *,
-        safety_net: dict[str, str] | None = None,
         auto_approve: bool = False,
     ) -> ChangeResult:
         """Register a configuration change plan without executing anything."""
@@ -727,25 +707,14 @@ class SessionManager:
         session = self._get_session(session_id)
         with session.lock:
             self._require_ready(session)
-            self._require_writes_allowed(session)
             for command in commands:
                 check_structural_safety(command, tool="plan_change")
-            resolved_safety = None
-            if safety_net is not None:
-                if set(safety_net) != {"save", "arm", "cancel"}:
-                    raise ChangeError(
-                        "safety_net requires exactly save, arm and cancel commands"
-                    )
-                for command in safety_net.values():
-                    check_structural_safety(command, tool="safety_net")
-                resolved_safety = SafetyNet(**safety_net)
             plan = self._changes.create(
                 session_id=session_id,
                 target=session.target.name,
                 host=session.target.host,
                 title=title.strip(),
                 commands=commands,
-                safety_net=resolved_safety,
                 auto_approve=auto_approve,
             )
             self._audit_event(
@@ -757,7 +726,6 @@ class SessionManager:
                 change_id=plan.change_id,
                 title=plan.title,
                 hash=plan.hash,
-                safety_net=bool(resolved_safety),
             )
             return ChangeResult.from_plan(plan)
 
@@ -795,24 +763,10 @@ class SessionManager:
                 )
 
             self._require_ready(session)
-            self._require_writes_allowed(session)
             warnings: list[str] = []
             output_parts: list[str] = []
             try:
                 plan = self._changes.mark_applied(change_id)
-                if plan.safety_net is not None:
-                    self._run_change_command(
-                        session, plan.safety_net.save, output_parts
-                    )
-                    self._run_change_command(
-                        session, plan.safety_net.arm, output_parts
-                    )
-                    self._changes.set_reboot_required(change_id, True)
-                    plan = self._changes.get(change_id)
-                    warnings.append(
-                        "scheduled reboot armed; call finalize_change after "
-                        "verification to cancel it"
-                    )
                 for command in [cmd.command for cmd in plan.commands]:
                     self._run_change_command(session, command, output_parts)
             except Exception as exc:
@@ -844,7 +798,6 @@ class SessionManager:
                 session_id=session.session_id,
                 change_id=change_id,
                 hash=plan.hash,
-                reboot_cancel_required=plan.reboot_cancel_required,
             )
             return ChangeResult.from_plan(
                 self._changes.get(change_id), output=output, warnings=warnings
@@ -868,7 +821,7 @@ class SessionManager:
             return ChangeResult.from_plan(aborted)
 
     def finalize_change(self, change_id: str) -> ChangeResult:
-        """Cancel the scheduled reboot or commit the safety net after apply."""
+        """Mark an applied change plan as finalized."""
         plan = self._changes.get(change_id)
         if plan.state != ChangeState.APPLIED:
             raise ChangeError(
@@ -877,38 +830,6 @@ class SessionManager:
         session = self._get_session(plan.session_id)
         with session.lock:
             self._require_ready(session)
-            warnings: list[str] = []
-            output_parts: list[str] = []
-            error: str | None = None
-            try:
-                if plan.safety_net is not None and plan.reboot_cancel_required:
-                    self._run_change_command(
-                        session, plan.safety_net.cancel, output_parts
-                    )
-                    self._changes.set_reboot_required(change_id, False)
-            except Exception as exc:
-                self._changes.mark_failed(change_id)
-                error = session.redactor.redact(str(exc))
-                warnings.append(
-                    "could not cancel the scheduled reboot; the device will "
-                    "reboot on its own (reload cancel command failed)"
-                )
-                self._audit_event(
-                    "finalize_change",
-                    target=session.target,
-                    outcome="failed",
-                    redactor=session.redactor,
-                    session_id=session.session_id,
-                    change_id=change_id,
-                    hash=plan.hash,
-                    error=error,
-                )
-                return ChangeResult.from_plan(
-                    self._changes.get(change_id),
-                    output="\n".join(output_parts),
-                    warnings=warnings,
-                    error=error,
-                )
             finalized = self._changes.finalize(change_id)
             self._touch(session)
             self._audit_event(
@@ -919,20 +840,8 @@ class SessionManager:
                 session_id=session.session_id,
                 change_id=change_id,
                 hash=plan.hash,
-                reboot_cancel_required=False,
             )
-            return ChangeResult.from_plan(
-                finalized, output="\n".join(output_parts), warnings=warnings
-            )
-
-    def _require_writes_allowed(self, session: _ManagedSession) -> None:
-        if not session.target.allow_writes:
-            raise ChangeError(
-                f"changes are not enabled for target {session.target.name!r}; "
-                "set allow_writes: true on the device"
-            )
-        if self._config.policy.defaults.write_change == "deny":
-            raise ChangeError("change plans are denied by policy defaults")
+            return ChangeResult.from_plan(finalized)
 
     def _run_change_command(
         self,

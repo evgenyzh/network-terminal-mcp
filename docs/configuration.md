@@ -24,15 +24,10 @@ devices:
     tags: [access, lab]
     allow_telnet: false
     port: 22
-    allow_writes: false
 ```
 
 Поля модели `Device`: `host`, `credentials`, `connection`, `tags`,
-`allow_telnet`, `port`, `allow_writes`.
-
-`allow_writes: true` разрешает применение изменений конфигурации на этом
-устройстве (через `plan_change`/`apply_change`); без него изменения всегда
-отклоняются, даже если policy разрешает `write_change`. По умолчанию `false`.
+`allow_telnet`, `port`.
 
 Инвентарь предназначен для инфраструктуры, а не для каждого устройства.
 Сетевые устройства (коммутаторы и т.п.) обычно достигаются ad-hoc через
@@ -107,8 +102,8 @@ SSH-only `proxyjump` hop, один `nested` hop (`next_protocol: ssh` или
 как socket. `jump_port` относится к bastion; final target использует
 `Device.port` или ad-hoc `port`, затем fallback profile `port`, затем 22.
 
-Nested подключается к `host` через `generic_termserver`, затем из shell
-промежуточного хоста выполняет `ssh` (или `telnet`, если
+Nested подключается к `host` по SSH, затем из shell промежуточного хоста
+выполняет `ssh` (или `telnet`, если
 `next_protocol: telnet`) до final target с credentials целевого устройства.
 Inner SSH
 использует SSH-клиент промежуточного хоста: host key цели проверяется им, а не
@@ -152,12 +147,12 @@ Telnet и console требуют двойного gating: `allow_telnet: true` �
 случайно включить Telnet нельзя. Telnet не проверяет host key и передаёт
 трафик и учётные данные открытым текстом; сессия всегда возвращает warning.
 
-Изменения конфигурации тоже требуют двойного gating: `Device.allow_writes:
-true` **и** `defaults.write_change: allow` в policy (по умолчанию `deny`).
-Инструменты `plan_change`, `apply_change`, `abort_change` и `finalize_change`
-применяют изменения отдельно от `run_command`; команды пишет модель, а сервер
-хранит их канонический список и исполняет один раз. Подробнее в разделе
-[Запись конфигурации](security.md#запись-конфигурации).
+Изменения конфигурации идут через отдельные инструменты `plan_change`,
+`apply_change`, `abort_change` и `finalize_change`, отделённые от `run_command`;
+команды пишет модель, а сервер хранит их канонический список и исполняет один
+раз после явного подтверждения человеком. Отдельного гейта разрешения
+изменений нет — безопасность держится на двухшаговом `apply_change`.
+Подробнее в разделе [Запись конфигурации](security.md#запись-конфигурации).
 
 ## Credential profile
 

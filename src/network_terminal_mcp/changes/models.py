@@ -18,20 +18,6 @@ class ChangeState(StrEnum):
     FAILED = "failed"
 
 
-class SafetyNet(BaseModel):
-    """Optional reload/commit rollback safety net declared by the model.
-
-    ``save`` snapshots the pre-change config to the device's startup config
-    before any change command runs, ``arm`` schedules the reload/commit, and
-    ``cancel`` is sent on finalize. All are opaque vendor command lines written
-    by the model; the server executes them verbatim and never inspects them.
-    """
-
-    save: str
-    arm: str
-    cancel: str
-
-
 class ChangeCommand(BaseModel):
     """One planned command and its per-command execution outcome."""
 
@@ -52,10 +38,8 @@ class ChangePlan(BaseModel):
     title: str
     commands: list[ChangeCommand]
     hash: str
-    safety_net: SafetyNet | None = None
     auto_approve: bool = False
     state: ChangeState = ChangeState.PROPOSED
-    reboot_cancel_required: bool = False
     created_at: datetime
     applied_at: datetime | None = None
     finalized_at: datetime | None = None
@@ -73,10 +57,8 @@ class ChangeResult(BaseModel):
     state: ChangeState
     hash: str
     commands: list[dict[str, object]] = Field(default_factory=list)
-    safety_net: SafetyNet | None = None
     auto_approve: bool = False
     confirmation_required: bool = False
-    reboot_cancel_required: bool = False
     output: str = ""
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
@@ -106,10 +88,8 @@ class ChangeResult(BaseModel):
                 }
                 for command in plan.commands
             ],
-            safety_net=plan.safety_net,
             auto_approve=plan.auto_approve,
             confirmation_required=confirmation_required,
-            reboot_cancel_required=plan.reboot_cancel_required,
             output=output,
             warnings=warnings or [],
             error=error,
