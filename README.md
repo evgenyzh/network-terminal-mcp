@@ -93,9 +93,9 @@ Telnet, console и serial требуют явных per-call флагов и м�
 ## Установка
 
 ```bash
-uvx network-terminal-mcp
+uvx network-terminal-mcp@latest
 # или как постоянный инструмент:
-uv tool install network-terminal-mcp
+uv tool install network-terminal-mcp@latest
 # или:
 pip install network-terminal-mcp
 ```
@@ -109,7 +109,7 @@ pip install network-terminal-mcp
   "mcp": {
     "network-terminal": {
       "type": "local",
-      "command": ["uvx", "network-terminal-mcp"],
+      "command": ["uvx", "network-terminal-mcp@latest"],
       "enabled": true
     }
   },

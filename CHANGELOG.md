@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- В README и примере конфигурации OpenCode рекомендован запуск через
+  `uvx network-terminal-mcp@latest`, чтобы клиент подхватывал новые релизы.
+
 ## [0.1.1] - 2026-10-05
 
 ### Fixed
