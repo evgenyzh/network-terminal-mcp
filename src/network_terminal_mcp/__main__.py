@@ -22,7 +22,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="override configuration directory "
         "(default: $NETWORK_MCP_CONFIG_DIR or ~/.config/network-terminal-mcp)",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=False)
     sub.add_parser("check", help="validate the optional local policy file")
     return parser
 
@@ -30,6 +30,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command is None:
+        # No subcommand: run the MCP stdio server (this is how clients start it).
+        from network_terminal_mcp.server import create_server
+
+        create_server().run(transport="stdio")
+        return 0
     try:
         config = load_config(args.config_dir)
         print(f"config dir: {config.config_dir}")

@@ -59,3 +59,17 @@ def test_check_ignores_removed_inventory_file(
     _write(config_dir, "inventory.yml", {"devices": {"sw1": {"host": "192.0.2.1"}}})
     assert main(["--config-dir", str(config_dir), "check"]) == 0
     assert "known_hosts_file" in capsys.readouterr().out
+
+
+def test_no_command_starts_stdio_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    transports: list[str] = []
+
+    class FakeServer:
+        def run(self, *, transport: str) -> None:
+            transports.append(transport)
+
+    monkeypatch.setattr(
+        "network_terminal_mcp.server.create_server", lambda: FakeServer()
+    )
+    assert main([]) == 0
+    assert transports == ["stdio"]

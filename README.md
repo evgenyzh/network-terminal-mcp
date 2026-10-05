@@ -128,8 +128,9 @@ hard-deny Telnet, serial, legacy-алгоритмов, plaintext) можно п�
 Проверка локальной политики до запуска:
 
 ```bash
-uv sync
-uv run python -m network_terminal_mcp check
+uvx network-terminal-mcp check
+# в чекауте проекта:
+uv sync && uv run python -m network_terminal_mcp check
 ```
 
 Подробный порядок регистрации SSH host key и запуска через OpenCode описан в
