@@ -62,18 +62,6 @@ class TransportError(NetworkMCPError):
     code = "transport_error"
 
 
-class TargetError(NetworkMCPError):
-    """A device target is unknown or cannot be resolved."""
-
-    code = "target_error"
-
-
-class ChangeError(NetworkMCPError):
-    """A configuration change plan is invalid, rejected, or already used."""
-
-    code = "change_error"
-
-
 def fail_closed_audit(message: str) -> NoReturn:
     """Raise the audit error that aborts an operation when logging fails."""
     raise AuditError(message)

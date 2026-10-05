@@ -1,239 +1,171 @@
 # Конфигурация
 
-Формат ниже реализован Pydantic-схемой Этапов 1-3. Неизвестные поля отклоняются,
-а ссылки устройства на credential/connection profiles проверяются при загрузке.
+Сервер работает zero-config: после установки не нужно писать YAML, чтобы
+подключиться. Каждое соединение модель описывает прямо в вызове `open_session`
+(host, protocol, credentials, route, host key policy, serial-параметры,
+опционально legacy алгоритмы). Pydantic валидирует описание до открытия любого
+сетевого соединения, а секреты остаются ссылками.
 
-## Разделение файлов
+Единственный локальный файл — **необязательный** `policy.yml`: posture и
+runtime-лимиты. Без него действуют встроенные значения. Инвентаря, connection и
+credential profiles больше нет.
 
-- `inventory.yml`: устройства, группы и ссылки на профили.
-- `connections.yml`: маршруты, hops и legacy SSH параметры.
-- `credentials.yml`: ссылки на `pass`, но не сами секреты.
-- `policy.yml`: решения allow/ask/deny.
+## `open_session`
 
-Runtime-файлы располагаются в `~/.config/network-terminal-mcp/`, а примеры в
-репозитории не содержат реальных данных.
-
-## Target
-
-```yaml
-devices:
-  access-snr-01:
-    host: 192.0.2.10
-    credentials: network-tacacs
-    connection: direct
-    tags: [access, lab]
-    allow_telnet: false
-    port: 22
+```text
+open_session(
+  host: str,
+  credentials: CredentialSpec | None = None,
+  port: int | None = None,          # порт final target
+  protocol: "ssh"|"telnet"|"console"|"serial" = "ssh",
+  route: SocksRoute | ProxyJumpRoute | None = None,
+  host_key_policy: "strict"|"accept_new"|"accept_changed" = "strict",
+  legacy: LegacyAlgorithms | None = None,
+  allow_telnet: bool = False,
+  allow_plaintext_password: bool = False,
+  allow_serial: bool = False,
+  serial: SerialParams | None = None,
+)
 ```
 
-Поля модели `Device`: `host`, `credentials`, `connection`, `tags`,
-`allow_telnet`, `port`.
+`protocol` и `port` всегда описывают final target. Тип оборудования не
+передаётся: модель определяет его по баннеру и выводу после подключения.
+Для `serial` credentials не нужны (устройство аутентифицирует само консольный
+вход), host — абсолютный путь к `/dev/tty*`.
 
-Инвентарь предназначен для инфраструктуры, а не для каждого устройства.
-Сетевые устройства (коммутаторы и т.п.) обычно достигаются ad-hoc через
-`open_session(host=...)` без записи в `devices` и без указания платформы. Для
-ad-hoc подключений `credentials` и `connection` берутся из дефолтов:
+### Credentials
 
-```yaml
-default_credentials: network-tacacs
-default_connection: through-jump
+```text
+# пароль из pass
+credentials = { backend: "pass", entry: "network/credentials/net", username: "operator" }
+
+# явный локальный SSH key
+credentials = { backend: "ssh_key", key_file: "~/.ssh/id_ed25519",
+                key_passphrase_entry: "network/credentials/key-pass", username: "operator" }
+
+# plaintext — только с allow_plaintext_password=true, всегда insecure warning
+credentials = { backend: "plaintext", username: "operator", password: "..." }
 ```
 
-`default_credentials` и `default_connection` — опциональные имена профилей,
-которые подставляются в ad-hoc `open_session(host=...)`, когда модель не
-передала их явно. Оба должны существовать среди профилей. Одноразовый target
-может передать те же несекретные поля в `open_session`. Разрешенные credential и
-connection profiles по-прежнему берутся из локальной конфигурации.
+`entry` и `key_passphrase_entry` — относительные имена записей `pass` (без `..`
+и ведущего `/`). Сервер вызывает `pass show` без shell. Пароль из `pass`
+читается только в память сессии, не попадает в аргументы, results и audit и
+используется redaction. Plaintext-пароль принимается только при явном
+`allow_plaintext_password=true`, не сохраняется сервером, маскируется в аудите и
+всегда возвращается с insecure warning; policy может hard-deny этот режим.
 
-Тип оборудования ad-hoc определяется по выводу уже после открытия сессии:
-модель читает banner и команды (`show version` / `display version` и т.п.) и
-работает с тем CLI, который видит. Платформа не передаётся и не переключается.
+### Route
 
-## Connection profile
+`route` описывает один hop до final target; без него соединение прямое. Дальше
+модель сама печатает `ssh`/`telnet` в открытой сессии, если нужен следующий
+переход.
 
-```yaml
-connections:
-  direct:
-    type: direct
-    protocol: ssh
-    host_key_policy: strict
+```text
+# локальный SOCKS5 (обычно ssh -D); target должен быть IP
+route = { type: "socks", host: "127.0.0.1", port: 1080 }
 
-  direct-enroll:
-    type: direct
-    protocol: ssh
-    host_key_policy: accept_new
-
-  direct-snr:
-    type: direct
-    protocol: ssh
-    host_key_policy: accept_changed
-
-  through-jump:
-    type: proxyjump
-    protocol: ssh
-    jump_host: jump.example.net
-    jump_port: 22
-    jump_credentials: terminal-tacacs
-    jump_host_key_policy: strict
-    host_key_policy: strict
-    # Optional fallback for the final target. Device/ad-hoc port wins.
-    port: 22
-
-  through-terminal:
-    type: nested
-    host: terminal.example.net
-    protocol: ssh
-    credentials: terminal-tacacs
-    next_protocol: ssh
-    host_key_policy: strict
-
-  old-switch:
-    type: direct
-    protocol: legacy_ssh
-    host_key_algorithms: [ssh-rsa]
-    kex_algorithms: [diffie-hellman-group14-sha1]
-    ciphers: [aes128-cbc]
+# один SSH jump host
+route = { type: "proxyjump", host: "jump.example.net", port: 22,
+          credentials: { backend: "pass", entry: "network/jump", username: "operator" },
+          host_key_policy: "strict" }
 ```
 
-Поддерживаются `direct` с protocol `ssh`, `legacy_ssh` или `telnet`, один
-SSH-only `proxyjump` hop, один `nested` hop (`next_protocol: ssh` или
-`telnet`) и TCP `console` profile. ProxyJump аутентифицируется на
-`jump_host`, открывает `direct-tcpip` channel к final target и передаёт его
-как socket. `jump_port` относится к bastion; final target использует
-`Device.port` или ad-hoc `port`, затем fallback profile `port`, затем 22.
+- `socks` и `proxyjump` поддерживают только SSH final target.
+- Host key jump проверяется локально по `host_key_policy` route.
+- Произвольный `ProxyCommand`, shell-строки и больше одного hop не
+  поддерживаются. Второй hop выполняется вручную: `terminal_write("ssh ...")`.
 
-Nested подключается к `host` по SSH, затем из shell промежуточного хоста
-выполняет `ssh` (или `telnet`, если
-`next_protocol: telnet`) до final target с credentials целевого устройства.
-Inner SSH
-использует SSH-клиент промежуточного хоста: host key цели проверяется им, а не
-локальным `known_hosts_file`. Inner Telnet вообще не проверяет host key цели.
+### Serial
 
-`console` profile подключается к TCP console port терминального сервера
-(`port` обязателен) через Telnet. Поле `connect_command`
-намеренно не поддерживается: произвольная shell-строка противоречит модели
-безопасности. Console требует того же gating, что и Telnet.
-
-Ключи jump host и final target проверяются раздельно в одном dedicated
-`known_hosts_file`: `jump_host_key_policy` относится к bastion, а
-`host_key_policy` — к final target (для `nested` — к intermediate host).
-Literal `ProxyCommand` и несколько hops не поддерживаются. Сложные nested-профили
-в дальнейшем будут описываться массивом typed hops, а не shell-строкой.
-
-`proxyjump` с полем `socks: {host, port}` вместо `jump_host` маршрутизирует
-final target через локальный SOCKS5-прокси — обычно это локальный SSH dynamic
-forward (`ssh -D 1080 jump.example.net`). `socks` и `jump_host` взаимоисключающие.
-Прокси не резолвит имена, поэтому target должен быть IP-адресом. Для первого
-подключения цели, видимой только через туннель, используйте
-`host_key_policy: accept_new` (TOFU через SOCKS), затем переключите на `strict`.
-Пример:
-
-```yaml
-connections:
-  through-socks:
-    type: proxyjump
-    protocol: ssh
-    socks: { host: 127.0.0.1, port: 1080 }
-    host_key_policy: accept_new
+```text
+open_session(host="/dev/ttyUSB0", protocol="serial", allow_serial=True,
+             serial={ baudrate: 115200, bytesize: 8, parity: "N", stopbits: 1 })
 ```
 
-`legacy_ssh` и явные списки KEX/ciphers/key types выполняют per-profile
-algorithm override: категории, перечисленные в профиле, ограничиваются
-allowlist, остальные сохраняют значения Paramiko по умолчанию. Списки не
-применяются глобально и не отключают host key checking.
+Путь должен существовать и быть символьным устройством. Serial не проверяет
+host key и не аутентифицируется; policy может hard-deny через
+`defaults.allow_serial: false`. По умолчанию `terminal_write(enter=True)`
+отправляет `\r`, как ожидает большинство консольных портов.
 
-Telnet и console требуют двойного gating: `allow_telnet: true` на устройстве
-**и** `defaults.telnet: allow` в policy. По умолчанию `telnet: deny`, поэтому
-случайно включить Telnet нельзя. Telnet не проверяет host key и передаёт
-трафик и учётные данные открытым текстом; сессия всегда возвращает warning.
+### Legacy SSH
 
-Изменения конфигурации идут через отдельный инструмент `run_change`,
-отделённый от read-only `run_command`. Подтверждение перед исполнением даёт
-permission-политика клиента: в `opencode.json`
-`"permission": { "network-terminal_run_change": "ask" }` показывает нативное
-всплывающее окно (once/always/reject). Серверного гейта подтверждения нет.
-Подробнее в разделе
-[Запись конфигурации](security.md#запись-конфигурации).
-
-## Credential profile
-
-```yaml
-credentials:
-  network-tacacs:
-    backend: pass
-    entry: network/credentials/network-tacacs
-    username: operator
-
-  terminal-tacacs:
-    backend: pass
-    entry: network/credentials/terminal-server
-    username: operator
-
-  jump-key:
-    backend: ssh_key
-    key_file: ~/.ssh/id_ed25519
-    key_passphrase_entry: network/credentials/jump-key-passphrase
-    username: operator
+```text
+legacy = { host_key_algorithms: ["ssh-rsa"],
+           kex_algorithms: ["diffie-hellman-group1-sha1"],
+           ciphers: ["aes128-cbc"] }
 ```
 
-Поля `entry` и `username` не принимаются из MCP-вызова. Пароль всегда берется
-из `pass`; username не считается секретом и задается отдельно, чтобы не
-дублировать его в password store. Profile с `backend: ssh_key` хранит только
-явный локальный путь `key_file` и username; automatic ssh-agent/key discovery
-не включается. Key file не передается в MCP arguments. Для password-backed
-target используйте отдельный `pass` profile, даже если jump host использует key.
-Для зашифрованного private key добавьте `key_passphrase_entry`: его первая строка
-также читается из `pass`, redacted и не передается в MCP arguments.
+Списки — allowlist для указанных категорий: они превращаются в Paramiko
+`disabled_algorithms`, остальные категории сохраняют defaults, host key checking
+не отключается. Legacy применяется только к локальному SSH-соединению (direct,
+socks, proxyjump) и всегда возвращает warning. Штатный сценарий: модель сначала
+пробует обычный SSH; если устройство требует старые алгоритмы, повторяет вызов с
+`legacy` для этого явного host. Policy может hard-deny.
 
-## Runtime defaults
+### Host key
+
+По умолчанию `strict`: host key обязан быть в локальном
+`~/.local/state/network-terminal-mcp/known_hosts`. Для первого подключения
+передайте `host_key_policy: "accept_new"` (TOFU, явная регистрация), сверьте
+fingerprint вне канала и вернитесь к `strict`.
+
+`accept_changed` — слабый режим для устройств, у которых ключ заведомо меняется
+при каждой загрузке (например, некоторые SNR). Он явный, всегда пишет в audit
+старый и новый fingerprint и не должен применяться к устройствам со стабильными
+ключами.
+
+### Telnet и console
+
+`protocol: "telnet"` или `"console"` требуют явного `allow_telnet=true` в
+вызове. `console` дополнительно требует `port`. Telnet/console передают учётные
+данные и трафик открытым текстом, не проверяют host key и всегда возвращают
+warning. Policy может hard-deny через `defaults.allow_telnet: false`.
+
+## Секреты в живой сессии
+
+Пароль, который устройство запрашивает уже внутри сессии (второй `ssh`,
+`enable`, TACACS), вводится только инструментом
+`terminal_write_secret(session_id, entry)`: значение берётся из `pass` внутри
+сервера, не возвращается модели и не пишется в audit (только имя записи и
+размер). Обычный `terminal_write` предназначен для команд и клавиш; его ввод
+логируется целиком.
+
+## policy.yml (необязательно)
+
+`~/.config/network-terminal-mcp/policy.yml`, каталог 0700, файл 0600. Все поля
+опциональны; приведены значения по умолчанию:
 
 ```yaml
+defaults:
+  allow_telnet: true                 # false = hard-deny Telnet/console
+  allow_plaintext_password: true     # false = hard-deny plaintext-пароль
+  allow_legacy_algorithms: true      # false = hard-deny legacy SSH
+  allow_serial: true                 # false = hard-deny /dev/tty*
 runtime:
-  session_idle_timeout: 300
-  session_max_lifetime: 1800
-  command_timeout: 60
-  cli_help_timeout: 5
+  session_idle_timeout: 3600
+  session_max_lifetime: 86400
+  io_timeout: 60                     # connect/auth и default read timeout
+  max_read_timeout: 300              # верхняя граница terminal_read(timeout)
+  max_write_bytes: 65536
   max_inline_output_bytes: 65536
   max_session_buffer_bytes: 1048576
   max_open_sessions: 10
-  max_pager_pages: 32
   audit_file: ~/.local/state/network-terminal-mcp/audit.jsonl
   output_dir: ~/.local/state/network-terminal-mcp/outputs
   known_hosts_file: ~/.local/state/network-terminal-mcp/known_hosts
   transcripts_enabled: false
 ```
 
-`host_key_policy` по умолчанию равен `strict`: target подключается только при
-совпадении ключа с `known_hosts_file`. Значение `accept_new` допускается только
-для явной первичной регистрации ключа (TOFU); после нее профиль следует вернуть
-в `strict`.
+Долгие idle/lifetime позволяют держать несколько устройств открытыми
+одновременно и переключаться между ними без переподключения.
 
-`accept_changed` — слабый доверительный режим, opt-in для конкретного профиля.
-Используется только для платформ, у которых host key заведомо меняется при
-каждой загрузке (например, некоторые SNR). При каждом подключении сервер
-сверяет живой ключ с сохраненным: совпадает — оставляет без изменений,
-изменился или отсутствует — заменяет и пишет в audit предупреждение со
-старым и новым fingerprint. Для устройств со стабильными ключами этот режим
-недопустим: он снимает защиту от MITM.
-
-`transcripts_enabled` зарезервирован для следующего этапа и пока не включает
-сохранение full transcript.
-
-`max_pager_pages` ограничивает количество страниц, которые можно запросить
-через `send_control(..., action="space")` в одной операции. После лимита сервер
-отправляет `q`, ожидает prompt и переводит session в `ready`.
-
-`cli_help_timeout` ограничивает ожидание подсказки отдельно от обычной команды.
-После любого результата или таймаута сервер отправляет Ctrl-C и ожидает prompt;
-оба ожидания ограничены этим значением. Невернувшаяся подсказка переводит
-session в `failed`.
-
-## Проверка конфигурации
+Проверка конфигурации без сетевых соединений:
 
 ```bash
+uv sync
 uv run python -m network_terminal_mcp check
-uv run python -m network_terminal_mcp check --device access-snr-01
 ```
 
-Эти команды валидируют YAML и ссылки между профилями, не открывая сетевое
-соединение и не читая password entry из `pass`.
+Каталог конфигурации переопределяется `--config-dir` или
+`NETWORK_MCP_CONFIG_DIR`. Старые файлы `inventory.yml`, `connections.yml` и
+`credentials.yml` больше не читаются и могут быть удалены.

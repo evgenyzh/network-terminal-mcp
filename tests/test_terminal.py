@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from network_terminal_mcp.errors import TransportError
-from network_terminal_mcp.terminal import SshTerminal, _BaseTerminal
+from network_terminal_mcp.terminal import SerialTerminal, SshTerminal, _BaseTerminal
 
 
 class ScriptedTerminal(_BaseTerminal):
@@ -55,6 +58,36 @@ def test_find_prompt_returns_the_last_line() -> None:
     assert prompt == "sw1#"
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "<SW>", "[SW]", "[SW-bgp]", "[~SW]", "[*SW]", "[~SW-bgp]",
+        "[*SW-GigabitEthernet0/0/1]", "[SW-bgp-af-ipv4]", "<SW-1>",
+        "switch(config-if)#", "operator@router>", "operator@router#",
+    ],
+)
+def test_find_prompt_recognizes_configuration_views(prompt: str) -> None:
+    terminal = ScriptedTerminal([f"Welcome to the device\r\n{prompt} \r\n"])
+
+    assert terminal.find_prompt() == prompt
+    assert terminal.writes == [b"\n"]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "status [SW]", "[edit protocols bgp]", "Continue? [Y/N]", "[]",
+        "[~]", "[SW]command", "prefix switch#", "progress 100%",
+        "[SW\x03]", "[[SW]]", "[Y/N]", "[yes/no]",
+    ],
+)
+def test_find_prompt_rejects_non_prompt_lines(output: str) -> None:
+    terminal = ScriptedTerminal([output])
+
+    with pytest.raises(TransportError, match="unable to find"):
+        terminal.find_prompt()
+
+
 def test_find_prompt_raises_when_no_prompt() -> None:
     terminal = ScriptedTerminal([""])
     with pytest.raises(TransportError, match="unable to find"):
@@ -93,3 +126,55 @@ def test_ssh_terminal_disconnect_without_connect_is_safe() -> None:
     terminal.disconnect()
     assert terminal._channel is None
     assert terminal._client is None
+
+
+_SERIAL_KWARGS = {
+    "baudrate": 9600,
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1,
+    "conn_timeout": 1.0,
+}
+
+
+def test_serial_rejects_relative_paths(tmp_path: Path) -> None:
+    terminal = SerialTerminal()
+    with pytest.raises(TransportError, match="absolute /dev/"):
+        terminal.connect(device="ttyUSB0", **_SERIAL_KWARGS)  # type: ignore[arg-type]
+    with pytest.raises(TransportError, match="absolute /dev/"):
+        terminal.connect(device=str(tmp_path / "ttyUSB0"), **_SERIAL_KWARGS)  # type: ignore[arg-type]
+
+
+def test_serial_rejects_missing_devices() -> None:
+    terminal = SerialTerminal()
+    with pytest.raises(TransportError, match="not accessible"):
+        terminal.connect(
+            device="/dev/opencode-network-terminal-mcp-missing",
+            **_SERIAL_KWARGS,  # type: ignore[arg-type]
+        )
+
+
+def test_serial_rejects_non_character_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import stat as stat_module
+
+    monkeypatch.setattr(
+        "network_terminal_mcp.terminal.os.stat",
+        lambda path: os.stat_result((stat_module.S_IFREG | 0o644, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
+    )
+    terminal = SerialTerminal()
+    with pytest.raises(TransportError, match="not a character device"):
+        terminal.connect(device="/dev/not-a-char", **_SERIAL_KWARGS)  # type: ignore[arg-type]
+
+
+def test_serial_open_failure_is_a_transport_error() -> None:
+    terminal = SerialTerminal()
+    with pytest.raises(TransportError, match="serial open failed"):
+        terminal.connect(device="/dev/null", **_SERIAL_KWARGS)  # type: ignore[arg-type]
+
+
+def test_serial_disconnect_without_connect_is_safe() -> None:
+    terminal = SerialTerminal()
+    terminal.disconnect()
+    assert terminal._serial is None

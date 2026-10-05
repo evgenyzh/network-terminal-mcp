@@ -11,7 +11,6 @@ from network_terminal_mcp.errors import (
     NetworkMCPError,
     PolicyError,
     SessionError,
-    TargetError,
     TransportError,
 )
 
@@ -31,7 +30,6 @@ def test_code_is_in_message() -> None:
         SessionError("x"),
         AuditError("x"),
         TransportError("x"),
-        TargetError("x"),
     ],
 )
 def test_subclasses_carry_unique_codes(error: NetworkMCPError) -> None:

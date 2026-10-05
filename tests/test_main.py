@@ -1,4 +1,4 @@
-"""Tests for the configuration health-check CLI."""
+"""Tests for the policy health-check CLI."""
 
 from __future__ import annotations
 
@@ -21,57 +21,41 @@ def _write(directory: Path, name: str, data: object) -> None:
     (directory / name).write_text(yaml.safe_dump(data), encoding="utf-8")
 
 
-def _base_config(config_dir: Path) -> None:
-    _write(
-        config_dir,
-        "inventory.yml",
-        {
-            "devices": {
-                "sw1": {
-                    "host": "192.0.2.1",
-                    "credentials": "net",
-                    "connection": "direct",
-                }
-            }
-        },
-    )
-    _write(
-        config_dir,
-        "connections.yml",
-        {"connections": {"direct": {"type": "direct", "protocol": "ssh"}}},
-    )
-    _write(
-        config_dir,
-        "credentials.yml",
-        {
-            "credentials": {
-                "net": {"backend": "pass", "entry": "n/c", "username": "operator"}
-            }
-        },
-    )
-
-
-def test_check_summary(config_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    _base_config(config_dir)
+def test_check_summary_with_defaults(
+    config_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     assert main(["--config-dir", str(config_dir), "check"]) == 0
     out = capsys.readouterr().out
-    assert "devices=1" in out
     assert "config dir" in out
+    assert "known_hosts_file" in out
+    assert "max_open_sessions=10" in out
 
 
-def test_check_device(config_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    _base_config(config_dir)
-    assert main(["--config-dir", str(config_dir), "check", "--device", "sw1"]) == 0
+def test_check_reads_the_optional_policy_file(
+    config_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write(
+        config_dir,
+        "policy.yml",
+        {
+            "defaults": {"allow_telnet": False},
+            "runtime": {"session_idle_timeout": 120},
+        },
+    )
+    assert main(["--config-dir", str(config_dir), "check"]) == 0
     out = capsys.readouterr().out
-    assert "host=192.0.2.1" in out
-    assert "credentials=net" in out
+    assert "session_idle_timeout=120" in out
 
 
-def test_check_device_unknown_fails(config_dir: Path) -> None:
-    _base_config(config_dir)
-    assert main(["--config-dir", str(config_dir), "check", "--device", "nope"]) == 1
-
-
-def test_check_invalid_config_fails(config_dir: Path) -> None:
+def test_check_invalid_policy_fails(config_dir: Path) -> None:
     (config_dir / "policy.yml").write_text("::: nope :::", encoding="utf-8")
     assert main(["--config-dir", str(config_dir), "check"]) == 1
+
+
+def test_check_ignores_removed_inventory_file(
+    config_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Old inventory/connection files are ignored, not fatal.
+    _write(config_dir, "inventory.yml", {"devices": {"sw1": {"host": "192.0.2.1"}}})
+    assert main(["--config-dir", str(config_dir), "check"]) == 0
+    assert "known_hosts_file" in capsys.readouterr().out

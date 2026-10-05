@@ -7,16 +7,15 @@ from datetime import UTC, datetime
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from network_terminal_mcp.changes.models import ChangeCommand, ChangeResult
+from network_terminal_mcp.config.models import OpenSpec
 from network_terminal_mcp.server import create_server
 from network_terminal_mcp.sessions import (
-    CliHelpResult,
-    CommandResult,
-    ControlResult,
     OutputChunk,
-    ResponseResult,
     SessionInfo,
     SessionState,
+    TerminalOutput,
+    TerminalSecretResult,
+    TerminalWriteResult,
 )
 
 
@@ -25,7 +24,7 @@ class FakeManager:
         self.calls: list[tuple[str, object]] = []
         self.info = SessionInfo(
             session_id="session-1",
-            target="sw1",
+            route="direct",
             host="192.0.2.1",
             prompt="sw1#",
             state=SessionState.READY,
@@ -33,41 +32,27 @@ class FakeManager:
             last_used_at=datetime.now(UTC),
         )
 
-    def open_session(self, name: str | None = None, **ad_hoc: object) -> SessionInfo:
-        self.calls.append(("open_session", name if name is not None else ad_hoc))
+    def open_session(self, spec: OpenSpec) -> SessionInfo:
+        self.calls.append(("open_session", spec))
         return self.info
 
-    def run_command(self, session_id: str, command: str) -> CommandResult:
-        self.calls.append(("run_command", (session_id, command)))
-        return CommandResult(
-            session_id=session_id,
-            command=command,
-            policy="allow",
-            executed=True,
-            output="ok",
+    def terminal_write(
+        self, session_id: str, data: str, *, enter: bool = True
+    ) -> TerminalWriteResult:
+        self.calls.append(("terminal_write", (session_id, data, enter)))
+        return TerminalWriteResult(
+            session_id=session_id, data=data, bytes_sent=len(data), state=SessionState.READY
         )
 
-    def run_commands(self, session_id: str, commands: list[str]) -> list[CommandResult]:
-        self.calls.append(("run_commands", (session_id, commands)))
-        return [self.run_command(session_id, command) for command in commands]
+    def terminal_read(self, session_id: str, *, timeout: float | None = None) -> TerminalOutput:
+        self.calls.append(("terminal_read", (session_id, timeout)))
+        return TerminalOutput(session_id=session_id, output="output", output_offset=0)
 
-    def cli_help(self, session_id: str, line: str) -> CliHelpResult:
-        self.calls.append(("cli_help", (session_id, line)))
-        return CliHelpResult(
-            session_id=session_id,
-            line=line,
-            policy="allow",
-            executed=True,
-            output="completion",
+    def terminal_write_secret(self, session_id: str, entry: str) -> TerminalSecretResult:
+        self.calls.append(("terminal_write_secret", (session_id, entry)))
+        return TerminalSecretResult(
+            session_id=session_id, entry=entry, bytes_sent=7, state=SessionState.READY
         )
-
-    def send_control(self, session_id: str, action: str) -> ControlResult:
-        self.calls.append(("send_control", (session_id, action)))
-        return ControlResult(session_id=session_id, action="space", output="next page")
-
-    def respond(self, session_id: str, response: str) -> ResponseResult:
-        self.calls.append(("respond", (session_id, response)))
-        return ResponseResult(session_id=session_id, response=response, output="continued")
 
     def read_output(self, session_id: str, *, offset: int, limit: int | None) -> OutputChunk:
         self.calls.append(("read_output", (session_id, offset, limit)))
@@ -81,128 +66,169 @@ class FakeManager:
         self.calls.append(("close_session", session_id))
         return self.info.model_copy(update={"state": SessionState.CLOSED})
 
-    def run_change(self, session_id: str, commands: list[str]) -> ChangeResult:
-        self.calls.append(("run_change", (session_id, commands)))
-        return ChangeResult(
-            session_id=session_id,
-            commands=[ChangeCommand(command=command) for command in commands],
-            output="ok",
-        )
-
 
 @pytest.mark.asyncio
-async def test_named_open_session_tool() -> None:
-    manager = FakeManager()
-    server = create_server(manager=manager)  # type: ignore[arg-type]
-    result = await server.call_tool("open_session", {"target": "sw1"})
-    assert result.structured_content["session_id"] == "session-1"
-    assert manager.calls == [("open_session", "sw1")]
-
-
-@pytest.mark.asyncio
-async def test_ad_hoc_open_session_tool() -> None:
+async def test_open_session_tool_accepts_an_inline_spec() -> None:
     manager = FakeManager()
     server = create_server(manager=manager)  # type: ignore[arg-type]
     result = await server.call_tool(
         "open_session",
         {
             "host": "192.0.2.2",
-            "credentials": "net",
-            "connection": "direct",
+            "credentials": {"entry": "network/net", "username": "operator"},
+            "route": {"type": "socks", "host": "127.0.0.1", "port": 1080},
         },
     )
-    assert result.structured_content["host"] == "192.0.2.1"
-    assert manager.calls == [
-        (
+    assert result.structured_content["session_id"] == "session-1"
+    assert result.structured_content["route"] == "direct"
+    call_name, spec = manager.calls[0]
+    assert call_name == "open_session"
+    assert isinstance(spec, OpenSpec)
+    assert spec.host == "192.0.2.2"
+    assert spec.route is not None
+    assert spec.route.type == "socks"
+
+
+@pytest.mark.asyncio
+async def test_open_session_tool_accepts_a_serial_spec() -> None:
+    manager = FakeManager()
+    server = create_server(manager=manager)  # type: ignore[arg-type]
+    await server.call_tool(
+        "open_session",
+        {
+            "host": "/dev/ttyUSB0",
+            "protocol": "serial",
+            "allow_serial": True,
+            "serial": {"baudrate": 115200},
+        },
+    )
+    _, spec = manager.calls[0]
+    assert isinstance(spec, OpenSpec)
+    assert spec.protocol == "serial"
+    assert spec.credentials is None
+    assert spec.serial.baudrate == 115200
+
+
+@pytest.mark.asyncio
+async def test_open_session_tool_rejects_plaintext_without_the_flag() -> None:
+    manager = FakeManager()
+    server = create_server(manager=manager)  # type: ignore[arg-type]
+    with pytest.raises(ToolError):
+        await server.call_tool(
             "open_session",
             {
                 "host": "192.0.2.2",
-                "credentials": "net",
-                "connection": "direct",
+                "credentials": {
+                    "backend": "plaintext",
+                    "username": "operator",
+                    "password": "hunter2",
+                },
             },
         )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_command_and_status_tools() -> None:
-    manager = FakeManager()
-    server = create_server(manager=manager)  # type: ignore[arg-type]
-    command = await server.call_tool(
-        "run_command", {"session_id": "session-1", "command": "show version"}
-    )
-    status = await server.call_tool("session_status", {"session_id": "session-1"})
-    assert command.structured_content["executed"] is True
-    assert status.structured_content["state"] == "ready"
-
-
-@pytest.mark.asyncio
-async def test_interactive_tools() -> None:
-    manager = FakeManager()
-    server = create_server(manager=manager)  # type: ignore[arg-type]
-
-    help_result = await server.call_tool(
-        "cli_help", {"session_id": "session-1", "line": "show "}
-    )
-    control = await server.call_tool(
-        "send_control", {"session_id": "session-1", "action": "space"}
-    )
-    response = await server.call_tool(
-        "respond", {"session_id": "session-1", "response": "y"}
-    )
-
-    assert help_result.structured_content["output"] == "completion"
-    assert control.structured_content["action"] == "space"
-    assert response.structured_content["output"] == "continued"
-    assert manager.calls == [
-        ("cli_help", ("session-1", "show ")),
-        ("send_control", ("session-1", "space")),
-        ("respond", ("session-1", "y")),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_send_control_rejects_unknown_action_before_manager_dispatch() -> None:
-    manager = FakeManager()
-    server = create_server(manager=manager)  # type: ignore[arg-type]
-
-    with pytest.raises(ToolError, match="Input should be 'space', 'q' or 'ctrl-c'"):
-        await server.call_tool(
-            "send_control", {"session_id": "session-1", "action": "ctrl-u"}
-        )
-
     assert manager.calls == []
 
 
 @pytest.mark.asyncio
-async def test_output_and_close_tools() -> None:
+async def test_open_session_tool_rejects_telnet_without_the_flag() -> None:
+    manager = FakeManager()
+    server = create_server(manager=manager)  # type: ignore[arg-type]
+    with pytest.raises(ToolError):
+        await server.call_tool(
+            "open_session",
+            {
+                "host": "192.0.2.2",
+                "protocol": "telnet",
+                "credentials": {"entry": "network/net", "username": "operator"},
+            },
+        )
+    assert manager.calls == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_tools_dispatch() -> None:
+    manager = FakeManager()
+    server = create_server(manager=manager)  # type: ignore[arg-type]
+
+    written = await server.call_tool(
+        "terminal_write", {"session_id": "session-1", "data": "ssh operator@192.0.2.10"}
+    )
+    read = await server.call_tool("terminal_read", {"session_id": "session-1"})
+    secret = await server.call_tool(
+        "terminal_write_secret", {"session_id": "session-1", "entry": "net/device-pass"}
+    )
+
+    assert written.structured_content["bytes_sent"] == len("ssh operator@192.0.2.10")
+    assert read.structured_content["output"] == "output"
+    assert secret.structured_content["entry"] == "net/device-pass"
+    assert manager.calls == [
+        ("terminal_write", ("session-1", "ssh operator@192.0.2.10", True)),
+        ("terminal_read", ("session-1", None)),
+        ("terminal_write_secret", ("session-1", "net/device-pass")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_enter_flag_is_forwarded() -> None:
+    manager = FakeManager()
+    server = create_server(manager=manager)  # type: ignore[arg-type]
+
+    await server.call_tool(
+        "terminal_write",
+        {"session_id": "session-1", "data": "\u0003", "enter": False},
+    )
+
+    assert manager.calls == [("terminal_write", ("session-1", "\u0003", False))]
+
+
+@pytest.mark.asyncio
+async def test_output_and_status_tools() -> None:
     manager = FakeManager()
     server = create_server(manager=manager)  # type: ignore[arg-type]
     output = await server.call_tool(
         "read_output", {"session_id": "session-1", "offset": 3, "limit": 10}
     )
+    status = await server.call_tool("session_status", {"session_id": "session-1"})
     closed = await server.call_tool("close_session", {"session_id": "session-1"})
     assert output.structured_content["output"] == "chunk"
+    assert status.structured_content["state"] == "ready"
     assert closed.structured_content["state"] == "closed"
 
 
 @pytest.mark.asyncio
-async def test_change_tools() -> None:
+async def test_server_ships_usage_instructions_and_resource() -> None:
     manager = FakeManager()
     server = create_server(manager=manager)  # type: ignore[arg-type]
 
-    changed = await server.call_tool(
-        "run_change",
-        {
-            "session_id": "session-1",
-            "commands": ["vlan 100"],
-        },
-    )
-    closed = await server.call_tool("close_session", {"session_id": "session-1"})
+    instructions = server.instructions or ""
+    assert "terminal_write_secret" in instructions
+    assert "authentication error is NOT a permission popup" in instructions
 
-    assert changed.structured_content["commands"][0]["command"] == "vlan 100"
-    assert closed.structured_content["state"] == "closed"
-    assert manager.calls == [
-        ("run_change", ("session-1", ["vlan 100"])),
-        ("close_session", "session-1"),
-    ]
+    resources = await server.list_resources()
+    assert any(str(resource.uri) == "network-terminal://usage" for resource in resources)
+
+    contents = await server.read_resource("network-terminal://usage")
+    manual = "".join(
+        item.content if isinstance(item.content, str) else item.content.decode()
+        for item in contents
+    )
+    assert "terminal_write_secret" in manual
+    assert "proxyjump" in manual
+    assert "close_session" in manual
+
+
+@pytest.mark.asyncio
+async def test_command_and_change_tools_are_gone() -> None:
+    manager = FakeManager()
+    server = create_server(manager=manager)  # type: ignore[arg-type]
+    gone = (
+        "run_command",
+        "run_commands",
+        "cli_help",
+        "send_control",
+        "respond",
+        "run_change",
+    )
+    for tool in gone:
+        with pytest.raises(ToolError):
+            await server.call_tool(tool, {"session_id": "session-1"})
+    assert manager.calls == []

@@ -4,27 +4,33 @@
 
 ### Unit
 
-- Валидация inventory, connection и policy schemas.
-- Разрешение target/profile без доступа к произвольной записи `pass`.
-- Redaction паролей из ошибок и audit.
-- Command policy: allow, ask, deny, переносы строк и metacharacters.
-- Session state machine, locks, timeout и output limits.
-- `cli_help` cleanup, pager/control transitions, confirmation allowlist и
-  отказ от secret prompt.
+- Валидация policy schema и inline connection specs (`OpenSpec`).
+- Connection plan: порты, route-метки, serial-параметры, warnings, запрет
+  несовместимых полей.
+- Redaction паролей из ошибок и audit; добавление секретов, введённых в сессии.
+- Raw terminal API: `terminal_write` (enter/control bytes/serial `\r`, лимит
+  размера), `terminal_read` (таймауты, offsets, truncation),
+  `terminal_write_secret` (entry вместо значения, redaction, пустая запись).
+- Session lifecycle: locks, idle/lifetime timeout, max sessions, fail-closed
+  поведение при transport error.
+- Mutable redaction и `read_output` offsets при переполнении буфера.
 - Host key store: strict unknown host, TOFU enrollment и nonstandard SSH port.
-- Transport params: построение ssh/telnet dict без `device_type`; передача
-  `sock` (SOCKS/jump), `disabled_algorithms` и timeouts в `SshTerminal`/
-  `TelnetTerminal`.
+- Transport params: построение ssh/telnet/serial dict без `device_type`;
+  передача `sock` (SOCKS/jump), `disabled_algorithms` и timeouts.
+- Гейты: `allow_telnet`, `allow_serial`, `allow_plaintext_password`, policy
+  hard-deny, валидация `pass`-entry (traversal) в spec и secret input.
+- Serial device validation: относительный путь, несуществующий путь,
+  не-символьное устройство, ошибка открытия.
 - MCP tool registration, Pydantic input validation и worker-thread dispatch.
 
 ### Transcript replay
 
-- Prompt discovery (`find_prompt`).
-- Терминальный expect-loop: `read_until_pattern` с таймаутом, `send_command`
-  с expect и strip prompt/command, overflow обратно в buffer.
-- `cli_help` без Enter и последующая очистка строки.
-- Обычная команда, длинный вывод и pager.
-- Потеря соединения на каждом этапе nested route.
+- Prompt discovery (`find_prompt`) как best-effort: отсутствие prompt не
+  ломает сессию.
+- Терминальный read-loop: `read_channel_timing` с тишиной и таймаутом,
+  ANSI/CRLF нормализация, overflow обратно в buffer.
+- Scripted SSH/Telnet/serial endpoints: login prompt, команды, pager, второй
+  `ssh` внутри сессии, password prompt для `terminal_write_secret`.
 
 ### Integration
 
@@ -38,12 +44,11 @@
 Только после явного разрешения пользователя для точных targets:
 
 - одно устройство за прогон;
-- только диагностические команды;
 - сначала console/management reachability;
 - никаких production config transitions без отдельного разрешения;
 - после теста проверить отсутствие зависших sessions.
 
-## Выполненная проверка Этапа 1
+## Выполненная проверка (Этапы 1-9)
 
 Проведена только после явного разрешения пользователя и без добавления IP,
 hostname, serial number или fingerprint в репозиторий.
@@ -54,14 +59,13 @@ hostname, serial number или fingerprint в репозиторий.
 | SNR old | Cisco-like | login, prompt detection, `show version` | пройден |
 | SNR eNOS | Cisco-like | login, prompt detection, `show version` | пройден |
 | D-Link DES | D-Link CLI | login, prompt detection, `show switch` | пройден |
-| Huawei VRP | VRP | login, prompt detection, `display version` | пройден |
-| Juniper Junos | Junos | login, prompt detection, `show version` | пройден |
+| Huawei S6730 | VRP | login, prompt detection, `display version` | пройден |
+| Juniper MX204 | Junos | login, prompt detection, `show version` | пройден |
 
-Проверялся путь `MCPServer.call_tool`: `open_session` → `run_command` →
-`read_output` → `close_session`. В Этапе 2 локальные scripted tests дополнительно
-проверяют contracts `cli_help`, `send_control` и `respond`. Полноценный stdio
-client round-trip и OpenCode registration остаются задачей Этапа 6. Pager,
-`cli_help` и device confirmation на реальном CLI еще не тестировались.
+На Этапе 9 через живой MCP подтверждены: `proxyjump` до промежуточного Linux
+хоста, `terminal_write("ssh ...")` внутри сессии, ввод пароля через
+`terminal_write_secret` и `terminal_read` уже на CLI целевого Huawei S6730.
+Адреса, usernames и fingerprints в репозиторий не записываются.
 
 ## Матрица приемки
 
@@ -69,37 +73,33 @@ client round-trip и OpenCode registration остаются задачей Эт�
 
 | Проверка | Ожидаемый результат |
 | --- | --- |
-| Login | prompt определен, секрет не залогирован |
-| Prompt detection | prompt распознан, вывод установился |
-| `cli_help` | подсказка прочитана, строка отменена, prompt восстановлен |
-| Single command | вывод завершен по prompt |
-| Multiple commands | одна TCP/terminal session |
-| Long output | pager обработан, лимит соблюден |
-| Invalid command | ошибка возвращена, session остается ready |
-| Close | соединение и hops закрыты |
+| Login | prompt определён или сессия остаётся ready с warning, секрет не залогирован |
+| Prompt detection | best-effort, не блокирует raw I/O |
+| Second hop | `ssh`/`telnet` в сессии доходит до CLI, пароль через `terminal_write_secret` |
+| Single command | вывод получен через `terminal_read`, offsets корректны |
+| Multiple commands | одна terminal session |
+| Long output | pager листается `terminal_write`, buffer не теряет offsets |
+| Invalid command | ошибка видна в выводе, session остаётся ready |
+| Close | соединение и jump client закрыты |
 
 ## Обязательные негативные тесты
 
-- Попытка передать пароль в ad-hoc target.
-- Произвольное имя записи `pass` из MCP argument.
-- Command chaining через `;`, `&&`, newline или carriage return.
-- Переход в config mode при read-only policy.
-- Неизвестный confirmation prompt.
-- Telnet без explicit allow.
-- Legacy algorithms для host вне профиля.
+- Попытка передать неизвестное поле или plaintext-пароль без флага.
+- `pass`-entry с traversal (`..`, абсолютный путь) в spec и secret input.
+- Telnet/serial без явного флага и при policy hard-deny.
+- Plaintext credentials при policy hard-deny.
+- Legacy algorithms при policy hard-deny.
 - Невозможность записи audit-файла.
-- Transcript/output path traversal.
-- `run_change` с structural hazard в команде.
-- `run_change` с пустым списком команд.
-- `run_change` останавливается на первой упавшей команде (остальные не
-  выполняются).
-- `run_change` без живой сессии (после рестарта) — fail-closed.
-- Change-команда с pager/confirmation prompt.
+- `terminal_write` при failed session и transport error → fail-closed.
+- `terminal_read` с timeout вне границ.
+- `terminal_write_secret` с пустым значением записи.
+- Serial с относительным путём, несуществующим устройством и не-символьным
+  устройством.
 - SOCKS5 с требующейся авторизацией прокси.
 - SOCKS5 с не-IP target.
 - SOCKS5 при недоступном прокси/цели.
-- `proxyjump` с `socks` и `jump_host` одновременно.
-- Ad-hoc без `default_credentials`/`default_connection`.
+- Несовместимые route/protocol комбинации (socks+telnet, console+route,
+  serial+route).
 
 ## Команды проверки
 

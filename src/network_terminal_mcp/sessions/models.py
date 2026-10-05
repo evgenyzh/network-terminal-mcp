@@ -1,21 +1,15 @@
-"""Data models for managed terminal sessions."""
+"""Data models for managed raw terminal sessions."""
 
 from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from network_terminal_mcp.config.models import Action
-
 
 class SessionState(StrEnum):
-    CONNECTING = "connecting"
     READY = "ready"
-    PAGING = "paging"
-    AWAITING_RESPONSE = "awaiting_response"
     FAILED = "failed"
     CLOSING = "closing"
     CLOSED = "closed"
@@ -27,9 +21,9 @@ class SessionInfo(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     session_id: str
-    target: str
+    route: str
     host: str
-    prompt: str
+    prompt: str = ""
     state: SessionState
     created_at: datetime
     last_used_at: datetime
@@ -37,7 +31,7 @@ class SessionInfo(BaseModel):
 
 
 class TerminalOutput(BaseModel):
-    """Output and pending terminal interaction metadata."""
+    """A bounded slice of freshly read terminal output."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -46,40 +40,28 @@ class TerminalOutput(BaseModel):
     truncated: bool = False
     output_offset: int | None = None
     next_output_offset: int | None = None
-    pager_active: bool = False
-    response_required: bool = False
-    device_prompt: str | None = None
-    allowed_responses: list[str] = Field(default_factory=list)
 
 
-class CommandResult(TerminalOutput):
-    """Result of an attempted single CLI command."""
+class TerminalWriteResult(BaseModel):
+    """Result of writing raw input to a session."""
 
-    command: str
-    policy: Action
-    executed: bool
-    confirmation_required: bool = False
+    model_config = ConfigDict(frozen=True)
 
-
-class CliHelpResult(TerminalOutput):
-    """Result of a non-executing CLI help request."""
-
-    line: str
-    policy: Action
-    executed: bool
-    confirmation_required: bool = False
+    session_id: str
+    data: str
+    bytes_sent: int
+    state: SessionState
 
 
-class ControlResult(TerminalOutput):
-    """Result of a state-bound terminal control action."""
+class TerminalSecretResult(BaseModel):
+    """Result of writing a pass-referenced secret; never contains the secret."""
 
-    action: Literal["space", "q", "ctrl-c"]
+    model_config = ConfigDict(frozen=True)
 
-
-class ResponseResult(TerminalOutput):
-    """Result of an allowlisted response to a device confirmation prompt."""
-
-    response: str
+    session_id: str
+    entry: str
+    bytes_sent: int
+    state: SessionState
 
 
 class OutputChunk(BaseModel):

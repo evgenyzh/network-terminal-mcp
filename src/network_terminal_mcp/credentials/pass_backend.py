@@ -1,12 +1,13 @@
-"""Credential retrieval from the ``pass`` password store.
+"""Credential retrieval from ``pass``, explicit key files, and plaintext.
 
-Secrets live in GPG-encrypted ``pass`` entries, never in MCP arguments or
-results. The server shells out to ``pass`` without interpolation, so the entry
-name is always taken from local configuration rather than model input.
+Secrets live in GPG-encrypted ``pass`` entries or explicit local key files;
+plaintext passwords are an explicit insecure opt-in. The server shells out to
+``pass`` without a shell, so an entry name can never become a command. Entry
+names are validated by :class:`~network_terminal_mcp.config.models.CredentialSpec`
+before reaching this module.
 
-The entry's first line is the password. The non-secret AAA username belongs to
-the local credential profile, so it can be changed independently of the
-password-store entry.
+The entry's first line is the password. The non-secret AAA username is part of
+the credential spec, so it can be changed independently of the store entry.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
-from network_terminal_mcp.config.models import CredentialProfile
+from network_terminal_mcp.config.models import CredentialSpec
 from network_terminal_mcp.errors import CredentialError
 
 _PASS_BINARY = "pass"
@@ -48,34 +49,47 @@ def parse_entry(content: str) -> str:
 
 
 class PassBackend:
-    """Resolve password-store and explicitly configured SSH key profiles."""
+    """Resolve pass entries, explicit SSH keys, and plaintext credentials."""
 
     def __init__(self, binary: str | None = None) -> None:
-        self._binary = binary or require_pass_binary()
+        # ``pass`` is located lazily so key-only or plaintext-only setups do
+        # not require the binary to be installed.
+        self._binary = binary
 
-    def resolve(self, profile: CredentialProfile) -> Credentials:
-        """Return credentials for ``profile``, raising on any failure."""
-        if profile.backend == "ssh_key":
-            assert profile.key_file is not None
-            if not profile.key_file.is_file():
-                raise CredentialError(f"SSH key file does not exist: {profile.key_file}")
+    def resolve(self, spec: CredentialSpec) -> Credentials:
+        """Return credentials for ``spec``, raising on any failure."""
+        if spec.backend == "plaintext":
+            assert spec.password is not None
+            return Credentials(
+                username=spec.username,
+                password=spec.password.get_secret_value(),
+            )
+        if spec.backend == "ssh_key":
+            assert spec.key_file is not None
+            if not spec.key_file.is_file():
+                raise CredentialError(f"SSH key file does not exist: {spec.key_file}")
             passphrase = (
-                self._read_entry(profile.key_passphrase_entry)
-                if profile.key_passphrase_entry is not None
+                self._read_entry(spec.key_passphrase_entry)
+                if spec.key_passphrase_entry is not None
                 else None
             )
             return Credentials(
-                username=profile.username,
-                key_file=str(profile.key_file),
+                username=spec.username,
+                key_file=str(spec.key_file),
                 key_passphrase=passphrase,
             )
-        password = self._read_entry(profile.entry or "")
-        return Credentials(username=profile.username, password=password)
+        password = self._read_entry(spec.entry or "")
+        return Credentials(username=spec.username, password=password)
+
+    def read_entry(self, entry: str) -> str:
+        """Return one ``pass`` entry's secret value for the secret input tool."""
+        return self._read_entry(entry)
 
     def _read_entry(self, entry: str) -> str:
+        binary = self._binary or require_pass_binary()
         try:
             completed = subprocess.run(
-                [self._binary, "show", entry],
+                [binary, "show", entry],
                 check=False,
                 capture_output=True,
                 text=True,

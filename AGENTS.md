@@ -6,7 +6,11 @@
 - `docs/architecture.md` is the technical source of truth.
 - `docs/development-plan.md` lists ordered milestones and exit criteria.
 - `docs/security.md` contains mandatory safety requirements.
-- Files under `config/` are examples only and must never contain real addresses or secrets.
+- `src/network_terminal_mcp/usage.md` is the model-facing manual shipped as MCP
+  `instructions` + the `network-terminal://usage` resource; keep it in sync with
+  `usage.py` and the OpenCode skill.
+- There are no example config files: connections are model-described inline. Never commit real
+  addresses, hostnames, or secrets anywhere in the repository.
 
 ## Safety Rules
 
@@ -14,24 +18,34 @@
   addresses to this repository.
 - Never run integration tests against real network devices without explicit user approval for the
   exact targets and commands.
-- Read-only diagnostics are the initial scope. Do not expose configuration writes through a generic
-  command tool.
-- Keep legacy SSH algorithms scoped to explicit hosts or connection profiles. Never weaken global
+- Sessions are raw interactive terminals: the model may type any command, including configuration
+  entry. The safety boundary is the client permission gate on `open_session` (and optionally on
+  `terminal_write`), the audited input, and the operator's AAA policy — not command allowlists.
+- Secrets typed at a live prompt must go through `terminal_write_secret` (a `pass` entry reference);
+  its value must never appear in tool arguments, results, or audit. Plain `terminal_write` is
+  logged verbatim and must not be used for secrets.
+- Keep legacy SSH algorithms scoped to explicit per-call host allowlists. Never weaken global
   SSH settings.
-- Telnet must be explicitly enabled per device or connection profile and clearly marked insecure.
+- Telnet, TCP console, and local serial must be explicitly enabled per call (`allow_telnet=true`,
+  `allow_serial=true`) and clearly marked insecure; policy can hard-deny them.
 - Audit failures are fail-closed: if an action cannot be recorded, it must not be executed.
 - Secret retrieval is internal to the server. MCP tool arguments and results must not contain
-  passwords.
+  passwords, except an explicit plaintext opt-in behind `allow_plaintext_password`, which is never
+  stored, never audited, and always marked insecure. References (`pass` entry, key file) are the
+  default.
 
 ## Engineering Rules
 
 - Use Python 3.12+ and `uv`.
-- Terminal transport is implemented directly on Paramiko (SSH) and telnetlib3
-  (Telnet/console) in `src/network_terminal_mcp/terminal.py`. Do not reintroduce
-  a vendor-driver abstraction; the model identifies the device type from output.
+- Terminal transport is implemented directly on Paramiko (SSH), telnetlib3
+  (Telnet/TCP console), and pyserial (local serial) in
+  `src/network_terminal_mcp/terminal.py`. Do not reintroduce a vendor-driver
+  abstraction or nested connection routes; the model identifies the device type
+  from output and performs further ssh/telnet hops itself with `terminal_write`.
 - Keep command knowledge out of the transport layer. The transport handles
   writes, reads, prompt detection, and timeouts only.
-- Validate configuration with Pydantic before opening any network connection.
+- Validate the connection spec and policy with Pydantic before opening any
+  network connection.
 - Use structured errors and redact secrets before logging or returning failures.
 
 ## Planned Verification

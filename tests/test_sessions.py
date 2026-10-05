@@ -1,72 +1,47 @@
-"""Unit tests for direct SSH session management."""
+"""Unit tests for raw terminal session management."""
 
 from __future__ import annotations
 
-import re
+import json
 from pathlib import Path
 
+import paramiko
 import pytest
+from pydantic import ValidationError
 
 from network_terminal_mcp.config.loader import AppConfig
 from network_terminal_mcp.config.models import (
-    ConnectionsConfig,
-    CredentialProfile,
-    CredentialsConfig,
-    InventoryConfig,
+    CredentialSpec,
+    OpenSpec,
     PolicyConfig,
 )
 from network_terminal_mcp.credentials.pass_backend import Credentials
-from network_terminal_mcp.errors import PolicyError, SessionError, TransportError
+from network_terminal_mcp.errors import SessionError, TransportError
 from network_terminal_mcp.host_keys import HostKeyStatus
-from network_terminal_mcp.sessions import SessionManager, SessionState
+from network_terminal_mcp.sessions import SessionInfo, SessionManager, SessionState
+from network_terminal_mcp.terminal import TerminalConnection
 
 
 class FakeConnection:
     def __init__(self) -> None:
-        self.commands: list[str] = []
-        self.expect_patterns: list[str] = []
         self.writes: list[str] = []
-        self.command_outputs: dict[str, str] = {}
-        self.read_outputs: list[str] = []
         self.timing_output = ""
-        self.read_error: Exception | None = None
         self.timing_error: Exception | None = None
-        self.read_timeouts: list[float] = []
+        self.write_error: Exception | None = None
         self.timing_timeouts: list[float] = []
+        self.prompt = "switch#"
+        self.prompt_error: Exception | None = None
         self.disconnected = False
 
     def find_prompt(self) -> str:
-        return "switch#"
-
-    def send_command(
-        self,
-        command_string: str,
-        *,
-        expect_string: str | None = None,
-        read_timeout: float,
-        strip_prompt: bool = True,
-        strip_command: bool = True,
-        cmd_verify: bool = True,
-    ) -> str:
-        self.commands.append(command_string)
-        if expect_string is not None:
-            self.expect_patterns.append(expect_string)
-        if command_string in self.command_outputs:
-            return self.command_outputs[command_string]
-        if command_string == "show long":
-            return "x" * 40 + "switch#"
-        return f"output for {command_string}switch#"
+        if self.prompt_error is not None:
+            raise self.prompt_error
+        return self.prompt
 
     def write_channel(self, out_data: str) -> None:
+        if self.write_error is not None:
+            raise self.write_error
         self.writes.append(out_data)
-
-    def read_until_pattern(self, pattern: str, *, read_timeout: float) -> str:
-        self.read_timeouts.append(read_timeout)
-        if self.read_error is not None:
-            raise self.read_error
-        if self.read_outputs:
-            return self.read_outputs.pop(0)
-        return "switch#"
 
     def read_channel_timing(self, *, last_read: float, read_timeout: float) -> str:
         self.timing_timeouts.append(read_timeout)
@@ -126,16 +101,32 @@ class FakeJumpClient:
 
 
 class FakeCredentials:
-    def resolve(self, profile: CredentialProfile) -> Credentials:
-        if profile.backend == "ssh_key":
-            return Credentials(username=profile.username, key_file=str(profile.key_file))
-        if profile.username == "term-operator":
-            password = "intermediate-secret"
-        elif profile.username == "jump-operator":
+    def __init__(self) -> None:
+        self.resolved: list[CredentialSpec] = []
+        self.read_entries: list[str] = []
+        self.entries: dict[str, str] = {"network/secret": "typed-secret"}
+
+    def resolve(self, spec: CredentialSpec) -> Credentials:
+        self.resolved.append(spec)
+        if spec.backend == "ssh_key":
+            return Credentials(
+                username=spec.username,
+                key_file=f"/resolved/{spec.key_file}",
+            )
+        if spec.backend == "plaintext":
+            assert spec.password is not None
+            return Credentials(
+                username=spec.username, password=spec.password.get_secret_value()
+            )
+        if spec.username == "jump-operator":
             password = "jump-secret"
         else:
             password = "hunter2"
-        return Credentials(username=profile.username, password=password)
+        return Credentials(username=spec.username, password=password)
+
+    def read_entry(self, entry: str) -> str:
+        self.read_entries.append(entry)
+        return self.entries.get(entry, "")
 
 
 class FakeAudit:
@@ -182,136 +173,77 @@ class MutableClock:
         return self.value
 
 
-def _config(
+def _policy(
     *,
-    proxyjump: bool = False,
-    socks: bool = False,
-    jump_key: bool = False,
-    nested: bool = False,
-    nested_telnet: bool = False,
-    telnet: bool = False,
-    allow_telnet: bool = False,
-    console: bool = False,
-    **runtime: object,
-) -> AppConfig:
-    if socks:
-        connection_name = "through-socks"
-    elif proxyjump:
-        connection_name = "through-jump"
-    elif nested or nested_telnet:
-        connection_name = "nested-term"
-    elif console:
-        connection_name = "console"
-    elif telnet:
-        connection_name = "direct-telnet"
-    else:
-        connection_name = "direct"
-    connections: dict[str, object] = {
-        "direct": {"type": "direct", "protocol": "ssh"}
-    }
-    credentials: dict[str, object] = {
-        "net": {"backend": "pass", "entry": "network/net", "username": "operator"}
-    }
-    if socks:
-        connections["through-socks"] = {
-            "type": "proxyjump",
-            "socks": {"host": "127.0.0.1", "port": 10900},
-            "host_key_policy": "accept_new",
+    allow_telnet: bool = True,
+    allow_plaintext_password: bool = True,
+    allow_legacy_algorithms: bool = True,
+    allow_serial: bool = True,
+    runtime: dict[str, object] | None = None,
+) -> PolicyConfig:
+    return PolicyConfig.model_validate(
+        {
+            "defaults": {
+                "allow_telnet": allow_telnet,
+                "allow_plaintext_password": allow_plaintext_password,
+                "allow_legacy_algorithms": allow_legacy_algorithms,
+                "allow_serial": allow_serial,
+            },
+            "runtime": runtime or {},
         }
-    if proxyjump:
-        connections["through-jump"] = {
-            "type": "proxyjump",
-            "jump_host": "192.0.2.254",
-            "jump_credentials": "jump",
-        }
-        credentials["jump"] = (
-            {
-                "backend": "ssh_key",
-                "key_file": "/tmp/jump-key",
-                "username": "jump-operator",
-            }
-            if jump_key
-            else {
-                "backend": "pass",
-                "entry": "network/jump",
-                "username": "jump-operator",
-            }
-        )
-    if nested or nested_telnet:
-        connections["nested-term"] = {
-            "type": "nested",
-            "host": "192.0.2.254",
-            "protocol": "ssh",
-            "credentials": "intermediate",
-            "next_protocol": "telnet" if nested_telnet else "ssh",
-        }
-        credentials["intermediate"] = {
-            "backend": "pass",
-            "entry": "network/intermediate",
-            "username": "term-operator",
-        }
-    if telnet:
-        connections["direct-telnet"] = {
-            "type": "direct",
-            "protocol": "telnet",
-            "host_key_policy": "strict",
-        }
-    if console:
-        connections["console"] = {
-            "type": "console",
-            "port": 2002,
-        }
-    inventory_devices = {
-        "sw1": {
-            "host": "192.0.2.1",
-            "credentials": "net",
-            "connection": connection_name,
-        }
-    }
-    if allow_telnet:
-        inventory_devices["sw1"]["allow_telnet"] = True  # type: ignore[index]
-    policy_data: dict[str, object] = {
-        "rules": [{"id": "show", "action": "allow", "command_patterns": ["show *"]}],
-        "runtime": runtime,
-    }
-    if telnet or nested_telnet or console:
-        policy_data["defaults"] = {"telnet": "allow"}
-    return AppConfig(
-        inventory=InventoryConfig.model_validate(
-            {"devices": inventory_devices}
-        ),
-        connections=ConnectionsConfig.model_validate(
-            {"connections": connections}
-        ),
-        credentials=CredentialsConfig.model_validate(
-            {
-                "credentials": credentials
-            }
-        ),
-        policy=PolicyConfig.model_validate(policy_data),
-        config_dir=Path("."),
     )
 
 
+def _config(*, policy: PolicyConfig | None = None) -> AppConfig:
+    return AppConfig(policy=policy or _policy(), config_dir=Path("."))
+
+
+def _credentials(
+    username: str = "operator", entry: str = "network/net"
+) -> dict[str, object]:
+    return {"backend": "pass", "entry": entry, "username": username}
+
+
+def _spec(**overrides: object) -> OpenSpec:
+    data: dict[str, object] = {"host": "192.0.2.1", "credentials": _credentials()}
+    data.update(overrides)
+    return OpenSpec.model_validate(data)
+
+
+def _open(manager: SessionManager, **overrides: object) -> SessionInfo:
+    return manager.open_session(_spec(**overrides))
+
+
+def _jump_route(*, key: bool = False) -> dict[str, object]:
+    credentials: dict[str, object] = (
+        {
+            "backend": "ssh_key",
+            "key_file": "/tmp/jump-key",
+            "username": "jump-operator",
+        }
+        if key
+        else _credentials("jump-operator", "network/jump")
+    )
+    return {"type": "proxyjump", "host": "192.0.2.254", "credentials": credentials}
+
+
+def _socks_route() -> dict[str, object]:
+    return {"type": "socks", "host": "127.0.0.1", "port": 10900}
+
+
 def _manager(
-    connection: FakeConnection,
+    connection: TerminalConnection,
     audit: FakeAudit,
     clock: MutableClock | None = None,
     *,
-    allow_telnet: bool = False,
-    telnet: bool = False,
-    console: bool = False,
+    policy: PolicyConfig | None = None,
+    credentials: FakeCredentials | None = None,
     **runtime: object,
 ) -> SessionManager:
     return SessionManager(
-        _config(
-            allow_telnet=allow_telnet,
-            telnet=telnet,
-            console=console,
-            **runtime,
-        ),
+        _config(policy=policy or _policy(runtime=runtime)),
         connection_factory=lambda params: connection,
-        credential_resolver=FakeCredentials(),
+        credential_resolver=credentials or FakeCredentials(),
         audit_logger=audit,  # type: ignore[arg-type]
         host_keys=FakeHostKeys(),  # type: ignore[arg-type]
         clock=clock or MutableClock(),
@@ -326,7 +258,6 @@ def _proxy_manager(
     connection_error: Exception | None = None,
     clock: MutableClock | None = None,
     host_keys: FakeHostKeys | None = None,
-    jump_key: bool = False,
 ) -> tuple[SessionManager, FakeHostKeys, list[dict[str, object]]]:
     resolved_host_keys = host_keys or FakeHostKeys()
     params: list[dict[str, object]] = []
@@ -338,12 +269,12 @@ def _proxy_manager(
         return connection
 
     manager = SessionManager(
-        _config(proxyjump=True, jump_key=jump_key),
+        _config(),
         connection_factory=factory,
         credential_resolver=FakeCredentials(),
         audit_logger=audit,  # type: ignore[arg-type]
         host_keys=resolved_host_keys,  # type: ignore[arg-type]
-        jump_client_factory=lambda: jump_client,  # type: ignore[arg-type]
+        jump_client_factory=lambda: jump_client,  # type: ignore[arg-type,return-value]
         clock=clock or MutableClock(),
     )
     return manager, resolved_host_keys, params
@@ -367,7 +298,7 @@ def _socks_manager(
         return connection
 
     manager = SessionManager(
-        _config(socks=True),
+        _config(),
         connection_factory=factory,
         credential_resolver=FakeCredentials(),
         audit_logger=audit,  # type: ignore[arg-type]
@@ -377,42 +308,82 @@ def _socks_manager(
     return manager, resolved_host_keys, params
 
 
-def _nested_manager(
-    connection: FakeConnection,
-    audit: FakeAudit,
-    *,
-    connection_error: Exception | None = None,
-    host_keys: FakeHostKeys | None = None,
-    clock: MutableClock | None = None,
-    nested_telnet: bool = False,
-) -> tuple[SessionManager, FakeHostKeys, list[dict[str, object]]]:
-    resolved_host_keys = host_keys or FakeHostKeys()
+# ---------------------------------------------------------------------------
+# open_session
+# ---------------------------------------------------------------------------
+
+
+def test_open_session_uses_factory_and_reports_route() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit())
+    info = _open(manager)
+    assert info.state is SessionState.READY
+    assert info.prompt == "switch#"
+    assert info.route == "direct"
+    assert info.host == "192.0.2.1"
+
+
+def test_direct_ssh_transport_params() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
     params: list[dict[str, object]] = []
 
     def factory(connection_params: dict[str, object]) -> FakeConnection:
         params.append(connection_params)
-        if connection_error is not None:
-            raise connection_error
         return connection
 
     manager = SessionManager(
-        _config(nested=True, nested_telnet=nested_telnet, allow_telnet=True),
+        _config(),
         connection_factory=factory,
         credential_resolver=FakeCredentials(),
         audit_logger=audit,  # type: ignore[arg-type]
-        host_keys=resolved_host_keys,  # type: ignore[arg-type]
-        clock=clock or MutableClock(),
+        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
     )
-    return manager, resolved_host_keys, params
+    _open(manager)
+
+    assert params[0]["transport"] == "ssh"
+    assert params[0]["host"] == "192.0.2.1"
+    assert params[0]["port"] == 22
+    assert params[0]["username"] == "operator"
+    assert params[0]["password"] == "hunter2"
+    assert params[0]["known_hosts_file"] == "/tmp/known_hosts"
+    assert "sock" not in params[0]
+    assert audit.records[0]["route"] == "direct"
+    assert audit.records[0]["username"] == "operator"
 
 
-
-def test_open_session_resolves_alias_and_uses_factory() -> None:
+def test_prompt_failure_keeps_the_session_usable() -> None:
     connection = FakeConnection()
+    connection.prompt_error = TransportError("unable to find the device prompt")
     manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
+
+    info = _open(manager)
+
     assert info.state is SessionState.READY
-    assert info.prompt == "switch#"
+    assert info.prompt == ""
+    assert any("prompt not detected" in warning for warning in info.warnings)
+
+
+def test_legacy_algorithms_become_disabled_algorithms() -> None:
+    connection = FakeConnection()
+    params: list[dict[str, object]] = []
+
+    def factory(connection_params: dict[str, object]) -> FakeConnection:
+        params.append(connection_params)
+        return connection
+
+    manager = SessionManager(
+        _config(),
+        connection_factory=factory,
+        credential_resolver=FakeCredentials(),
+        audit_logger=FakeAudit(),  # type: ignore[arg-type]
+        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
+    )
+    _open(manager, legacy={"ciphers": ["aes128-cbc"]})
+
+    disabled = params[0]["disabled_algorithms"]
+    assert isinstance(disabled, dict)
+    assert "aes128-cbc" not in disabled["ciphers"]
 
 
 def test_proxyjump_uses_a_forwarded_socket_and_closes_the_jump_client() -> None:
@@ -421,7 +392,7 @@ def test_proxyjump_uses_a_forwarded_socket_and_closes_the_jump_client() -> None:
     audit = FakeAudit()
     manager, host_keys, params = _proxy_manager(connection, jump_client, audit)
 
-    info = manager.open_session("sw1")
+    info = _open(manager, route=_jump_route())
 
     assert host_keys.calls == [
         ("192.0.2.254", 22, "strict", False),
@@ -459,7 +430,7 @@ class FakeSocket:
         return -1
 
 
-def test_socks_proxyjump_reaches_target_through_a_socks_socket(
+def test_socks_route_reaches_target_through_a_socks_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = FakeConnection()
@@ -485,54 +456,16 @@ def test_socks_proxyjump_reaches_target_through_a_socks_socket(
     )
     manager, _, params = _socks_manager(connection, audit, host_keys=host_keys)
 
-    info = manager.open_session("sw1")
+    info = _open(manager, route=_socks_route(), host_key_policy="accept_new")
 
     assert host_keys.calls == [("192.0.2.1", 22, "accept_new", True)]
-    assert socks_targets == [(("192.0.2.1", 22, 60.0))]
+    assert socks_targets == [("192.0.2.1", 22, 60.0)]
     assert params[0]["host"] == "192.0.2.1"
     assert params[0]["sock"] is fake_socket
     assert audit.records[0]["route"] == "socks"
 
     manager.close_session(info.session_id)
     assert connection.disconnected is True
-
-
-def test_socks_proxyjump_does_not_connect_an_ssh_bastion() -> None:
-    connection = FakeConnection()
-    audit = FakeAudit()
-    manager, _, params = _socks_manager(connection, audit)
-
-    info = manager.open_session("sw1")
-
-    assert params[0]["sock"] is not None
-    # No jump client is created for the socks-only route.
-    assert "jump_client" not in params[0]
-
-    manager.close_session(info.session_id)
-    connection = FakeConnection()
-    jump_client = FakeJumpClient()
-    manager, _, _ = _proxy_manager(
-        connection,
-        jump_client,
-        FakeAudit(),
-        jump_key=True,
-    )
-
-    info = manager.open_session("sw1")
-
-    assert jump_client.connect_kwargs == {
-        "hostname": "192.0.2.254",
-        "port": 22,
-        "username": "jump-operator",
-        "key_filename": "/tmp/jump-key",
-        "passphrase": None,
-        "timeout": 60.0,
-        "banner_timeout": 60.0,
-        "auth_timeout": 60.0,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
-    manager.close_session(info.session_id)
 
 
 def test_proxyjump_probes_an_unenrolled_target_through_a_separate_channel(
@@ -552,7 +485,7 @@ def test_proxyjump_probes_an_unenrolled_target_through_a_separate_channel(
         host_keys=host_keys,
     )
 
-    info = manager.open_session("sw1")
+    info = _open(manager, route=_jump_route())
 
     assert len(jump_client.transport.channels) == 2
     manager.close_session(info.session_id)
@@ -569,7 +502,7 @@ def test_proxyjump_closes_the_jump_client_when_target_connection_fails() -> None
     )
 
     with pytest.raises(TransportError, match="target login failed") as error:
-        manager.open_session("sw1")
+        _open(manager, route=_jump_route())
 
     assert "hunter2" not in str(error.value)
     assert "jump-secret" not in str(error.value)
@@ -582,10 +515,43 @@ def test_proxyjump_closes_the_jump_client_when_bastion_login_fails() -> None:
     manager, _, _ = _proxy_manager(FakeConnection(), jump_client, FakeAudit())
 
     with pytest.raises(TransportError, match="bastion login failed") as error:
-        manager.open_session("sw1")
+        _open(manager, route=_jump_route())
 
     assert "jump-secret" not in str(error.value)
     assert jump_client.closed is True
+
+
+def test_proxyjump_reports_jump_authentication_failure_clearly() -> None:
+    jump_client = FakeJumpClient()
+    jump_client.connect_error = paramiko.AuthenticationException("Authentication failed.")
+    audit = FakeAudit()
+    manager, _, _ = _proxy_manager(FakeConnection(), jump_client, audit)
+
+    with pytest.raises(TransportError, match="jump host authentication failed") as error:
+        _open(manager, route=_jump_route())
+
+    assert "jump-operator@192.0.2.254:22" in str(error.value)
+    assert "permission gate was not the problem" in str(error.value)
+    assert jump_client.closed is True
+    assert "jump host authentication failed" in str(audit.records[-1]["error"])
+
+
+def test_proxyjump_reports_final_target_authentication_failure_clearly() -> None:
+    jump_client = FakeJumpClient()
+    manager, _, _ = _proxy_manager(
+        FakeConnection(),
+        jump_client,
+        FakeAudit(),
+        connection_error=paramiko.AuthenticationException("Authentication failed."),
+    )
+
+    with pytest.raises(
+        TransportError, match="authentication failed for final target"
+    ) as error:
+        _open(manager, route=_jump_route())
+
+    assert "operator@192.0.2.1:22" in str(error.value)
+    assert "permission gate was not the problem" in str(error.value)
 
 
 def test_proxyjump_closes_the_jump_client_when_a_session_expires() -> None:
@@ -598,9 +564,9 @@ def test_proxyjump_closes_the_jump_client_when_a_session_expires() -> None:
         FakeAudit(),
         clock=clock,
     )
-    info = manager.open_session("sw1")
+    info = _open(manager, route=_jump_route())
 
-    clock.value = 301
+    clock.value = 100_000
     with pytest.raises(SessionError, match="unknown or expired session"):
         manager.session_status(info.session_id)
 
@@ -608,114 +574,24 @@ def test_proxyjump_closes_the_jump_client_when_a_session_expires() -> None:
     assert jump_client.closed is True
 
 
-def test_nested_connects_to_the_intermediate_host_and_reads_the_target() -> None:
+def test_console_requires_an_explicit_port_at_spec_validation() -> None:
+    with pytest.raises(ValidationError, match="console protocol requires"):
+        _spec(protocol="console", allow_telnet=True)
+
+
+def test_telnet_policy_hard_deny() -> None:
     connection = FakeConnection()
-    audit = FakeAudit()
-    manager, host_keys, params = _nested_manager(connection, audit)
-
-    info = manager.open_session("sw1")
-
-    assert host_keys.calls == [("192.0.2.254", 22, "strict", False)]
-    assert params[0]["transport"] == "ssh"
-    assert params[0]["host"] == "192.0.2.254"
-    assert params[0]["username"] == "term-operator"
-    assert params[0]["password"] == "intermediate-secret"
-    assert "sock" not in params[0]
-    assert info.prompt == "switch#"
-    assert audit.records[0]["route"] == "nested"
-    assert any(w == "nested SSH uses the intermediate host's SSH client"
-               for w in info.warnings)
-
-    manager.close_session(info.session_id)
-    assert connection.disconnected is True
-
-
-def test_nested_login_sends_the_ssh_command_and_target_password() -> None:
-    connection = FakeConnection()
-    manager, _, _ = _nested_manager(connection, FakeAudit())
-
-    manager.open_session("sw1")
-
-    assert connection.writes == [
-        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null operator@192.0.2.1\n",
-        "hunter2\n",
-    ]
-    assert connection.read_timeouts == [60.0]
-
-
-def test_nested_telnet_login_sends_telnet_command_and_credentials() -> None:
-    connection = FakeConnection()
-    manager, _, _ = _nested_manager(connection, FakeAudit(), nested_telnet=True)
-
-    info = manager.open_session("sw1")
-
-    assert connection.writes == [
-        "telnet 192.0.2.1\n",
-        "operator\n",
-        "hunter2\n",
-    ]
-    assert connection.read_timeouts == [60.0, 60.0]
-    assert any(
-        "nested Telnet transmits credentials and traffic in cleartext"
-        for warning in info.warnings
+    manager = _manager(
+        connection, FakeAudit(), policy=_policy(allow_telnet=False)
     )
 
-
-def test_direct_telnet_requires_allow_telnet_on_the_device() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit(), telnet=True, allow_telnet=False)
-
-    with pytest.raises(TransportError, match="allow_telnet"):
-        manager.open_session("sw1")
+    with pytest.raises(TransportError, match="Telnet is disabled by policy defaults"):
+        _open(manager, protocol="telnet", allow_telnet=True)
     assert connection.disconnected is False
-
-
-def test_direct_telnet_requires_policy_allow() -> None:
-    connections = ConnectionsConfig.model_validate(
-        {
-            "connections": {
-                "direct-telnet": {"type": "direct", "protocol": "telnet"}
-            }
-        }
-    )
-    manager = SessionManager(
-        AppConfig(
-            inventory=InventoryConfig.model_validate(
-                {
-                    "devices": {
-                        "sw1": {
-                            "host": "192.0.2.1",
-                            "credentials": "net",
-                            "connection": "direct-telnet",
-                            "allow_telnet": True,
-                        }
-                    }
-                }
-            ),
-            connections=connections,
-            credentials=CredentialsConfig.model_validate(
-                {
-                    "credentials": {
-                        "net": {"backend": "pass", "entry": "network/net",
-                                 "username": "operator"},
-                    }
-                }
-            ),
-            policy=PolicyConfig.model_validate({}),
-            config_dir=Path("."),
-        ),
-        credential_resolver=FakeCredentials(),
-        audit_logger=FakeAudit(),  # type: ignore[arg-type]
-        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
-    )
-
-    with pytest.raises(TransportError, match="Telnet is denied"):
-        manager.open_session("sw1")
 
 
 def test_direct_telnet_uses_the_telnet_driver_without_host_key_check() -> None:
     connection = FakeConnection()
-    audit = FakeAudit()
     host_keys = FakeHostKeys()
     params: list[dict[str, object]] = []
 
@@ -724,721 +600,337 @@ def test_direct_telnet_uses_the_telnet_driver_without_host_key_check() -> None:
         return connection
 
     manager = SessionManager(
-        _config(telnet=True, allow_telnet=True),
+        _config(),
         connection_factory=factory,
         credential_resolver=FakeCredentials(),
-        audit_logger=audit,  # type: ignore[arg-type]
+        audit_logger=FakeAudit(),  # type: ignore[arg-type]
         host_keys=host_keys,  # type: ignore[arg-type]
     )
 
-    info = manager.open_session("sw1")
+    info = _open(manager, protocol="telnet", allow_telnet=True, port=2323)
 
-    assert params[0]["transport"] == "telnet"
-    assert params[0]["port"] == 23
-    assert params[0]["password"] == "hunter2"
-    assert "sock" not in params[0]
     assert host_keys.calls == []
-    assert info.prompt == "switch#"
-    assert any("Telnet transmits credentials and traffic in cleartext"
-               for warning in info.warnings)
-    assert audit.records[0]["route"] == "telnet"
-
-    manager.close_session(info.session_id)
-    assert connection.disconnected is True
-
-
-def test_direct_telnet_uses_a_custom_port() -> None:
-    connection = FakeConnection()
-    params: list[dict[str, object]] = []
-
-    def factory(connection_params: dict[str, object]) -> FakeConnection:
-        params.append(connection_params)
-        return connection
-
-    connections = ConnectionsConfig.model_validate(
-        {
-            "connections": {
-                "direct-telnet": {"type": "direct", "protocol": "telnet", "port": 2002}
-            }
-        }
-    )
-    manager = SessionManager(
-        AppConfig(
-            inventory=InventoryConfig.model_validate(
-                {
-                    "devices": {
-                        "sw1": {
-                            "host": "192.0.2.1",
-                            "credentials": "net",
-                            "connection": "direct-telnet",
-                            "allow_telnet": True,
-                        }
-                    }
-                }
-            ),
-            connections=connections,
-            credentials=CredentialsConfig.model_validate(
-                {
-                    "credentials": {
-                        "net": {"backend": "pass", "entry": "network/net",
-                                 "username": "operator"},
-                    }
-                }
-            ),
-            policy=PolicyConfig.model_validate({"defaults": {"telnet": "allow"}}),
-            config_dir=Path("."),
-        ),
-        connection_factory=factory,
-        credential_resolver=FakeCredentials(),
-        audit_logger=FakeAudit(),  # type: ignore[arg-type]
-        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
-    )
-
-    manager.open_session("sw1")
-
-    assert params[0]["port"] == 2002
-
-
-def test_console_requires_allow_telnet_and_uses_the_telnet_driver() -> None:
-    connection = FakeConnection()
-    audit = FakeAudit()
-    params: list[dict[str, object]] = []
-
-    def factory(connection_params: dict[str, object]) -> FakeConnection:
-        params.append(connection_params)
-        return connection
-
-    manager = SessionManager(
-        _config(console=True, allow_telnet=True),
-        connection_factory=factory,
-        credential_resolver=FakeCredentials(),
-        audit_logger=audit,  # type: ignore[arg-type]
-        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
-    )
-
-    info = manager.open_session("sw1")
-
     assert params[0]["transport"] == "telnet"
-    assert params[0]["port"] == 2002
-    assert "sock" not in params[0]
-    assert any("console access transmits credentials and traffic in cleartext"
-               for warning in info.warnings)
-    assert audit.records[0]["route"] == "console"
+    assert params[0]["port"] == 2323
+    assert info.route == "telnet"
 
 
-def test_console_requires_allow_telnet_on_the_device() -> None:
+# ---------------------------------------------------------------------------
+# serial
+# ---------------------------------------------------------------------------
+
+
+def test_serial_plan_and_transport_params() -> None:
     connection = FakeConnection()
-    manager = _manager(connection, FakeAudit(), console=True, allow_telnet=False)
-
-    with pytest.raises(TransportError, match="allow_telnet"):
-        manager.open_session("sw1")
-
-
-def test_legacy_direct_applies_disabled_algorithms_from_the_allowlist() -> None:
-    connection = FakeConnection()
+    credentials = FakeCredentials()
     params: list[dict[str, object]] = []
 
     def factory(connection_params: dict[str, object]) -> FakeConnection:
         params.append(connection_params)
         return connection
 
-    connections = ConnectionsConfig.model_validate(
-        {
-            "connections": {
-                "legacy": {
-                    "type": "direct",
-                    "protocol": "legacy_ssh",
-                    "host_key_algorithms": ["ssh-rsa"],
-                    "kex_algorithms": ["diffie-hellman-group1-sha1"],
-                    "ciphers": ["aes128-cbc"],
-                }
-            }
-        }
-    )
     manager = SessionManager(
-        AppConfig(
-            inventory=InventoryConfig.model_validate(
-                {
-                    "devices": {
-                        "sw1": {
-                            "host": "192.0.2.1",
-                            "credentials": "net",
-                            "connection": "legacy",
-                        }
-                    }
-                }
-            ),
-            connections=connections,
-            credentials=CredentialsConfig.model_validate(
-                {
-                    "credentials": {
-                        "net": {"backend": "pass", "entry": "network/net",
-                                 "username": "operator"},
-                    }
-                }
-            ),
-            policy=PolicyConfig.model_validate({}),
-            config_dir=Path("."),
-        ),
+        _config(),
         connection_factory=factory,
-        credential_resolver=FakeCredentials(),
+        credential_resolver=credentials,
         audit_logger=FakeAudit(),  # type: ignore[arg-type]
         host_keys=FakeHostKeys(),  # type: ignore[arg-type]
     )
 
-    info = manager.open_session("sw1")
-
-    disabled = params[0]["disabled_algorithms"]
-    assert isinstance(disabled, dict)
-    assert "ssh-rsa" not in disabled["keys"]
-    assert "diffie-hellman-group1-sha1" not in disabled["kex"]
-    assert "aes128-cbc" not in disabled["ciphers"]
-    assert any("explicit legacy algorithm overrides in use" for warning in info.warnings)
-    assert any("legacy SSH profile in use" for warning in info.warnings)
-    connection = FakeConnection()
-    host_keys = FakeHostKeys()
-    manager, host_keys, _ = _nested_manager(
-        connection, FakeAudit(), host_keys=host_keys
+    info = manager.open_session(
+        _spec(
+            protocol="serial",
+            host="/dev/ttyUSB0",
+            credentials=None,
+            allow_serial=True,
+            serial={"baudrate": 115200, "parity": "E", "stopbits": 1.5},
+        )
     )
 
-    manager.open_session("sw1")
+    assert credentials.resolved == []
+    assert params[0] == {
+        "transport": "serial",
+        "device": "/dev/ttyUSB0",
+        "baudrate": 115200,
+        "bytesize": 8,
+        "parity": "E",
+        "stopbits": 1.5,
+        "conn_timeout": 60.0,
+    }
+    assert info.route == "serial"
+    assert any("local serial console" in warning for warning in info.warnings)
 
-    assert host_keys.calls == [("192.0.2.254", 22, "strict", False)]
+
+def test_serial_requires_the_allow_flag_at_spec_validation() -> None:
+    with pytest.raises(ValidationError, match="allow_serial"):
+        _spec(protocol="serial", host="/dev/ttyUSB0", credentials=None)
 
 
-def test_nested_disconnects_the_connection_when_target_login_fails() -> None:
+def test_serial_rejects_non_dev_paths_and_ports() -> None:
+    with pytest.raises(ValidationError, match="absolute /dev/"):
+        _spec(
+            protocol="serial",
+            host="/tmp/ttyUSB0",
+            credentials=None,
+            allow_serial=True,
+        )
+    with pytest.raises(ValidationError, match="does not use a TCP port"):
+        _spec(
+            protocol="serial",
+            host="/dev/ttyUSB0",
+            credentials=None,
+            allow_serial=True,
+            port=22,
+        )
+
+
+def test_serial_policy_hard_deny() -> None:
     connection = FakeConnection()
-    connection.read_error = RuntimeError("intermediate login failed with intermediate-secret")
-    manager, _, _ = _nested_manager(connection, FakeAudit())
-
-    with pytest.raises(TransportError, match="intermediate login failed") as error:
-        manager.open_session("sw1")
-
-    assert "intermediate-secret" not in str(error.value)
-    assert connection.disconnected is True
-
-
-def test_nested_redacts_target_password_when_factory_fails() -> None:
-    connection = FakeConnection()
-    audit = FakeAudit()
-    manager, _, _ = _nested_manager(
-        connection,
-        audit,
-        connection_error=RuntimeError("target login failed with hunter2"),
+    manager = _manager(
+        connection, FakeAudit(), policy=_policy(allow_serial=False)
     )
 
-    with pytest.raises(TransportError, match="target login failed") as error:
-        manager.open_session("sw1")
-
-    assert "hunter2" not in str(error.value)
+    with pytest.raises(TransportError, match="serial is disabled by policy defaults"):
+        _open(
+            manager,
+            protocol="serial",
+            host="/dev/ttyUSB0",
+            credentials=None,
+            allow_serial=True,
+        )
     assert connection.disconnected is False
 
 
-def test_nested_session_expires_and_disconnects() -> None:
+# ---------------------------------------------------------------------------
+# terminal_write
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_write_appends_enter_by_default() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager = _manager(connection, audit)
+    info = _open(manager)
+
+    result = manager.terminal_write(info.session_id, "display version")
+
+    assert connection.writes == ["display version\n"]
+    assert result.bytes_sent == len("display version\n")
+    write_records = [r for r in audit.records if r["event"] == "terminal_write"]
+    assert write_records[0]["data"] == "display version"
+    assert write_records[0]["enter"] is True
+
+
+def test_terminal_write_without_enter_sends_control_bytes() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit())
+    info = _open(manager)
+
+    manager.terminal_write(info.session_id, "\x03", enter=False)
+    manager.terminal_write(info.session_id, " ", enter=False)
+
+    assert connection.writes == ["\x03", " "]
+
+
+def test_terminal_write_serial_uses_carriage_return() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit())
+    info = manager.open_session(
+        _spec(protocol="serial", host="/dev/ttyUSB0", credentials=None, allow_serial=True)
+    )
+
+    manager.terminal_write(info.session_id, "show version")
+
+    assert connection.writes == ["show version\r"]
+
+
+def test_terminal_write_rejects_oversized_input() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit(), max_write_bytes=5)
+    info = _open(manager)
+
+    with pytest.raises(SessionError, match="max_write_bytes"):
+        manager.terminal_write(info.session_id, "show version")
+    assert connection.writes == []
+
+
+def test_terminal_write_redacts_known_secrets_in_result_and_audit() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager = _manager(connection, audit)
+    info = _open(manager)
+
+    result = manager.terminal_write(info.session_id, "password hunter2", enter=False)
+
+    assert "hunter2" not in result.data
+    write_records = [r for r in audit.records if r["event"] == "terminal_write"]
+    assert "hunter2" not in json.dumps(write_records)
+
+
+def test_transport_failure_marks_the_session_failed() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager = _manager(connection, audit)
+    info = _open(manager)
+    connection.write_error = OSError("broken pipe with hunter2")
+
+    with pytest.raises(TransportError, match="terminal write failed") as error:
+        manager.terminal_write(info.session_id, "show version")
+
+    assert "hunter2" not in str(error.value)
+    assert manager.session_status(info.session_id).state is SessionState.FAILED
+    with pytest.raises(SessionError, match="not ready"):
+        manager.terminal_write(info.session_id, "show version")
+
+
+# ---------------------------------------------------------------------------
+# terminal_read
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_read_returns_output_and_buffers_it() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit())
+    info = _open(manager)
+    connection.timing_output = "hello\nswitch#"
+
+    result = manager.terminal_read(info.session_id, timeout=2.0)
+
+    assert result.output == "hello\nswitch#"
+    assert result.output_offset == 0
+    assert result.truncated is False
+    chunk = manager.read_output(info.session_id, offset=0)
+    assert chunk.output == "hello\nswitch#"
+
+
+def test_terminal_read_truncates_large_inline_output() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit(), max_inline_output_bytes=8)
+    info = _open(manager)
+    connection.timing_output = "0123456789abcdef"
+
+    result = manager.terminal_read(info.session_id, timeout=2.0)
+
+    assert result.truncated is True
+    assert result.output == "01234567"
+    assert result.next_output_offset == 16
+    rest = manager.read_output(info.session_id, offset=8)
+    assert rest.output == "89abcdef"
+
+
+def test_terminal_read_validates_timeout_bounds() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit(), max_read_timeout=10)
+    info = _open(manager)
+
+    with pytest.raises(SessionError, match="positive"):
+        manager.terminal_read(info.session_id, timeout=0)
+    with pytest.raises(SessionError, match="max_read_timeout"):
+        manager.terminal_read(info.session_id, timeout=11)
+
+
+def test_terminal_read_failure_marks_the_session_failed() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit())
+    info = _open(manager)
+    connection.timing_error = OSError("read failed")
+
+    with pytest.raises(TransportError, match="terminal read failed"):
+        manager.terminal_read(info.session_id)
+
+    assert manager.session_status(info.session_id).state is SessionState.FAILED
+
+
+# ---------------------------------------------------------------------------
+# terminal_write_secret
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_write_secret_resolves_redacts_and_audits_entry_only() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    credentials = FakeCredentials()
+    manager = _manager(connection, audit, credentials=credentials)
+    info = _open(manager)
+
+    result = manager.terminal_write_secret(info.session_id, "network/secret")
+
+    assert connection.writes == ["typed-secret\n"]
+    assert credentials.read_entries == ["network/secret"]
+    assert result.entry == "network/secret"
+    assert result.bytes_sent == len("typed-secret\n")
+    records = json.dumps(audit.records)
+    assert "typed-secret" not in records
+    assert "network/secret" in records
+
+    connection.timing_output = "got typed-secret"
+    read = manager.terminal_read(info.session_id)
+    assert read.output == "got <redacted>"
+
+
+def test_terminal_write_secret_rejects_invalid_and_empty_entries() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit())
+    info = _open(manager)
+
+    with pytest.raises(SessionError, match="pass entry"):
+        manager.terminal_write_secret(info.session_id, "../secret")
+    with pytest.raises(SessionError, match="empty secret"):
+        manager.terminal_write_secret(info.session_id, "network/missing")
+    assert connection.writes == []
+
+
+# ---------------------------------------------------------------------------
+# session bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def test_read_output_rejects_expired_offsets() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit(), max_session_buffer_bytes=8)
+    info = _open(manager)
+    connection.timing_output = "abcdefghij"
+
+    manager.terminal_read(info.session_id, timeout=1.0)
+
+    with pytest.raises(SessionError, match="expired"):
+        manager.read_output(info.session_id, offset=0)
+    chunk = manager.read_output(info.session_id, offset=2)
+    assert chunk.output == "cdefghij"
+    assert chunk.truncated is True
+
+
+def test_session_expires_after_idle_timeout() -> None:
     connection = FakeConnection()
     clock = MutableClock()
-    manager, _, _ = _nested_manager(
-        connection, FakeAudit(), clock=clock
+    manager = _manager(
+        connection, FakeAudit(), clock=clock, session_idle_timeout=10
     )
-    info = manager.open_session("sw1")
+    info = _open(manager)
 
-    clock.value = 301
+    clock.value = 11
     with pytest.raises(SessionError, match="unknown or expired session"):
         manager.session_status(info.session_id)
-
     assert connection.disconnected is True
 
 
-def test_nested_telnet_requires_allow_telnet_on_the_device() -> None:
-    connections = ConnectionsConfig.model_validate(
-        {
-            "connections": {
-                "nested-term": {
-                    "type": "nested",
-                    "host": "192.0.2.254",
-                    "protocol": "ssh",
-                    "credentials": "intermediate",
-                    "next_protocol": "telnet",
-                }
-            },
-        }
-    )
-    manager = SessionManager(
-        AppConfig(
-            inventory=InventoryConfig.model_validate(
-                {
-                    "devices": {
-                        "sw1": {
-                            "host": "192.0.2.1",
-                            "credentials": "net",
-                            "connection": "nested-term",
-                        }
-                    }
-                }
-            ),
-            connections=connections,
-            credentials=CredentialsConfig.model_validate(
-                {
-                    "credentials": {
-                        "net": {"backend": "pass", "entry": "network/net",
-                                 "username": "operator"},
-                        "intermediate": {"backend": "pass",
-                                         "entry": "network/intermediate",
-                                         "username": "term-operator"},
-                    }
-                }
-            ),
-            policy=PolicyConfig.model_validate({}),
-            config_dir=Path("."),
-        ),
-        credential_resolver=FakeCredentials(),
-        audit_logger=FakeAudit(),  # type: ignore[arg-type]
-        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
-    )
-
-    with pytest.raises(TransportError, match="allow_telnet"):
-        manager.open_session("sw1")
-
-
-def test_nested_telnet_requires_policy_allow_even_with_allow_telnet() -> None:
-    connections = ConnectionsConfig.model_validate(
-        {
-            "connections": {
-                "nested-term": {
-                    "type": "nested",
-                    "host": "192.0.2.254",
-                    "protocol": "ssh",
-                    "credentials": "intermediate",
-                    "next_protocol": "telnet",
-                }
-            },
-        }
-    )
-    manager = SessionManager(
-        AppConfig(
-            inventory=InventoryConfig.model_validate(
-                {
-                    "devices": {
-                        "sw1": {
-                            "host": "192.0.2.1",
-                            "credentials": "net",
-                            "connection": "nested-term",
-                            "allow_telnet": True,
-                        }
-                    }
-                }
-            ),
-            connections=connections,
-            credentials=CredentialsConfig.model_validate(
-                {
-                    "credentials": {
-                        "net": {"backend": "pass", "entry": "network/net",
-                                 "username": "operator"},
-                        "intermediate": {"backend": "pass",
-                                         "entry": "network/intermediate",
-                                         "username": "term-operator"},
-                    }
-                }
-            ),
-            policy=PolicyConfig.model_validate({}),
-            config_dir=Path("."),
-        ),
-        credential_resolver=FakeCredentials(),
-        audit_logger=FakeAudit(),  # type: ignore[arg-type]
-        host_keys=FakeHostKeys(),  # type: ignore[arg-type]
-    )
-
-    with pytest.raises(TransportError, match="Telnet is denied"):
-        manager.open_session("sw1")
-
-
-def test_allowed_command_is_executed_and_audited() -> None:
+def test_max_open_sessions_is_enforced() -> None:
     connection = FakeConnection()
-    audit = FakeAudit()
-    manager = _manager(connection, audit)
-    info = manager.open_session("sw1")
-    result = manager.run_command(info.session_id, "show version")
-    assert result.executed is True
-    assert result.output == "output for show version"
-    assert connection.commands == ["show version"]
-    assert audit.records[-1]["outcome"] == "completed"
+    manager = _manager(connection, FakeAudit(), max_open_sessions=1)
+    _open(manager)
+
+    with pytest.raises(SessionError, match="maximum number of open sessions"):
+        _open(manager)
 
 
-def test_ask_command_does_not_execute() -> None:
+def test_close_session_disconnects_and_reports_closed() -> None:
     connection = FakeConnection()
     manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    result = manager.run_command(info.session_id, "ping 192.0.2.1")
-    assert result.executed is False
-    assert result.confirmation_required is True
-    assert connection.commands == []
+    info = _open(manager)
 
-
-def test_denied_command_raises_without_execution() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    with pytest.raises(PolicyError):
-        manager.run_command(info.session_id, "reload")
-    assert connection.commands == []
-
-
-def test_run_commands_stops_at_first_unapproved_command() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    results = manager.run_commands(
-        info.session_id, ["show version", "ping 192.0.2.1", "show clock"]
-    )
-    assert [result.executed for result in results] == [True, False]
-    assert connection.commands == ["show version"]
-
-
-def test_cli_help_reads_completion_and_cancels_unfinished_line() -> None:
-    connection = FakeConnection()
-    connection.timing_output = "  version  Show software version\n"
-    audit = FakeAudit()
-    manager = _manager(connection, audit)
-    info = manager.open_session("sw1")
-
-    result = manager.cli_help(info.session_id, "show ")
-
-    assert result.executed is True
-    assert result.output == "  version  Show software version\n"
-    assert connection.commands == []
-    assert connection.writes == ["show ?", "\x03"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-    assert audit.records[-1]["event"] == "cli_help"
-    assert audit.records[-1]["outcome"] == "completed"
-
-
-def test_cli_help_clears_a_recognized_prompt_tail_without_waiting_for_output() -> None:
-    connection = FakeConnection()
-    connection.timing_output = "  version  Show software version\nswitch#show    \x08\x08\x08"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    result = manager.cli_help(info.session_id, "show ")
-
-    assert result.output == "  version  Show software version\n"
-    assert connection.read_timeouts == []
-    assert connection.writes == ["show ?", "\x03", "\x15"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-@pytest.mark.parametrize("line", ["show ?", "show version\n", "show $(hostname)"])
-def test_cli_help_rejects_unsafe_or_ambiguous_input(line: str) -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    with pytest.raises(PolicyError):
-        manager.cli_help(info.session_id, line)
-
-    assert connection.writes == []
-
-
-def test_cli_help_fails_the_session_when_cleanup_cannot_restore_prompt() -> None:
-    connection = FakeConnection()
-    connection.timing_output = "  version  Show software version\n"
-    connection.read_error = RuntimeError("prompt not received")
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    with pytest.raises(TransportError, match="prompt not received"):
-        manager.cli_help(info.session_id, "show ")
-
-    assert connection.writes == ["show ?", "\x03"]
-    assert manager.session_status(info.session_id).state is SessionState.FAILED
-
-
-def test_cli_help_cancels_input_after_a_read_timeout() -> None:
-    connection = FakeConnection()
-    connection.timing_error = RuntimeError("help read timed out")
-    manager = _manager(connection, FakeAudit(), cli_help_timeout=3)
-    info = manager.open_session("sw1")
-
-    with pytest.raises(TransportError, match="help read timed out"):
-        manager.cli_help(info.session_id, "show ")
-
-    assert connection.timing_timeouts == [3.0]
-    assert connection.read_timeouts == [3.0]
-    assert connection.writes == ["show ?", "\x03"]
-    assert manager.session_status(info.session_id).state is SessionState.FAILED
-
-
-def test_cli_help_detects_paged_help_and_stays_in_paging() -> None:
-    connection = FakeConnection()
-    connection.timing_output = "  show usage\n---(more 35%)---"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    result = manager.cli_help(info.session_id, "show ")
-
-    assert result.executed is True
-    assert result.pager_active is True
-    assert result.output == "  show usage\n---(more 35%)---"
-    assert connection.writes == ["show ?"]
-    assert manager.session_status(info.session_id).state is SessionState.PAGING
-
-
-def test_cli_help_pager_pages_through_to_ready_and_clears_residual_line() -> None:
-    connection = FakeConnection()
-    connection.timing_output = "page1\n--More--"
-    connection.read_outputs = ["page2\n--More--", "page3\nswitch#show "]
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    manager.cli_help(info.session_id, "show ")
-
-    first = manager.send_control(info.session_id, "space")
-    second = manager.send_control(info.session_id, "space")
-
-    assert first.pager_active is True
-    assert first.output == "page2\n--More--"
-    assert second.pager_active is False
-    assert second.output == "page3\n"
-    assert connection.writes == ["show ?", " ", " ", "\x03", "\x15"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_cli_help_pager_q_abort_clears_residual_line() -> None:
-    connection = FakeConnection()
-    connection.timing_output = "page1\n--More--"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    manager.cli_help(info.session_id, "show ")
-
-    result = manager.send_control(info.session_id, "q")
-
-    assert result.action == "q"
-    assert connection.writes == ["show ?", "q", "\x03", "\x15"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_cli_help_pager_page_limit_aborts_with_q() -> None:
-    connection = FakeConnection()
-    connection.timing_output = "page1\n--More--"
-    manager = _manager(connection, FakeAudit(), max_pager_pages=1)
-    info = manager.open_session("sw1")
-    manager.cli_help(info.session_id, "show ")
-
-    result = manager.send_control(info.session_id, "space")
-
-    assert result.action == "q"
-    assert connection.writes == ["show ?", "q", "\x03", "\x15"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_command_pager_q_abort_does_not_send_extra_ctrl_c() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show interfaces"] = "page1\n--More--"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    manager.run_command(info.session_id, "show interfaces")
-
-    result = manager.send_control(info.session_id, "q")
-
-    assert result.action == "q"
-    assert connection.writes == ["q"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_pager_requires_explicit_space_and_returns_to_ready() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show interfaces"] = "first page\n--More--"
-    connection.read_outputs = ["second page\nswitch#"]
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    first = manager.run_command(info.session_id, "show interfaces")
-
-    assert first.pager_active is True
-    assert first.output == "first page\n--More--"
-    assert re.search(connection.expect_patterns[-1], "first page\n--More--")
-    assert manager.session_status(info.session_id).state is SessionState.PAGING
-
-    second = manager.send_control(info.session_id, "space")
-
-    assert second.action == "space"
-    assert second.output == "second page\n"
-    assert second.pager_active is False
-    assert connection.writes == [" "]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_pager_detects_junos_more_marker_without_a_page_number() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show interfaces"] = "lines\n---(more)---"
-    connection.read_outputs = ["next\nswitch#"]
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    first = manager.run_command(info.session_id, "show interfaces")
-
-    assert first.pager_active is True
-    assert first.output == "lines\n---(more)---"
-    assert manager.session_status(info.session_id).state is SessionState.PAGING
-
-    second = manager.send_control(info.session_id, "space")
-    assert second.pager_active is False
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_pager_limit_aborts_with_q() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show interfaces"] = "first page\n--More--"
-    manager = _manager(connection, FakeAudit(), max_pager_pages=1)
-    info = manager.open_session("sw1")
-    manager.run_command(info.session_id, "show interfaces")
-
-    result = manager.send_control(info.session_id, "space")
-
-    assert result.action == "q"
-    assert connection.writes == ["q"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_q_cancels_an_active_pager() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show interfaces"] = "first page\n--More--"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    manager.run_command(info.session_id, "show interfaces")
-
-    result = manager.send_control(info.session_id, "q")
-
-    assert result.action == "q"
-    assert connection.writes == ["q"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_confirmation_only_accepts_detected_response_tokens() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show version"] = "Continue? [Y/N]"
-    connection.command_outputs["y"] = "continued\nswitch#"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    command = manager.run_command(info.session_id, "show version")
-
-    assert command.response_required is True
-    assert command.allowed_responses == ["y", "n"]
-    assert manager.session_status(info.session_id).state is SessionState.AWAITING_RESPONSE
-    with pytest.raises(PolicyError):
-        manager.respond(info.session_id, "yes")
-    assert connection.commands == ["show version"]
-
-    response = manager.respond(info.session_id, "Y")
-
-    assert response.response == "y"
-    assert response.output == "continued\n"
-    assert connection.commands == ["show version", "y"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_ctrl_c_cancels_a_pending_confirmation() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show version"] = "Continue? [Y/N]"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    manager.run_command(info.session_id, "show version")
-
-    result = manager.send_control(info.session_id, "ctrl-c")
-
-    assert result.action == "ctrl-c"
-    assert connection.writes == ["\x03"]
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_plain_y_n_text_is_not_treated_as_a_confirmation_prompt() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show version"] = "answer column [Y/N]\nswitch#"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    result = manager.run_command(info.session_id, "show version")
-
-    assert result.response_required is False
-    assert result.output == "answer column [Y/N]\n"
-    assert manager.session_status(info.session_id).state is SessionState.READY
-
-
-def test_unknown_confirmation_prompt_fails_without_sending_a_response() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show version"] = "Continue? [OK/CANCEL]"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    with pytest.raises(TransportError, match="did not end at a recognized prompt"):
-        manager.run_command(info.session_id, "show version")
-
-    assert connection.commands == ["show version"]
-    assert connection.writes == []
-    assert manager.session_status(info.session_id).state is SessionState.FAILED
-
-
-def test_secret_prompt_fails_session_without_sending_a_response() -> None:
-    connection = FakeConnection()
-    connection.command_outputs["show version"] = "Password:"
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    with pytest.raises(TransportError, match="requested a password"):
-        manager.run_command(info.session_id, "show version")
-
-    assert connection.commands == ["show version"]
-    assert manager.session_status(info.session_id).state is SessionState.FAILED
-
-
-def test_control_is_rejected_when_no_pager_or_prompt_is_pending() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-
-    with pytest.raises(SessionError, match="requires paging"):
-        manager.send_control(info.session_id, "space")
-
-    assert connection.writes == []
-
-
-def test_read_output_is_chunked() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
-    manager.run_command(info.session_id, "show version")
-    first = manager.read_output(info.session_id, limit=6)
-    second = manager.read_output(info.session_id, offset=first.next_offset or 0, limit=100)
-    assert first.output == "output"
-    assert second.output == " for show version"
-
-
-def test_inline_output_limit_marks_result_truncated() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit(), max_inline_output_bytes=10)
-    info = manager.open_session("sw1")
-    result = manager.run_command(info.session_id, "show long")
-    assert result.truncated is True
-    assert result.output == "x" * 10
-    assert result.next_output_offset is not None
-
-
-def test_expired_session_is_disconnected() -> None:
-    connection = FakeConnection()
-    clock = MutableClock()
-    manager = _manager(connection, FakeAudit(), clock, session_idle_timeout=5)
-    info = manager.open_session("sw1")
-    clock.value = 6
-    with pytest.raises(SessionError, match="unknown or expired"):
-        manager.session_status(info.session_id)
-    assert connection.disconnected is True
-
-
-def test_close_removes_session() -> None:
-    connection = FakeConnection()
-    manager = _manager(connection, FakeAudit())
-    info = manager.open_session("sw1")
     closed = manager.close_session(info.session_id)
+
     assert closed.state is SessionState.CLOSED
     assert connection.disconnected is True
-    with pytest.raises(SessionError):
+    with pytest.raises(SessionError, match="unknown or expired session"):
         manager.session_status(info.session_id)

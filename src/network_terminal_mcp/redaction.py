@@ -34,6 +34,12 @@ class Redactor:
         """The known secret values (read-only)."""
         return self._secrets
 
+    def add(self, *secrets: str) -> None:
+        """Register more secret values, e.g. one typed at a live prompt."""
+        merged = set(self._secrets)
+        merged.update(secret for secret in secrets if secret.strip())
+        self._secrets = tuple(sorted(merged, key=len, reverse=True))
+
     def __bool__(self) -> bool:
         return bool(self._secrets)
 

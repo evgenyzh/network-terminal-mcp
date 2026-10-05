@@ -11,8 +11,6 @@ dist/
 build/
 
 # Local and secret-bearing runtime configuration
-config/*.yml
-!config/*.example.yml
 .env
 *.log
 transcripts/

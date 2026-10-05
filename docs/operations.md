@@ -1,217 +1,164 @@
-# Эксплуатация Этапов 1-4, 7
+# Эксплуатация
 
 ## Границы текущей версии
 
-Сервер поддерживает постоянные direct SSH-сессии, один configured SSH-only
-ProxyJump hop, один configured Nested hop (SSH или Telnet), локальный
-SOCKS5-прокси (`proxyjump` с полем `socks`) и TCP console profiles. Он не
-поддерживает `raw_input`.
+Сервер поддерживает постоянные direct SSH/Telnet/console/serial-сессии,
+локальный SOCKS5-маршрут и один SSH ProxyJump hop для первого подключения.
+Дальше модель работает в сыром терминале: печатает команды, `?`-подсказки,
+второй `ssh`/`telnet` и одиночные клавиши. Маршрут и credentials модель
+описывает прямо в `open_session`; локальный inventory/connection/credential
+YAML не нужен.
 
-Для ProxyJump нужны локальные connection и credential profiles для final target
-и bastion. Обе host key проверяются независимо; bastion должен разрешать
-`direct-tcpip` forwarding. При ошибке любого hop обе SSH-сессии закрываются.
+Рабочая инструкция для модели едет внутри MCP: краткий контракт в
+`instructions` и полный мануал в ресурсе `network-terminal://usage` (исходник —
+`src/network_terminal_mcp/usage.md`).
 
-Для Nested нужны локальные connection и credential profiles для intermediate
-host и final target. Сервер подключается к intermediate host по SSH и выполняет
-из его shell `ssh` до final target.
-Host key intermediate host проверяется локально;
-inner SSH использует SSH-клиент intermediate host, поэтому host key final target
-проверяется им. При ошибке connection закрывается.
+Все risky-опции явные: `allow_telnet=true` для Telnet/console,
+`allow_serial=true` для `/dev/tty*`, флаг `allow_plaintext_password=true` для
+plaintext-пароля, `legacy` для старых SSH-алгоритмов. Policy может hard-deny
+каждую из них.
 
-Для SOCKS-маршрута нужен локальный `proxyjump` profile с полем `socks`
-(`host`/`port` локального SOCKS5-прокси, обычно локальный SSH dynamic forward
-`ssh -D`). Credential profile bastion не нужен: цель достигается через прокси, а
-не через SSH-бастион. Target должен быть IP-адресом (прокси не резолвит имена).
-Host key final target проверяется через SOCKS-сокет; для первого подключения
-используйте `host_key_policy: accept_new`, затем `strict`. Трафик внутри туннеля
-и уровень доверия к прокси — на усмотрение оператора (сервер предупреждает).
+Каждый вызов `open_session` проходит через нативный permission-попап OpenCode
+(`network-terminal_open_session: ask`): пользователь видит host, route и
+credential-ссылки до подключения. Ввод в уже открытой сессии подтверждений не
+требует; при желании оператор может добавить
+`"network-terminal_terminal_write": "ask"` в permission-политику клиента.
 
-## Telnet и console
+## Рабочий цикл
 
-Прямой Telnet, Nested Telnet (`next_protocol: telnet`) и `console` profiles
-(ТСP console port терминального сервера) включаются только двойным gating:
-`allow_telnet: true` на устройстве **и** `defaults.telnet: allow` в policy.
-По умолчанию `telnet: deny`, поэтому Telnet выключен, пока не разрешён явно.
-Telnet передаёт учётные данные и трафик открытым текстом и не проверяет host
-key; каждая сессия возвращает warning. Nested Telnet выполняет `telnet` из
-shell промежуточного хоста, поэтому host key цели также не проверяется.
-`console` требует заданный `port`; `connect_command` не поддерживается.
-
-## Ad-hoc доступ
-
-Сетевые устройства обычно достигаются ad-hoc, без записей в `devices`:
-`open_session(host="192.0.2.2")`. Поля `credentials` и `connection`
-необязательны — берутся из `default_credentials` / `default_connection` в
-инвентаре. Платформа не передаётся: тип оборудования модель определяет по
-выводу уже после открытия сессии.
-
-Модель читает banner и команды (`show version` / `display version` и т.п.),
-распознаёт вендора по выводу и работает с тем CLI, который видит, без
-переключения драйверов.
-
-Пример флоу:
-
-```
-open_session(host=192.0.2.4)   # подключение без платформы
-run_command(show version)        # определяем вендора и CLI по выводу
-run_command(show version)        # продолжаем в том же CLI
+```text
+open_session(host="192.0.2.1", credentials={backend: "pass", entry: "net/sw", username: "operator"},
+             host_key_policy="accept_new")
+terminal_write(session_id, "display version")     # определяем вендора по выводу
+terminal_read(session_id)                          # читаем баннер/версию/pager
+terminal_write(session_id, "display interface brief")
+terminal_read(session_id)
+close_session(session_id)
 ```
 
-## Изменения конфигурации
+Pager листается обычным вводом: `terminal_write(session_id, " ", enter=False)`
+или `terminal_write(session_id, "q", enter=False)`. Подсказки CLI — печатайте
+`display ?` как есть и читайте вывод. `Ctrl-C` — `terminal_write(session_id,
+"\u0003", enter=False)`. Никаких специальных режимов у сервера нет.
 
-Изменения идут через отдельный инструмент, не через `run_command`:
+## Вложенные переходы
 
-- `run_change(session_id, commands)` — исполняет переданные команды сразу,
-  в порядке перечисления. Каждая команда проверяется на структурную
-  безопасность; pager или запрос подтверждения устройства прерывает
-  исполнение с ошибкой (fail-closed: останавливается, следующие команды не
-  выполняются). Результат содержит per-command статус исполнения и вывод.
+`proxyjump` нужен только чтобы попасть на bastion. Дальше переход выполняется
+обычным вводом в той же сессии:
 
-Подтверждение изменения вынесено на уровень клиента: в `opencode.json`
-тул `network-terminal_run_change` настроен на `permission: ask`, поэтому
-перед исполнением opencode показывает нативное всплывающее окно с командами
-(once/always/reject). Серверного механизма подтверждения нет — изменение
-исполняется сразу после вызова тула.
+```text
+open_session(host="localhost", port=2224,
+             route={type: "proxyjump", host="bastion.example.net",
+                    credentials={backend: "ssh_key", key_file: "~/.ssh/id_ed25519",
+                                 key_passphrase_entry: "net/key-pass", username: "operator"}},
+             credentials={backend: "ssh_key", key_file: "~/.ssh/id_ed25519",
+                          key_passphrase_entry: "net/key-pass", username: "operator"})
+terminal_write(session_id, "ssh operator@192.0.2.40")  # с shell bastion
+terminal_read(session_id)                              # "operator@192.0.2.40's password:"
+terminal_write_secret(session_id, "net/device-pass")   # значение из pass, не в audit
+terminal_read(session_id)                           # CLI устройства
+close_session(session_id)
+```
 
-Сессии живут в памяти сервера и привязаны к `session_id`, который уже несёт
-устройство, способ подключения и профиль учётных данных. После рестарта
-сервера сессии нет: вызов вернёт ошибку, значит, ничего не выполнялось, и
-надо заново открыть сессию и повторить `run_change`.
+Host key следующего hop проверяет SSH-клиент промежуточного хоста, а не
+локальный `known_hosts` этого сервера.
 
-Откат (reload/commit confirmed) — рекомендация модели по собственному
-усмотрению, а не серверная механика; модель сама решает, взводить ли его и
-какую команду использовать, и отменяет после проверки.
+## Маршруты первого подключения
+
+```text
+# локальный SOCKS5, обычно ssh -D; target должен быть IP
+open_session(host="192.0.2.1", route={type: "socks", host: "127.0.0.1", port: 1080},
+             credentials={backend: "pass", entry: "network/net", username: "operator"})
+
+# SSH jump host; host key jump и target проверяются независимо
+open_session(host="192.0.2.1", route={type: "proxyjump", host: "jump.example.net",
+             credentials={backend: "pass", entry: "network/jump", username: "operator"}},
+             credentials={backend: "pass", entry: "network/net", username: "operator"})
+```
+
+Для первого подключения используйте `host_key_policy="accept_new"`, затем
+`strict`. Доверие к SOCKS-прокси — на операторе, сервер возвращает warning.
+
+## Telnet, console и serial
+
+Прямой Telnet, `console` (TCP console port терминального сервера) и serial
+включаются только явными флагами (`allow_telnet=true` / `allow_serial=true`);
+policy может запретить их полностью. Telnet/console передают учётные данные и
+трафик открытым текстом; serial не имеет ни аутентификации, ни защиты канала.
+Для serial `host` — абсолютный `/dev/tty*`, который должен быть символьным
+устройством.
+
+## Несколько устройств одновременно
+
+Один процесс держит до `max_open_sessions` (по умолчанию 10) независимых
+сессий. `session_status` показывает состояние, prompt и warnings каждой.
+Сессии закрываются по idle timeout (по умолчанию 1 час), hard lifetime
+(24 часа) или `close_session`. Значения настраиваются в `policy.yml`.
 
 Реализованные MCP tools:
 
 - `open_session`
-- `run_command`
-- `run_commands`
-- `cli_help`
-- `send_control`
-- `respond`
+- `terminal_write`
+- `terminal_read`
+- `terminal_write_secret`
 - `read_output`
 - `session_status`
 - `close_session`
-- `run_change`
 
 ## Локальная конфигурация
 
-Конфигурация хранится вне git в `~/.config/network-terminal-mcp/`:
+Обязательных файлов нет. Единственный необязательный файл —
+`~/.config/network-terminal-mcp/policy.yml` (каталог 0700, файл 0600): posture
+и runtime-лимиты. Без него действуют встроенные defaults. Формат описан в
+[документе конфигурации](configuration.md).
 
-```text
-inventory.yml
-connections.yml
-credentials.yml
-policy.yml
-```
-
-Права: каталог 0700, файлы 0600. Схемы и примеры находятся в `config/`, а
-проверка выполняется без сетевых соединений:
+Проверка без сетевых соединений:
 
 ```bash
 uv sync
 uv run python -m network_terminal_mcp check
-uv run python -m network_terminal_mcp check --device <inventory-name>
 ```
+
+Старые `inventory.yml`, `connections.yml` и `credentials.yml` больше не
+читаются и могут быть удалены.
 
 ## Credentials
 
-`credentials.yml` содержит имя записи `pass` и не секретный AAA username:
+Credentials передаются в вызове как ссылки:
 
-```yaml
-credentials:
-  network-tacacs:
-    backend: pass
-    entry: network/credentials/network-tacacs
-    username: operator
+```text
+{ backend: "pass", entry: "network/credentials/net", username: "operator" }
+{ backend: "ssh_key", key_file: "~/.ssh/id_ed25519",
+  key_passphrase_entry: "network/credentials/key-pass", username: "operator" }
 ```
 
-Первая строка password-store entry — пароль. Не передавать пароль в MCP tool,
-inventory, audit или shell history.
+Первая строка password-store entry — пароль. Пароль не передаётся в другие MCP
+tools, audit или shell history. Секреты, запрашиваемые уже внутри сессии,
+вводятся через `terminal_write_secret` и тоже не попадают в audit.
+Plaintext-пароль допустим только при явном `allow_plaintext_password=true`.
 
 ## Первое SSH-подключение
 
 По умолчанию `host_key_policy: strict`: ключ target обязан уже присутствовать в
-`~/.local/state/network-terminal-mcp/known_hosts`.
-
-Для первичной регистрации создается отдельный профиль с явным TOFU:
-
-```yaml
-connections:
-  direct-enroll:
-    type: direct
-    protocol: ssh
-    host_key_policy: accept_new
-```
-
-Используйте его только для конкретной новой цели. Первое успешное
-`open_session` сохраняет ключ с правами 0600, пишет fingerprint в audit и
-возвращает предупреждение. Сверьте fingerprint по независимому каналу, затем
-переключите устройство обратно на профиль `direct` со `strict`.
+`~/.local/state/network-terminal-mcp/known_hosts`. Для первичной регистрации
+передайте в конкретном вызове `host_key_policy="accept_new"` (TOFU). Первое
+успешное `open_session` сохраняет ключ с правами 0600, пишет fingerprint в audit
+и возвращает предупреждение. Сверьте fingerprint по независимому каналу, после
+чего используйте `strict`.
 
 Ключ никогда не заменяется автоматически. Несовпадение ключа прерывает
-подключение.
-
-## Read-only политика
-
-Исполняются только команды с решением `allow`. Типовая policy:
-
-```yaml
-rules:
-  - id: read-only
-    action: allow
-    command_patterns: ["show *", "display *"]
-```
-
-Неизвестная команда возвращает `confirmation_required`; она не отправляется на
-оборудование. Destructive operations (`reload`, `erase`, `delete` и подобные),
-переносы строк, chaining и shell metacharacters запрещены.
-
-## Интерактивный read-only CLI
-
-`cli_help(session_id, line)` отправляет `<line>?` без Enter и читает completion.
-Не передавайте в `line` символ `?`, перевод строки или control bytes. Если CLI
-уже вернул `prompt + остаток строки`, сервер очищает line buffer Ctrl-C и
-Ctrl-U, не нажимая Enter. Для остальных непостраничных случаев ожидание prompt
-после Ctrl-C ограничено `runtime.cli_help_timeout` (по умолчанию 5 секунд), а
-не общим таймаутом команды.
-
-Проверено на оборудовании: `cli_help` работает на Cisco IOS и SNR eNOS
-(Cisco-подобный CLI). `cli_help` всегда отправляет `<line>?` без Enter. Для CLI,
-где подсказка показывается только после Enter (например, D-Link), помощь может
-не вернуться; в этом случае модель повторяет запрос, отправляя Enter сама, —
-завершающий `?` в строке не даёт команде выполниться.
-
-На SNR old help идёт через pager: `cli_help` возвращает первый экран с
-`pager_active: true`, дальше листайте `send_control("space")` и выходите `q`.
-После выхода сервер ждёт prompt с остатком строки и очищает её Ctrl-C и Ctrl-U.
-Надёжная клавиша выхода из help-pager — `q`; при нераспознанном возврате к
-prompt сессия безопасно переводится в `failed`.
-
-Pager не отключается автоматически: на Junos и Huawei VRP help возвращается
-одним ответом, но оставляет набранную строку; сервер очищает её
-последовательностью Ctrl-C, Ctrl-U перед следующей командой. Большие выводы на
-всех устройствах возвращаются с `pager_active: true`, и модель листает их
-`send_control`.
-
-При pager `run_command` возвращает `pager_active: true` и состояние `paging`.
-Продолжайте только одной страницей: `send_control(session_id, "space")`.
-`q` или `ctrl-c` возвращают terminal к prompt; после `max_pager_pages` сервер
-сам отправляет `q` вместо новой страницы.
-
-При `response_required: true` вызывайте `respond` только одним token из
-`allowed_responses`. Это device confirmation, а не подтверждение policy: команда
-с `confirmation_required` по-прежнему не была отправлена. Password/passphrase/
-secret prompts не получают ответа; session становится `failed` и требует
-`close_session` с последующим новым подключением.
+подключение. Слабый `accept_changed` — только для платформ с заведомо
+меняющимся при загрузке ключом (некоторые SNR); он явный, всегда пишет в audit
+старый и новый fingerprint.
 
 ## Audit и вывод
 
 - Audit: `~/.local/state/network-terminal-mcp/audit.jsonl`.
 - Known hosts: `~/.local/state/network-terminal-mcp/known_hosts`.
 - Обе директории создаются с 0700, файлы с 0600.
-- Если audit недоступен, новая команда не исполняется.
+- Если audit недоступен, новая операция не исполняется.
+- `terminal_write` пишет полный ввод (кроме известных серверу секретов),
+  `terminal_write_secret` — только entry и размер.
 - `read_output` читает bounded session buffer по offset. При переполнении buffer
   старый вывод недоступен, а `oldest_offset` сообщает границу.
 
@@ -225,7 +172,7 @@ uv run network-terminal-mcp
 
 Не запускать его вручную в обычном терминале для диагностики: stdout зарезервирован
 исключительно для MCP protocol. Для OpenCode server регистрируется как local
-MCP с абсолютным `cwd` проекта и timeout не меньше `runtime.command_timeout`:
+MCP с абсолютным `cwd` проекта и timeout не меньше `runtime.io_timeout`:
 
 ```json
 {
@@ -237,6 +184,9 @@ MCP с абсолютным `cwd` проекта и timeout не меньше `r
       "enabled": true,
       "timeout": 65000
     }
+  },
+  "permission": {
+    "network-terminal_open_session": "ask"
   }
 }
 ```

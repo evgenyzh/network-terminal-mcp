@@ -1,16 +1,18 @@
-"""Raw SSH/Telnet terminal transport without a driver abstraction.
+"""Raw SSH/Telnet/serial terminal transport without a driver abstraction.
 
 The session manager needs a small synchronous terminal API: write bytes, read
 until a regex matches or a time budget expires, and find the current prompt.
-This module implements that API directly on top of Paramiko (SSH) and
-telnetlib3 (Telnet and console). No vendor drivers are involved; the model
-interprets device output itself.
+This module implements that API directly on top of Paramiko (SSH), telnetlib3
+(Telnet and TCP console), and pyserial (local ``/dev/tty*`` consoles). No
+vendor drivers are involved; the model interprets device output itself.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import stat
 import threading
 import time
 from typing import Any, Protocol
@@ -60,7 +62,10 @@ class _BaseTerminal:
     _prompt_retries = 12
     _prompt_last_read = 0.3
     _prompt_read_timeout = 5.0
-    _PROMPT_LINE = re.compile(r"\S+[#>$%]\s*$")
+    _PROMPT_LINE = re.compile(
+        r"(?:\S+[#>$%]|\[[~*]?[A-Za-z0-9_][A-Za-z0-9_.-]*"
+        r"(?:-[A-Za-z0-9_./:-]+)?\])"
+    )
 
     def _read_channel(self) -> str:
         raise NotImplementedError
@@ -120,8 +125,9 @@ class _BaseTerminal:
         """Return the current device prompt.
 
         Sends RETURN, reads until output stabilizes (timing-based), and returns
-        the last line that looks like a prompt (ends with ``#``, ``>``, ``$`` or
-        ``%``). Banner lines and login residue are skipped by retrying.
+        the last line that looks like a prompt (a bracketed view, or ending
+        with ``#``, ``>``, ``$`` or ``%``). Banner lines and login residue are
+        skipped by retrying.
         """
         self._buffer = ""
         last_prompt = ""
@@ -133,7 +139,7 @@ class _BaseTerminal:
             )
             for line in reversed(data.splitlines()):
                 candidate = line.strip()
-                if self._PROMPT_LINE.search(candidate):
+                if self._PROMPT_LINE.fullmatch(candidate):
                     last_prompt = candidate
                     break
             if last_prompt:
@@ -405,3 +411,84 @@ class TelnetTerminal(_BaseTerminal):
         self._bridge.close()
         self._reader = None
         self._writer = None
+
+
+class SerialTerminal(_BaseTerminal):
+    """Local serial console backed by pyserial on an explicit /dev/ device."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._serial: Any = None
+
+    def connect(
+        self,
+        *,
+        device: str,
+        baudrate: int,
+        bytesize: int,
+        parity: str,
+        stopbits: float,
+        conn_timeout: float,
+    ) -> None:
+        self._validate_device(device)
+        try:
+            import serial
+        except ImportError as exc:
+            raise TransportError(
+                "pyserial is required for the serial transport; run uv sync"
+            ) from exc
+        try:
+            self._serial = serial.Serial(
+                port=device,
+                baudrate=baudrate,
+                bytesize=bytesize,
+                parity=parity,
+                stopbits=stopbits,
+                timeout=0.1,
+                write_timeout=conn_timeout,
+            )
+        except Exception as exc:
+            self._serial = None
+            raise TransportError(f"serial open failed for {device}: {exc}") from exc
+
+    @staticmethod
+    def _validate_device(device: str) -> None:
+        """Require an existing absolute ``/dev/`` character device."""
+        if not os.path.isabs(device) or not device.startswith("/dev/"):
+            raise TransportError(
+                f"serial device must be an absolute /dev/ path, got {device!r}"
+            )
+        try:
+            mode = os.stat(device).st_mode
+        except OSError as exc:
+            raise TransportError(f"serial device {device} is not accessible: {exc}") from exc
+        if not stat.S_ISCHR(mode):
+            raise TransportError(f"serial device {device} is not a character device")
+
+    def _read_channel(self) -> str:
+        if self._serial is None:
+            return ""
+        try:
+            raw = self._serial.read(_READ_CHUNK)
+        except Exception as exc:
+            raise TransportError(f"serial read failed: {exc}") from exc
+        if not raw:
+            return ""
+        return bytes(raw).decode("utf-8", errors="replace")
+
+    def _write_bytes(self, data: bytes) -> None:
+        if self._serial is None:
+            raise TransportError("serial terminal is closed")
+        try:
+            self._serial.write(data)
+            self._serial.flush()
+        except Exception as exc:
+            raise TransportError(f"serial write failed: {exc}") from exc
+
+    def disconnect(self) -> None:
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+        self._serial = None

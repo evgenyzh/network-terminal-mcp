@@ -1,57 +1,60 @@
 # network-terminal-mcp
 
+[![PyPI](https://img.shields.io/pypi/v/network-terminal-mcp)](https://pypi.org/project/network-terminal-mcp/)
+[![CI](https://github.com/evgenyzh/network-terminal-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/evgenyzh/network-terminal-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Локальный MCP-сервер для постоянных интерактивных сессий с сетевым
-оборудованием. Проект должен дать OpenCode удобный терминальный интерфейс:
-подключиться к устройству, использовать контекстную подсказку `?`, выполнить
-несколько команд в одной сессии и получить полный вывод без временных
-`sshpass`-команд и одноразовых скриптов.
+оборудованием. Проект даёт OpenCode сырой терминал: подключиться к устройству,
+использовать контекстную подсказку `?`, выполнить несколько команд, при
+необходимости зайти вторым `ssh`/`telnet` внутрь той же сессии и получить полный
+вывод без временных `sshpass`-команд и одноразовых скриптов.
 
-Статус: Этапы 1, 2, 3, 4, 6 и 7 реализованы; Этап 3 поддерживает один SSH-only
-ProxyJump hop и один Nested hop, а
-Этап 4 — per-profile legacy SSH algorithm overrides, прямой Telnet, Nested
-Telnet и TCP console profiles. Этап 7 добавляет безопасное применение
-изменений (`run_change`) с нативным подтверждением через permission-механику
-opencode (всплывающее окно `ask`, а не серверный диалог). Откат (reload/commit
-confirmed) — рекомендация
-модели по собственному усмотрению, а не серверная механика.
-Есть конфигурация, политика,
-аудит, credential backend, known_hosts, постоянные сессии на собственном
-терминальном слое (Paramiko + telnetlib3, без драйверов), безопасный
-`cli_help`, pager/control state machine и stdio MCP tools. Direct SSH проверен
-на Cisco IOS, SNR old/eNOS, D-Link, Huawei VRP и Junos. `cli_help` подтвержден
-на всех этих платформах: SNR old поддерживает `space`/`q` pager flow, а
-Junos/Huawei очищают оставшуюся help-строку Ctrl-C и Ctrl-U. ProxyJump
-проверен через два реальных bastion (key и password profile), Nested SSH — через
-password bastion до SNR old. Current local OpenCode profile подключён к server
-через stdio MCP и прошёл read-only round-trip. Подробности в
-[результатах проверок](docs/validation.md).
+Статус: v0.1.0 — этапы 1-9 реализованы. Сессия — это один постоянный терминальный stream
+(SSH, Telnet, TCP console или локальный serial `/dev/tty*`); модель пишет в него
+точно то, что нужно, включая вложенные переходы, и читает вывод без требования
+определённой формы prompt. Для первого подключения поддерживаются direct, один
+локальный SOCKS5 hop и один SSH ProxyJump hop; `nested`-маршрутов и
+командно-ориентированных инструментов больше нет. Секреты, запрашиваемые уже
+внутри сессии, вводятся через `terminal_write_secret` со ссылкой на `pass` и не
+попадают в audit. Один процесс держит несколько независимых сессий.
 
-Текущие ограничения: `raw_input`
-остаётся следующим этапом. Команда с
-policy-решением `ask` возвращает `confirmation_required`, но не исполняется.
-`respond` отвечает только на уже распознанный prompt устройства и не является
-механизмом policy confirmation. Telnet и console требуют двойного gating
-(`allow_telnet` на устройстве и `defaults.telnet: allow`) и проверены только
-unit-тестами, без hardware-подтверждения. `run_change` проверен unit-тестами и
-на живом Cisco IOS (применение и откат description); hardware-проверка rollback
-(Junos commit confirmed, Huawei
-schedule reboot delay) не выполнялась.
+Подключение описывает модель в самом вызове `open_session`: host, protocol,
+credentials (ссылки `pass`/key file или plaintext за флагом), route
+(direct/socks/proxyjump), host key policy, serial-параметры и legacy-алгоритмы.
+Инвентаря и profile-конфигов больше нет — после установки достаточно открыть
+сессию. Единственный необязательный локальный файл — `policy.yml` (posture и
+лимиты). Проверено на живом оборудовании: direct SSH на Cisco IOS, SNR
+old/eNOS, D-Link, Huawei VRP и Junos; ProxyJump через реальные bastion.
+Подробности в [результатах проверок](docs/validation.md).
+
+Текущие ограничения: raw input выполняется без per-команды подтверждения —
+после одобренного `open_session` модель работает в устройстве свободно; оператор
+может добавить permission `ask` для `terminal_write` в OpenCode. Автоматического
+распознавания sensitive-команд (`conf t`, `system-view`, `commit`) пока нет.
+Telnet, console и serial требуют явных per-call флагов и могут быть hard-deny
+политикой. `transcripts_enabled` остаётся зарезервированной настройкой.
 
 ## Основные цели
 
-- Прямой SSH, ProxyJump, вложенный SSH, консольный сервер и Telnet.
-- Современное и устаревшее оборудование с локальными профилями legacy SSH.
-- Постоянная сессия: авторизация и переход через терминальный сервер выполняются
-  один раз, затем модель продолжает работать с тем же prompt.
+- Прямой SSH, SOCKS5, ProxyJump, Telnet, TCP console и локальный serial.
+- Современное и устаревшее оборудование: legacy SSH алгоритмы включаются явно
+  для конкретного host в вызове.
+- Постоянная сессия: авторизация выполняется один раз, затем модель пишет
+  команды, `ssh`/`telnet` и одиночные клавиши в тот же stream.
+- Несколько параллельных сессий в одном процессе: переключение между
+  устройствами без переподключения.
+- Zero-config: модель описывает соединение сама, локально нужен только
+  необязательный `policy.yml`.
 - Точные команды выбирает модель. MCP не переводит абстрактные операции в
   vendor CLI и не хранит полный каталог команд.
-- Собственный терминальный слой на Paramiko и telnetlib3 предоставляет модель
-  сырой ssh/telnet/console интерфейс; тип устройства модель определяет сама по
-  баннеру и выводу.
-- Пароли загружаются из `pass`/GPG и не попадают в аргументы MCP или ответы.
-- Все команды и результаты подключения журналируются без секретов.
-- Диагностика доступна по умолчанию; изменение конфигурации отделено и требует
-  явного подтверждения.
+- Собственный терминальный слой на Paramiko, telnetlib3 и pyserial; тип
+  устройства модель определяет сама по баннеру и выводу.
+- Пароли загружаются из `pass` или явного key file; секреты вводятся в живой
+  prompt через `terminal_write_secret` и не попадают в MCP arguments, results и
+  audit. Plaintext-пароль — только за явным insecure-флагом.
+- Все подключения, ввод и события терминала журналируются без секретов.
+
 
 ## Первая область поддержки
 
@@ -62,7 +65,7 @@ schedule reboot delay) не выполнялась.
 - D-Link DGS/DES.
 - Eltex MES/ESR.
 - MikroTik RouterOS через обычный SSH.
-- BDCOM, EcoSGE и PON-платформы через проверяемые пользовательские адаптеры.
+- BDCOM, EcoSGE и PON-платформы через generic transport.
 
 ## Не входит в первую версию
 
@@ -74,15 +77,28 @@ schedule reboot delay) не выполнялась.
 
 ## Документы
 
+- [Инструкция для модели](src/network_terminal_mcp/usage.md) — она же MCP-ресурс
+  `network-terminal://usage`; краткий контракт едет в MCP `instructions`
 - [Архитектура](docs/architecture.md)
 - [План разработки](docs/development-plan.md)
 - [Модель безопасности](docs/security.md)
 - [Конфигурация](docs/configuration.md)
 - [Эксплуатация](docs/operations.md)
 - [Результаты проверок](docs/validation.md)
+- [История этапов 0-8](docs/history.md)
 - [Разработка адаптеров](docs/adapters.md)
 - [Стратегия тестирования](docs/testing.md)
 - [Открытые вопросы](docs/open-questions.md)
+
+## Установка
+
+```bash
+uvx network-terminal-mcp
+# или как постоянный инструмент:
+uv tool install network-terminal-mcp
+# или:
+pip install network-terminal-mcp
+```
 
 ## Запуск
 
@@ -93,22 +109,28 @@ schedule reboot delay) не выполнялась.
   "mcp": {
     "network-terminal": {
       "type": "local",
-      "command": ["uv", "run", "network-terminal-mcp"],
+      "command": ["uvx", "network-terminal-mcp"],
       "enabled": true
     }
+  },
+  "permission": {
+    "network-terminal_open_session": "ask"
   }
 }
 ```
 
-Перед запуском нужны локальные конфигурационные файлы в
-`~/.config/network-terminal-mcp/`; они не входят в git.
+Конфигурационные файлы не обязательны. Для строгих ограничений (например,
+hard-deny Telnet, serial, legacy-алгоритмов, plaintext) можно положить
+`policy.yml` в `~/.config/network-terminal-mcp/`. Ввод в живой сессии по
+умолчанию не подтверждается: после одобренного `open_session` модель работает в
+терминале свободно.
 
-Проверка локальной конфигурации до запуска:
+Проверка локальной политики до запуска:
 
 ```bash
 uv sync
 uv run python -m network_terminal_mcp check
 ```
 
-Подробный порядок первичной регистрации SSH host key и запуска через OpenCode
-описан в [руководстве эксплуатации](docs/operations.md).
+Подробный порядок регистрации SSH host key и запуска через OpenCode описан в
+[руководстве эксплуатации](docs/operations.md).

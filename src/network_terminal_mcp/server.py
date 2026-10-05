@@ -1,4 +1,4 @@
-"""stdio MCP server for direct network-terminal sessions."""
+"""stdio MCP server for raw network-terminal sessions."""
 
 from __future__ import annotations
 
@@ -6,23 +6,29 @@ import logging
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Literal
 
 import anyio
 from mcp.server import MCPServer
 
-from network_terminal_mcp.changes.models import ChangeResult
 from network_terminal_mcp.config.loader import load_config
-from network_terminal_mcp.errors import TargetError
+from network_terminal_mcp.config.models import (
+    CredentialSpec,
+    HostKeyPolicy,
+    LegacyAlgorithms,
+    OpenSpec,
+    Protocol,
+    RouteSpec,
+    SerialParams,
+)
 from network_terminal_mcp.sessions import (
-    CliHelpResult,
-    CommandResult,
-    ControlResult,
     OutputChunk,
-    ResponseResult,
     SessionInfo,
     SessionManager,
+    TerminalOutput,
+    TerminalSecretResult,
+    TerminalWriteResult,
 )
+from network_terminal_mcp.usage import INSTRUCTIONS, USAGE_URI, usage_text
 
 
 def create_server(
@@ -33,71 +39,105 @@ def create_server(
     """Build an MCP server, optionally with an injected manager for tests."""
     _configure_library_logging()
     session_manager = manager or SessionManager(load_config(config_dir))
-    server = MCPServer("network-terminal")
+    server = MCPServer("network-terminal", instructions=INSTRUCTIONS)
+
+    @server.resource(
+        USAGE_URI,
+        name="usage",
+        title="network-terminal operating manual",
+        description=(
+            "Full operating manual: raw terminal workflow, nested ssh/telnet "
+            "hops, secrets, configuration changes, and troubleshooting."
+        ),
+        mime_type="text/markdown",
+    )
+    def usage() -> str:
+        return usage_text()
 
     @server.tool()
     async def open_session(
-        target: str | None = None,
-        host: str | None = None,
-        credentials: str | None = None,
-        connection: str | None = None,
+        host: str,
+        credentials: CredentialSpec | None = None,
         port: int | None = None,
+        protocol: Protocol = "ssh",
+        route: RouteSpec | None = None,
+        host_key_policy: HostKeyPolicy = "strict",
+        legacy: LegacyAlgorithms | None = None,
+        allow_telnet: bool = False,
+        allow_plaintext_password: bool = False,
+        allow_serial: bool = False,
+        serial: SerialParams | None = None,
     ) -> SessionInfo:
-        """Open an inventory target or an ad-hoc SSH/Telnet session.
+        """Open a raw interactive terminal session and keep it open.
 
-        ``target`` is an inventory name (infrastructure hosts only). Without it,
-        ``host`` is required; ``credentials`` and ``connection`` fall back to
-        the configured inventory defaults. Passwords are never accepted as tool
-        arguments.
+        Describe the target inline: ``protocol`` and ``port`` describe the
+        final target, ``credentials`` are references (a ``pass`` entry, an
+        explicit SSH key file) for ssh/telnet/console. The optional single-hop
+        route is ``socks`` (local SOCKS5 proxy) or ``proxyjump`` (SSH jump
+        host); use proxyjump to reach a bastion quickly and run further ssh or
+        telnet hops yourself with terminal_write inside the same session.
+        For local console cables use ``protocol="serial"`` with an absolute
+        ``/dev/tty*`` path in ``host``, serial parameters and
+        ``allow_serial=true``. Every call goes through the client's permission
+        approval gate.
         """
-        if target is not None:
-            if any(value is not None for value in (host, credentials, connection, port)):
-                raise TargetError("target cannot be combined with ad-hoc target fields")
-            return await _run_sync(session_manager.open_session, target)
-        ad_hoc = {
-            key: value
-            for key, value in {
-                "host": host,
-                "credentials": credentials,
-                "connection": connection,
-                "port": port,
-            }.items()
-            if value is not None
-        }
-        return await _run_sync(session_manager.open_session, None, **ad_hoc)
+        spec = OpenSpec(
+            host=host,
+            port=port,
+            protocol=protocol,
+            credentials=credentials,
+            route=route,
+            host_key_policy=host_key_policy,
+            legacy=legacy,
+            allow_telnet=allow_telnet,
+            allow_plaintext_password=allow_plaintext_password,
+            allow_serial=allow_serial,
+            serial=serial or SerialParams(),
+        )
+        return await _run_sync(session_manager.open_session, spec)
 
     @server.tool()
-    async def run_command(session_id: str, command: str) -> CommandResult:
-        """Execute one policy-allowed read-only CLI command in a session."""
-        return await _run_sync(session_manager.run_command, session_id, command)
+    async def terminal_write(
+        session_id: str, data: str, enter: bool = True
+    ) -> TerminalWriteResult:
+        """Write exact input to the session's terminal stream.
+
+        Use this for commands, interactive keystrokes and nested hops such as
+        ``ssh user@host``. ``enter`` appends the transport line terminator
+        (newline, or carriage return on serial). The full ``data`` string is
+        recorded in the audit; never type passwords, passphrases or other
+        secrets here — use terminal_write_secret.
+        """
+        return await _run_sync(session_manager.terminal_write, session_id, data, enter=enter)
 
     @server.tool()
-    async def run_commands(session_id: str, commands: list[str]) -> list[CommandResult]:
-        """Execute commands serially, stopping at the first unapproved command."""
-        return await _run_sync(session_manager.run_commands, session_id, commands)
+    async def terminal_read(
+        session_id: str, timeout: float | None = None
+    ) -> TerminalOutput:
+        """Read terminal output until the stream is quiet or timeout expires.
+
+        Returns everything received, including pager screens, password
+        prompts, banners and shell output; no prompt shape is required. Use
+        session_status and read_output for offsets and buffered history.
+        """
+        return await _run_sync(session_manager.terminal_read, session_id, timeout=timeout)
 
     @server.tool()
-    async def cli_help(session_id: str, line: str) -> CliHelpResult:
-        """Read CLI completion help without executing ``line`` or pressing Enter."""
-        return await _run_sync(session_manager.cli_help, session_id, line)
+    async def terminal_write_secret(session_id: str, entry: str) -> TerminalSecretResult:
+        """Send a ``pass`` entry value at a live password or passphrase prompt.
 
-    @server.tool()
-    async def send_control(
-        session_id: str, action: Literal["space", "q", "ctrl-c"]
-    ) -> ControlResult:
-        """Send a control key only when the session is in a compatible state."""
-        return await _run_sync(session_manager.send_control, session_id, action)
-
-    @server.tool()
-    async def respond(session_id: str, response: str) -> ResponseResult:
-        """Reply only with a token allowed by the current device confirmation prompt."""
-        return await _run_sync(session_manager.respond, session_id, response)
+        Use this for every secret typed interactively (device logins, ssh,
+        enable, TACACS). The value is resolved inside the server and never
+        appears in tool arguments, results or audit; only the entry name and
+        byte count are logged.
+        """
+        return await _run_sync(session_manager.terminal_write_secret, session_id, entry)
 
     @server.tool()
     async def read_output(
         session_id: str, offset: int = 0, limit: int | None = None
     ) -> OutputChunk:
-        """Read a bounded slice of accumulated session output."""
+        """Read a bounded slice of accumulated session output by offset."""
         return await _run_sync(
             session_manager.read_output,
             session_id,
@@ -114,15 +154,6 @@ def create_server(
     async def close_session(session_id: str) -> SessionInfo:
         """Close a session and disconnect from the device."""
         return await _run_sync(session_manager.close_session, session_id)
-
-    @server.tool()
-    async def run_change(session_id: str, commands: list[str]) -> ChangeResult:
-        """Execute policy-allowed configuration change commands immediately.
-
-        Commands are validated for structural safety and run in order. A
-        device confirmation or pager aborts the run and reports it as failed.
-        """
-        return await _run_sync(session_manager.run_change, session_id, commands)
 
     return server
 

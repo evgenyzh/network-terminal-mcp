@@ -1,131 +1,46 @@
 """Configuration loading and validation.
 
-Configuration lives in ``~/.config/network-terminal-mcp/`` (overridable via the
-``NETWORK_MCP_CONFIG_DIR`` environment variable) as four YAML files:
+Only one optional YAML file remains: ``policy.yml`` (policy posture and
+runtime limits) in ``~/.config/network-terminal-mcp/``, overridable via the
+``NETWORK_MCP_CONFIG_DIR`` environment variable. Connection, credential, and
+inventory descriptions are supplied per ``open_session`` call instead.
 
-- ``inventory.yml``
-- ``connections.yml``
-- ``credentials.yml``
-- ``policy.yml``
-
-Files are optional: missing files produce empty/default configuration. Present
-files are validated strictly and must not contain unknown fields.
+Missing files produce built-in defaults, so a fresh install works read-only
+without any local configuration.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import yaml
 
-from network_terminal_mcp.config.models import (
-    ConnectionsConfig,
-    CredentialsConfig,
-    InventoryConfig,
-    NestedConnection,
-    PolicyConfig,
-    ProxyJumpConnection,
-)
+from network_terminal_mcp.config.models import PolicyConfig
 from network_terminal_mcp.errors import ConfigError
-
-if TYPE_CHECKING:
-    from pydantic import BaseModel
 
 CONFIG_DIR_ENV = "NETWORK_MCP_CONFIG_DIR"
 DEFAULT_CONFIG_DIR = Path("~/.config/network-terminal-mcp")
 
-_FILE_NAMES: tuple[str, ...] = (
-    "inventory.yml",
-    "connections.yml",
-    "credentials.yml",
-    "policy.yml",
-)
+_POLICY_FILE = "policy.yml"
 
 
 class AppConfig:
-    """Aggregate of all four configuration files."""
+    """Local policy and runtime configuration."""
 
-    def __init__(
-        self,
-        *,
-        inventory: InventoryConfig,
-        connections: ConnectionsConfig,
-        credentials: CredentialsConfig,
-        policy: PolicyConfig,
-        config_dir: Path,
-    ) -> None:
-        self.inventory = inventory
-        self.connections = connections
-        self.credentials = credentials
+    def __init__(self, *, policy: PolicyConfig, config_dir: Path) -> None:
         self.policy = policy
         self.config_dir = config_dir
 
-    def validate_references(self) -> None:
-        """Cross-check references between files.
-
-        Credential and connection profiles referenced from inventory must exist,
-        otherwise an ad-hoc or inventory target cannot be resolved.
-        """
-        for name, device in self.inventory.devices.items():
-            if device.credentials not in self.credentials.credentials:
-                raise ConfigError(
-                    f"device {name!r} references unknown credential profile "
-                    f"{device.credentials!r}"
-                )
-            if device.connection not in self.connections.connections:
-                raise ConfigError(
-                    f"device {name!r} references unknown connection profile "
-                    f"{device.connection!r}"
-                )
-        defaults = self.inventory.default_credentials, self.inventory.default_connection
-        if (
-            defaults[0] is not None
-            and defaults[0] not in self.credentials.credentials
-        ):
-            raise ConfigError(
-                f"default_credentials references unknown credential profile "
-                f"{defaults[0]!r}"
-            )
-        if (
-            defaults[1] is not None
-            and defaults[1] not in self.connections.connections
-        ):
-            raise ConfigError(
-                f"default_connection references unknown connection profile "
-                f"{defaults[1]!r}"
-            )
-        for name, profile in self.connections.connections.items():
-            if (
-                isinstance(profile, ProxyJumpConnection)
-                and profile.jump_credentials is not None
-                and profile.jump_credentials not in self.credentials.credentials
-            ):
-                raise ConfigError(
-                    f"connection {name!r} references unknown jump credential profile "
-                    f"{profile.jump_credentials!r}"
-                )
-            if (
-                isinstance(profile, NestedConnection)
-                and profile.credentials not in self.credentials.credentials
-            ):
-                raise ConfigError(
-                    f"connection {name!r} references unknown intermediate credential "
-                    f"profile {profile.credentials!r}"
-                )
-
     def to_summary(self) -> str:
         """Human-readable summary used by the CLI health check."""
-        devices = len(self.inventory.devices)
-        groups = len(self.inventory.groups)
-        connections = len(self.connections.connections)
-        credentials = len(self.credentials.credentials)
-        rules = len(self.policy.rules)
+        runtime = self.policy.runtime
         return (
-            f"devices={devices} groups={groups} "
-            f"connections={connections} "
-            f"credentials={credentials} policy_rules={rules}"
+            f"audit_file={runtime.audit_file} "
+            f"known_hosts_file={runtime.known_hosts_file} "
+            f"max_open_sessions={runtime.max_open_sessions} "
+            f"session_idle_timeout={runtime.session_idle_timeout} "
+            f"session_max_lifetime={runtime.session_max_lifetime}"
         )
 
 
@@ -153,33 +68,11 @@ def _load_yaml_file(path: Path) -> dict[str, object]:
 
 
 def load_config(config_dir: Path | None = None) -> AppConfig:
-    """Load and validate all configuration files from ``config_dir``."""
+    """Load and validate the optional local policy file."""
     directory = (config_dir or default_config_dir()).resolve()
-
-    inventory_data = _load_yaml_file(directory / "inventory.yml")
-    connections_data = _load_yaml_file(directory / "connections.yml")
-    credentials_data = _load_yaml_file(directory / "credentials.yml")
-    policy_data = _load_yaml_file(directory / "policy.yml")
-
-    def _construct[T: BaseModel](
-        model: type[T], data: dict[str, object], filename: str
-    ) -> T:
-        try:
-            return model.model_validate(data)
-        except Exception as exc:
-            raise ConfigError(f"invalid {filename}: {exc}") from exc
-
-    inventory = _construct(InventoryConfig, inventory_data, "inventory.yml")
-    connections = _construct(ConnectionsConfig, connections_data, "connections.yml")
-    credentials = _construct(CredentialsConfig, credentials_data, "credentials.yml")
-    policy = _construct(PolicyConfig, policy_data, "policy.yml")
-
-    config = AppConfig(
-        inventory=inventory,
-        connections=connections,
-        credentials=credentials,
-        policy=policy,
-        config_dir=directory,
-    )
-    config.validate_references()
-    return config
+    policy_data = _load_yaml_file(directory / _POLICY_FILE)
+    try:
+        policy = PolicyConfig.model_validate(policy_data)
+    except Exception as exc:
+        raise ConfigError(f"invalid {_POLICY_FILE}: {exc}") from exc
+    return AppConfig(policy=policy, config_dir=directory)

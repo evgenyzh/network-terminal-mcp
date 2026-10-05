@@ -2,13 +2,22 @@
 
 ## Назначение
 
-`network-terminal-mcp` предоставляет модели постоянный управляемый терминал, а
-не набор заранее подготовленных vendor-команд. Модель сама исследует CLI через
-`?`, читает ошибки синтаксиса и продолжает работу в той же сессии.
+`network-terminal-mcp` предоставляет модели постоянный сырой терминал к
+сетевому оборудованию, а не набор заранее подготовленных vendor-команд.
+Модель сама исследует CLI через `?`, читает ошибки синтаксиса, продолжает
+работу в той же сессии и при необходимости запускает внутри неё следующий
+`ssh` или `telnet`.
+
+Соединение тоже описывает модель: в `open_session` она передаёт host, protocol,
+credentials (ссылки, не секреты), опциональный route (socks/proxyjump для
+первого SSH), host key policy и, при необходимости, legacy SSH алгоритмы для
+конкретного host. Локальный inventory/connection/credential YAML не нужен;
+остаётся только необязательный `policy.yml`.
 
 Транспорт реализован в `src/network_terminal_mcp/terminal.py` как сырой
-терминальный слой: `SshTerminal` (Paramiko `invoke_shell`) и `TelnetTerminal`
-(telnetlib3) без vendor-драйверов и без понятия «платформа». Слой не переводит
+терминальный слой: `SshTerminal` (Paramiko `invoke_shell`), `TelnetTerminal`
+(telnetlib3 для Telnet и TCP console) и `SerialTerminal` (pyserial для
+`/dev/tty*`) без vendor-драйверов и без понятия «платформа». Слой не переводит
 запросы пользователя в команды и не является инвентарем или NMS.
 
 ## Компоненты
@@ -20,196 +29,145 @@ OpenCode
   v
 MCP tools
   |
-  +-- target resolver -------- inventory or ad-hoc target
-  +-- credential resolver ---- pass/GPG
-  +-- policy engine ---------- allow / ask / deny
-  +-- session manager -------- lifetime, locking, output limits
+  +-- connection spec -------- Pydantic OpenSpec: host/route/credential refs
+  +-- connection plan -------- validates defaults, ports, serial params, warnings
+  +-- credential resolver ---- pass / explicit key file / plaintext opt-in
+  +-- policy gates ----------- per-call allow flags + policy.yml defaults
+  +-- session manager -------- lifetime, locking, raw write/read, redaction
   +-- audit logger ----------- JSONL, fail-closed
   +-- host key store --------- strict known_hosts or explicit TOFU
   |
   v
-connection backend (implemented)
-  +-- SshTerminal (Paramiko invoke_shell) --- direct SSH / proxyjump / nested
+connection backend
+  +-- SshTerminal (Paramiko invoke_shell) --- direct SSH / socks / proxyjump
   +-- TelnetTerminal (telnetlib3) ----------- direct Telnet / console TCP
+  +-- SerialTerminal (pyserial) ------------- local /dev/tty* console
 ```
 
-Реализованы direct SSH, один configured SSH-only ProxyJump hop, один configured
-Nested hop (SSH или Telnet через клиент промежуточного хоста), прямой Telnet и
-TCP console profiles. Тип устройства заранее не известен и не требуется: модель
-читает banner/вывод и определяет CLI сама через generic tools.
+Реализованы direct SSH/Telnet/console/serial, один model-described SOCKS5 hop и
+один SSH ProxyJump hop для первого подключения. Дальнейшие переходы (второй
+`ssh`, `telnet`) модель выполняет сама внутри уже открытой сессии. Тип
+устройства заранее не известен и не требуется: модель читает banner/вывод и
+определяет CLI сама через generic tools.
 
-## MCP-инструменты Этапов 1-2
+## MCP-инструменты
+
+### Инструкция для модели
+
+Сервер поставляет модель-ориентированную инструкцию двумя способами: краткий
+контракт `instructions` в MCP initialize (OpenCode вкладывает его в контекст
+модели) и полный мануал как ресурс `network-terminal://usage`. Исходник обоих —
+`src/network_terminal_mcp/usage.md` и `usage.py`; их нужно держать
+синхронизированными со skill и этим документом.
 
 ### `open_session`
 
-Открывает direct, configured one-hop ProxyJump, configured one-hop Nested,
-Telnet или console-соединение и возвращает непрозрачный `session_id`, target,
-host, prompt, state и transport warnings. Тип оборудования заранее неизвестен:
-модель определяет его по banner/выводу и работает generic tools. Перед
-соединением SSH-ключ проверяется через локальный `known_hosts`; у ProxyJump
-отдельно проверяются ключи bastion и final target, у Nested — ключ intermediate
-host. Telnet/console не проверяют host key.
+Принимает валидированный `OpenSpec` и открывает постоянное соединение: host,
+protocol (`ssh`/`telnet`/`console`/`serial`), credentials, port final target,
+опциональный route, host key policy, legacy-алгоритмы и serial-параметры.
+Секреты в вызове недопустимы, кроме явного plaintext-режима за флагом. Все
+risky-опции (`telnet`, `serial`, plaintext, legacy) помечаются warning'ами и
+требуют явного per-call флага; policy может запретить их полностью. Соединение
+строится в `connections/plan.py` до любого сетевого вызова.
 
-Цель задается именем из инвентаря или одноразовым описанием `host`,
-`credentials`, `connection`, `port`. Одноразовая цель не содержит пароль и
-может ссылаться только на локальные profiles.
+Host key проверяется через локальный `known_hosts`; у ProxyJump отдельно
+проверяются ключи jump host и final target. Telnet/console/serial не проверяют
+host key. Каждый вызов `open_session` проходит через клиентский
+permission-попап OpenCode.
 
-### `run_command`
+Запуск `ssh`/`telnet` внутри сессии — обычный ввод модели: host key
+следующего hop проверяет SSH/Telnet-клиент промежуточного хоста, а не локальный
+store.
 
-Проверяет полную строку политикой, отправляет ее с Enter и читает до prompt или
-таймаута. В этой версии исполняются только решения `allow`; `ask` возвращает
-`confirmation_required`, а `deny` возвращает ошибку политики. При известном
-pager command возвращает первый фрагмент в состоянии `paging`, а при
-распознанном device confirmation - `response_required` и allowlist ответов.
-MCP не изменяет синтаксис команды.
+### `terminal_write`
 
-### `run_commands`
+Отправляет точный ввод в терминальный поток: команды, одиночные клавиши
+(`space`, `q`, Ctrl-C как `\u0003`) и переходы вида `ssh user@host` или
+`telnet host`. `enter=true` (по умолчанию) добавляет перевод строки транспорта
+(`\n`, на serial — `\r`). Полная строка пишется в audit с masking известных
+секретов. Пароли и другие секреты должны отправляться только через
+`terminal_write_secret`.
 
-Последовательно исполняет массив команд под одним session lock и
-останавливается на первой неисполненной команде, pager или device prompt.
+### `terminal_read`
 
-### `cli_help`
+Читает всё, что пришло, пока поток не стихнет (0.5 с тишины) или не истечёт
+`timeout`. Никакой формы prompt не требуется: pager-экраны, password prompts,
+banner, shell-вывод и ошибки CLI возвращаются как есть. Прочитанное
+накапливается в bounded session buffer и доступно через `read_output` по
+offset; при переполнении `oldest_offset` сообщает границу.
 
-Проверяет отдельную policy `defaults.cli_help`, отправляет `<line>?` без Enter и
-читает completion output. Вход не может содержать `?`, control characters или
-structural command hazards.
+### `terminal_write_secret`
 
-Если помощь попадает в pager (`--More--`, `---- More ----`,
-`---(more N%)---`), `cli_help` возвращает первый экран с `pager_active: true`
-и не отправляет control bytes. Модель продолжает страницами через
-`send_control(space)` либо выходит `q`. После `q` сервер ждёт распознанный
-`prompt + остаток строки`, затем посылает Ctrl-C и Ctrl-U, не нажимая Enter.
-Если pager не вернулся к известному prompt, session переводится в `failed`.
-
-После непостраничной помощи CLI может либо ждать Ctrl-C и вернуть чистый
-prompt, либо уже показать `prompt + остаток строки` (Junos/Huawei). Во втором
-случае сервер распознаёт этот хвост, посылает Ctrl-C и Ctrl-U без ожидания
-нового вывода: эти CLI очищают line buffer молча. `cli_help` всегда отправляет
-`<line>?` без Enter; для CLI, показывающих помощь только после Enter (D-Link),
-подсказка может не вернуться, и модель повторяет запрос с Enter — завершающий
-`?` не даёт строке выполниться.
-
-### `send_control`
-
-Не принимает произвольные bytes. В `paging` разрешены `space` (следующая
-страница), `q` и `ctrl-c` (отмена); для `awaiting_response` разрешен только
-`ctrl-c`. После `max_pager_pages` сервер вместо следующей `space` безопасно
-отправляет `q` и ожидает prompt.
-
-### `respond`
-
-Доступен только в `awaiting_response`. Сервер распознает ограниченный набор
-confirmation prompts с явным текстом действия и `[Y/N]`, `(Y/N)`, `[yes/no]`
-или `(yes/no)`, затем принимает только соответствующий token. Password,
-passphrase и secret prompts не получают автоматического ответа и переводят
-session в `failed`.
+Разрешает запись `pass` внутри сервера и вводит её значение в текущий prompt
+(например, `Password:`). Только имя записи и число байт попадают в audit;
+значение не появляется в аргументах, результатах и audit и добавляется в
+redaction текущей сессии. Обычный `terminal_write` для секретов использовать
+нельзя: он логируется целиком.
 
 ### `read_output`, `session_status`, `close_session`
 
-Возвращают накопленный вывод частями, состояние либо закрывают соединение.
-Вывод хранится в ограниченном session buffer; при превышении лимита старые данные
-вытесняются, а `oldest_offset` сообщает доступную начальную позицию.
-
-### Инструменты Этапа 7: изменения конфигурации
-
-`run_change(session_id, commands)` исполняет переданные команды сразу, в
-порядке перечисления. Каждая команда проходит структурную безопасность, но не
-keyword-deny (reload/save/commit-команды легитимны). Pager или device
-confirmation прерывают исполнение с ошибкой: следующие команды не выполняются,
-результат содержит per-command статус.
-
-Подтверждение вынесено на уровень клиента: в `opencode.json`
-`network-terminal_run_change` настроен на `permission: ask`, поэтому перед
-исполнением opencode показывает нативное всплывающее окно (once/always/reject)
-с командами. Серверного гейта подтверждения нет — это не дублирует permission.
-Откат (reload/commit confirmed) — рекомендация модели: она сама
-решает, взводить ли его перед изменениями и отменять после проверки.
-
-Сессии живут в памяти сервера и не переживают рестарт: после рестарта
-`run_change` для несуществующей сессии вернёт ошибку (fail-closed, ничего не
-выполнялось).
-
-### Инструменты следующих этапов
-
-`raw_input` остается отключенным по умолчанию. Policy-confirmation workflow
-для команд с решением `ask` не реализован и не использует `respond`.
+Возвращают накопленный вывод частями, состояние (prompt, warnings, lifetime)
+либо закрывают соединение. Сессии живут в памяти сервера и не переживают
+рестарт.
 
 ## Жизненный цикл сессии
 
 ```text
-connecting -> ready -> paging ------------+
-     |          |       |                 |
-     |          |       +-> awaiting_response
-     |          |                 |
-     v          v                 v
-   failed <-----+-----------------+-----> closing -> closed
+connecting -> ready -> failed
+                 |       |
+                 v       v
+              closing -> closed
 ```
 
-Каждая сессия имеет reentrant lock: одновременно выполняется одна операция или
-один пакет `run_commands`. Для сессий задаются idle timeout, hard lifetime и
-максимальный объем буфера.
+Каждая сессия имеет reentrant lock: одновременно выполняется одна операция.
+Задаются idle timeout (по умолчанию 1 час), hard lifetime (24 часа) и
+максимальный объем буфера. Один процесс держит до `max_open_sessions` (10)
+независимых сессий, поэтому несколько устройств можно держать открытыми
+одновременно и переключаться без переподключения.
 
-## Подготовка терминала и paging
+## Определение prompt и устройства
 
-После подключения терминал определяет prompt первым Enter и ждет, пока вывод
-установится. Специфичной per-driver подготовки (session_preparation) нет:
-отключение pager или пролистывание выполняет сама модель generic инструментами
-(`cli_help`, `send_control`) по наблюдаемому выводу. После вложенного SSH/Telnet
-сессия переходит на final target через клиент промежуточного хоста.
-
-Этап 2 добавляет консервативное распознавание распространенных pager markers
-(включая Junos `---(more N%)---`). Pager не продолжается автоматически: tool
-возвращает первый фрагмент и `paging`, после чего модель явно выбирает
-`space`, `q` или `ctrl-c`. Каждая страница пишется в bounded output buffer;
-page limit прерывается `q`. В help-flow совпадение prompt допускает хвост
-(`prompt + остаток строки`) только для `cli_help`; этот хвост очищается
-Ctrl-C и Ctrl-U без Enter. Вне help-flow совпадение prompt строгое.
-
-## Определение устройства по выводу
+После подключения сервер делает best-effort попытку определить prompt первым
+Enter. Если CLI не показывает распознаваемый prompt (serial-консоль в загрузке,
+pager с самого начала), сессия остаётся `ready` с warning; модель работает
+через `terminal_read`/`terminal_write`. Специфичной per-driver подготовки нет.
 
 Проект не знает тип устройства заранее и нигде его не хранит: поля platform нет
-ни на Device, ни в SessionInfo, ни в audit, ни в аргументах MCP-инструментов.
-`open_session` открывает любой SSH/Telnet/console-терминал без `device_type`.
-Модель сама определяет производителя и синтаксис CLI по banner и первым выводам,
-затем работает generic tools: `cli_help` (команда + `?`), чтение ошибок
-синтаксиса и корректировка следующей команды в той же сессии.
-
-Разница между `show mac address-table` и `show mac-address-table` не требует
-никаких драйверов: модель выясняет синтаксис через `cli_help` на живом CLI.
+ни на соединении, ни в `SessionInfo`, ни в audit, ни в аргументах
+MCP-инструментов. Модель определяет производителя и синтаксис CLI по banner и
+первым выводам, затем исследует команды через `?` и чтение ошибок.
 
 ## Транспортные маршруты
 
-- `direct` SSH: реализован `SshTerminal` на Paramiko `invoke_shell`;
-  `legacy_ssh` использует тот же Paramiko напрямую. Per-profile allowlists
-  (`host_key_algorithms`/`kex_algorithms`/`ciphers`) становятся Paramiko
-  `disabled_algorithms` и не ослабляют host key checking.
-- `proxyjump`: один configured SSH hop реализован через Paramiko `direct-tcpip`
-  channel, переданный `SshTerminal` как `sock`; arbitrary `ProxyCommand` не
-  поддерживается. С полем `socks: {host, port}` вместо `jump_host` тот же
-  профиль маршрутизирует final target через локальный SOCKS5-прокси (обычно
-  локальный SSH dynamic forward); целевой сокет создаётся модулем `socks` и
-  передаётся `SshTerminal` как `sock`, а host key цели проверяется через тот же
-  SOCKS-сокет.
-- `nested`: один configured hop; `next_protocol` поддерживает `ssh` и `telnet`.
-  Inner SSH выполняется SSH-клиентом промежуточного хоста, поэтому host key
-  final target проверяет именно он; inner Telnet host key не проверяет.
-- `direct` Telnet: реализован `TelnetTerminal` на telnetlib3 с двойным gating
-  (`allow_telnet` на устройстве и `defaults.telnet: allow`), host key не
-  проверяется.
-- `console`: реализован как TCP console port терминального сервера через
-  `TelnetTerminal`; требует заданный `port` и тот же gating.
+- `direct` SSH: `SshTerminal` на Paramiko `invoke_shell`. Legacy-алгоритмы
+  передаются per-call списками и превращаются в `disabled_algorithms` только для
+  этого соединения; host key checking не ослабляется.
+- `socks`: целевой сокет создаётся модулем `socks` через локальный SOCKS5-прокси
+  (обычно `ssh -D`) и передаётся `SshTerminal` как `sock`; host key final target
+  проверяется через тот же SOCKS-сокет. Прокси не резолвит имена, поэтому target
+  должен быть IP-адресом.
+- `proxyjump`: один SSH hop через Paramiko `direct-tcpip` channel; используется,
+  чтобы быстро попасть на bastion или terminal server и дальше работать в его
+  shell.
+- `direct` Telnet и `console`: `TelnetTerminal` на telnetlib3 с обязательным
+  per-call `allow_telnet=true`; host key не проверяется.
+- `serial`: `SerialTerminal` на pyserial; `host` — абсолютный путь `/dev/tty*`,
+  который должен быть символьным устройством. Аутентификации и транспорта
+  защиты нет; требуется `allow_serial=true`.
 
-Маршруты состоят только из заранее определенных connection profiles. Модель не
-может передать произвольную shell-команду перехода.
+Маршруты состоят только из typed-полей `open_session`. Модель не может передать
+произвольную shell-команду перехода или literal `ProxyCommand`; но внутри уже
+открытой сессии ввод не ограничен по синтаксису — это и есть смысл сырого
+терминала.
 
 ## Сырой терминальный слой
 
-`SshTerminal` и `TelnetTerminal` реализуют общий `TerminalConnection` protocol:
-`find_prompt`, `send_command`, `write_channel`, `read_until_pattern`,
-`read_channel_timing`, `disconnect`. SessionManager собирает transport params и
-передает их в подходящий класс: ключи `transport` ("ssh"|"telnet"), `host`,
-`port`, `username`, `password`/`key_file`/`passphrase`, `known_hosts_file`,
-`conn_timeout`/`banner_timeout`/`auth_timeout`, опциональный `sock` (SOCKS/jump)
-и опциональный `disabled_algorithms`. Среди параметров нет `device_type`: слой
-открывает любой ssh/telnet/console терминал, читает banner/вывод, а
-интерпретацию оставляет модели.
+`SshTerminal`, `TelnetTerminal` и `SerialTerminal` реализуют общий
+`TerminalConnection` protocol: `find_prompt`, `write_channel`,
+`read_channel_timing`, `disconnect` (плюс низкоуровневые helpers). SessionManager
+собирает transport params и передает их в подходящий класс: ключи `transport`
+("ssh"|"telnet"|"serial"), `host`/`device`, `port`, `username`,
+`password`/`key_file`/`passphrase`, serial-параметры, `known_hosts_file`,
+timeouts, опциональный `sock` (SOCKS/jump) и опциональный
+`disabled_algorithms`. Среди параметров нет `device_type`: слой открывает любой
+терминал, читает вывод, а интерпретацию оставляет модели.

@@ -45,3 +45,17 @@ def test_ignores_empty_secrets() -> None:
 @pytest.mark.parametrize("text", ["", "no secrets here"])
 def test_no_secret_no_change(text: str) -> None:
     assert Redactor(["x"]).redact(text) == text
+
+
+def test_add_registers_new_secrets_longest_first() -> None:
+    redactor = Redactor(["hunter2"])
+    redactor.add("typed-secret", "typed", "")
+    assert redactor.redact("typed typed-secret hunter2") == (
+        f"{REDACTED} {REDACTED} {REDACTED}"
+    )
+
+
+def test_add_ignores_empty_values() -> None:
+    redactor = Redactor()
+    redactor.add("", "   ")
+    assert not redactor

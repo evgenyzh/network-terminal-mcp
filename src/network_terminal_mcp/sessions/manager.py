@@ -1,77 +1,55 @@
-"""Session manager for raw SSH/Telnet terminal sessions."""
+"""Session manager for raw interactive SSH/Telnet/console/serial terminals."""
 
 from __future__ import annotations
 
-import re
 import threading
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal, Protocol, TypedDict, cast
+from typing import Protocol, TypedDict
 
 import paramiko
 
 from network_terminal_mcp.audit import AuditLogger
-from network_terminal_mcp.changes.models import ChangeCommand, ChangeResult
 from network_terminal_mcp.config.loader import AppConfig
 from network_terminal_mcp.config.models import (
-    Action,
-    ConnectionProfile,
-    ConsoleConnection,
-    CredentialProfile,
-    DirectConnection,
-    NestedConnection,
-    ProxyJumpConnection,
+    CredentialSpec,
+    LegacyAlgorithms,
+    OpenSpec,
+    ProxyJumpRoute,
+    SocksRoute,
+    validate_pass_entry,
+)
+from network_terminal_mcp.connections.plan import (
+    ConnectionPlan,
+    build_plan,
+    route_label,
 )
 from network_terminal_mcp.credentials.pass_backend import Credentials, PassBackend
-from network_terminal_mcp.errors import PolicyError, SessionError, TransportError
+from network_terminal_mcp.errors import SessionError, TransportError
 from network_terminal_mcp.host_keys import HostKeyStatus, HostKeyStore, probe_host_key_socket
-from network_terminal_mcp.policy.engine import PolicyEngine, check_structural_safety
 from network_terminal_mcp.redaction import Redactor
 from network_terminal_mcp.sessions.models import (
-    CliHelpResult,
-    CommandResult,
-    ControlResult,
     OutputChunk,
-    ResponseResult,
     SessionInfo,
     SessionState,
+    TerminalOutput,
+    TerminalSecretResult,
+    TerminalWriteResult,
 )
 from network_terminal_mcp.socks import socks5_connect
-from network_terminal_mcp.targets.resolver import Target, TargetResolver
 from network_terminal_mcp.terminal import (
+    SerialTerminal,
     SshTerminal,
     TelnetTerminal,
     TerminalConnection,
 )
 
+_READ_QUIET_SECONDS = 0.5
 
-class CredentialResolver(Protocol):
-    """Credential backend abstraction used by tests and the real server."""
-
-    def resolve(self, profile: CredentialProfile) -> Credentials: ...
-
-
-ConnectionFactory = Callable[[dict[str, object]], TerminalConnection]
-Clock = Callable[[], float]
-
-_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_PAGER_END = re.compile(
-    r"(?:--more--|<--- more --->|---- more ----|press any key to continue|"
-    r"---\s*\(\s*more(?:\s+\d+\s*%?)?\s*\)\s*---)\s*\Z",
-    re.IGNORECASE,
-)
-_CONFIRMATION_END = re.compile(
-    r"(?:\b(?:continue|proceed|confirm|are you sure|do you want|really|overwrite|"
-    r"delete|save|reset|reboot|reload)\b[^\r\n]{0,160}"
-    r"(?:\[y/n\]|\(y/n\)|\[yes/no\]|\(yes/no\)))\s*\Z",
-    re.IGNORECASE,
-)
-_SECRET_END = re.compile(r"(?:password|passphrase|secret)\s*:\s*\Z", re.IGNORECASE)
-
-# Full algorithm sets Paramiko can offer; per-profile allowlists become the
+# Full algorithm sets Paramiko can offer; per-call allowlists become the
 # complement via ``disabled_algorithms`` so legacy overrides are never global.
 _PARAMIKO_ALGORITHMS: dict[str, list[str]] = {
     "keys": sorted(paramiko.Transport._preferred_keys),  # type: ignore[attr-defined]
@@ -80,19 +58,16 @@ _PARAMIKO_ALGORITHMS: dict[str, list[str]] = {
 }
 
 
-@dataclass(frozen=True)
-class _PendingResponse:
-    prompt: str
-    allowed_responses: tuple[str, ...]
+class CredentialResolver(Protocol):
+    """Credential backend abstraction used by tests and the real server."""
+
+    def resolve(self, spec: CredentialSpec) -> Credentials: ...
+
+    def read_entry(self, entry: str) -> str: ...
 
 
-@dataclass(frozen=True)
-class _TerminalOutcome:
-    output: str
-    pager_active: bool = False
-    response_required: bool = False
-    device_prompt: str | None = None
-    allowed_responses: tuple[str, ...] = ()
+ConnectionFactory = Callable[[dict[str, object]], TerminalConnection]
+Clock = Callable[[], float]
 
 
 class _OutputFields(TypedDict):
@@ -100,38 +75,36 @@ class _OutputFields(TypedDict):
     truncated: bool
     output_offset: int | None
     next_output_offset: int | None
-    pager_active: bool
-    response_required: bool
-    device_prompt: str | None
-    allowed_responses: list[str]
 
 
 def _connection_factory_default(params: dict[str, object]) -> TerminalConnection:
     """Build a raw terminal from a transport params dict."""
     transport = params["transport"]
     connect_params = {k: v for k, v in params.items() if k != "transport"}
+    terminal: TerminalConnection
     if transport == "telnet":
-        terminal: SshTerminal | TelnetTerminal = TelnetTerminal()
-        terminal.connect(**connect_params)  # type: ignore[arg-type]
-        return terminal
-    if transport == "ssh":
+        terminal = TelnetTerminal()
+    elif transport == "serial":
+        terminal = SerialTerminal()
+    elif transport == "ssh":
         terminal = SshTerminal()
-        terminal.connect(**connect_params)  # type: ignore[arg-type]
-        return terminal
-    raise TransportError(f"unsupported transport {transport!r}")
+    else:
+        raise TransportError(f"unsupported transport {transport!r}")
+    terminal.connect(**connect_params)  # type: ignore[arg-type]
+    return terminal
 
 
-def _disabled_algorithms(profile: DirectConnection) -> dict[str, list[str]] | None:
-    """Convert per-profile allowlists into Paramiko ``disabled_algorithms``.
+def _disabled_algorithms(legacy: LegacyAlgorithms) -> dict[str, list[str]] | None:
+    """Convert per-call allowlists into Paramiko ``disabled_algorithms``.
 
-    Only categories explicitly listed in the profile are restricted; the
+    Only categories explicitly listed in the call are restricted; the
     remaining categories keep Paramiko's default algorithm set. Returns None
-    when the profile does not restrict anything.
+    when nothing is restricted.
     """
     allowlists: dict[str, list[str] | None] = {
-        "keys": profile.host_key_algorithms,
-        "kex": profile.kex_algorithms,
-        "ciphers": profile.ciphers,
+        "keys": legacy.host_key_algorithms,
+        "kex": legacy.kex_algorithms,
+        "ciphers": legacy.ciphers,
     }
     disabled: dict[str, list[str]] = {}
     for category, allowlist in allowlists.items():
@@ -145,11 +118,10 @@ def _disabled_algorithms(profile: DirectConnection) -> dict[str, list[str]] | No
 @dataclass
 class _ManagedSession:
     session_id: str
-    target: Target
+    plan: ConnectionPlan
     connection: TerminalConnection
     jump_client: paramiko.SSHClient | None
     prompt: str
-    raw_prompt: str
     warnings: list[str]
     redactor: Redactor
     created_at: datetime
@@ -160,14 +132,11 @@ class _ManagedSession:
     output: str = ""
     output_start: int = 0
     output_truncated: bool = False
-    pager_pages: int = 0
-    pager_is_help: bool = False
-    pending_response: _PendingResponse | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
 class SessionManager:
-    """Own direct SSH sessions and expose safe, synchronous operations."""
+    """Own raw persistent sessions and expose synchronous terminal operations."""
 
     def __init__(
         self,
@@ -181,8 +150,6 @@ class SessionManager:
         clock: Clock = time.monotonic,
     ) -> None:
         self._config = config
-        self._targets = TargetResolver(config)
-        self._policy = PolicyEngine(config.policy)
         self._connection_factory = connection_factory
         self._credentials = credential_resolver or PassBackend()
         self._audit = audit_logger or AuditLogger(config.policy.runtime.audit_file)
@@ -192,63 +159,38 @@ class SessionManager:
         self._sessions: dict[str, _ManagedSession] = {}
         self._lock = threading.RLock()
 
-    def open_session(self, name: str | None = None, **ad_hoc: object) -> SessionInfo:
-        """Open a configured or ad-hoc raw terminal session."""
+    # ------------------------------------------------------------------
+    # Session lifecycle
+    # ------------------------------------------------------------------
+
+    def open_session(self, spec: OpenSpec) -> SessionInfo:
+        """Open a model-described raw terminal session."""
         self._cleanup_expired()
-        target = self._targets.resolve(name=name, **ad_hoc)
-        profile = self._transport_profile(target)
-        credentials = self._resolve_credentials(target.credentials)
-        intermediate_credentials = (
-            self._resolve_credentials(profile.credentials)
-            if isinstance(profile, NestedConnection)
-            else None
-        )
-        jump_credentials = (
-            self._resolve_credentials(profile.jump_credentials)
-            if isinstance(profile, ProxyJumpConnection) and profile.jump_credentials is not None
-            else None
-        )
+        plan = build_plan(spec)
+        self._require_connection_allowed(plan)
+        credentials: Credentials | None = None
+        route_credentials: Credentials | None = None
+        if plan.protocol != "serial":
+            assert plan.credentials is not None
+            credentials = self._resolve_credentials(plan.credentials)
+            if isinstance(plan.route, ProxyJumpRoute):
+                route_credentials = self._resolve_credentials(plan.route.credentials)
         passwords = [
             secret
-            for secret in (credentials.password, credentials.key_passphrase)
+            for source in (credentials, route_credentials)
+            if source is not None
+            for secret in (source.password, source.key_passphrase)
             if secret is not None
         ]
-        if intermediate_credentials is not None:
-            passwords.extend(
-                secret
-                for secret in (
-                    intermediate_credentials.password,
-                    intermediate_credentials.key_passphrase,
-                )
-                if secret is not None
-            )
-        if jump_credentials is not None:
-            passwords.extend(
-                secret
-                for secret in (jump_credentials.password, jump_credentials.key_passphrase)
-                if secret is not None
-            )
         redactor = Redactor(passwords)
-        port = target.port or profile.port or 22
-        if isinstance(profile, NestedConnection):
-            if profile.next_protocol == "telnet":
-                port = target.port or profile.next_port or 23
-            else:
-                port = target.port or profile.next_port or 22
-        if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
-            port = target.port or profile.port or 23
-        if isinstance(profile, ConsoleConnection):
-            console_port = target.port or profile.port
-            if console_port is None:
-                raise TransportError("console connection requires a port")
-            port = console_port
-        warnings = self._transport_warnings(profile)
-        route = self._route_details(profile)
+        warnings = list(plan.warnings)
+        route = self._route_details(plan)
+        username = credentials.username if credentials is not None else "-"
 
         self._audit_event(
             "open_session",
-            target=target,
-            username=credentials.username,
+            plan=plan,
+            username=username,
             outcome="started",
             redactor=redactor,
             **route,
@@ -257,18 +199,19 @@ class SessionManager:
         jump_client: paramiko.SSHClient | None = None
         sock: object | None = None
         try:
-            timeout = float(self._config.policy.runtime.command_timeout)
-            if isinstance(profile, ProxyJumpConnection) and profile.socks is not None:
-                socks_endpoint = profile.socks
+            timeout = float(self._config.policy.runtime.io_timeout)
+            if isinstance(plan.route, SocksRoute):
+                assert plan.port is not None
+                socks_route = plan.route
                 host_key = self._host_keys.ensure(
-                    target.host,
-                    port=port,
-                    policy=profile.host_key_policy,
+                    plan.host,
+                    port=plan.port,
+                    policy=plan.host_key_policy,
                     timeout=timeout,
                     probe=lambda host, probe_port, probe_timeout: probe_host_key_socket(
                         socks5_connect(
-                            socks_endpoint.host,
-                            socks_endpoint.port,
+                            socks_route.host,
+                            socks_route.port,
                             host,
                             probe_port,
                             probe_timeout,
@@ -277,103 +220,90 @@ class SessionManager:
                     ),
                 )
                 sock = socks5_connect(
-                    socks_endpoint.host,
-                    socks_endpoint.port,
-                    target.host,
-                    port,
+                    socks_route.host,
+                    socks_route.port,
+                    plan.host,
+                    plan.port,
                     timeout,
                 )
-            elif isinstance(profile, ProxyJumpConnection):
-                assert jump_credentials is not None
-                assert profile.jump_host is not None
+            elif isinstance(plan.route, ProxyJumpRoute):
+                assert route_credentials is not None
+                jump_route = plan.route
                 jump_host_key = self._host_keys.ensure(
-                    profile.jump_host,
-                    port=profile.jump_port,
-                    policy=profile.jump_host_key_policy,
+                    jump_route.host,
+                    port=jump_route.port,
+                    policy=jump_route.host_key_policy,
                     timeout=timeout,
                 )
                 warnings.extend(
                     f"jump host: {warning}" for warning in self._host_key_warnings(jump_host_key)
                 )
-                jump_client = self._open_jump_client(profile, jump_credentials)
+                jump_client = self._open_jump_client(jump_route, route_credentials)
+                assert plan.port is not None
                 host_key = self._host_keys.ensure(
-                    target.host,
-                    port=port,
-                    policy=profile.host_key_policy,
+                    plan.host,
+                    port=plan.port,
+                    policy=plan.host_key_policy,
                     timeout=timeout,
                     probe=lambda host, probe_port, probe_timeout: self._probe_via_jump(
                         jump_client, host, probe_port, probe_timeout
                     ),
                 )
-                sock = self._open_jump_channel(jump_client, target.host, port)
-            elif isinstance(profile, NestedConnection):
-                assert intermediate_credentials is not None
-                intermediate_host_key = self._host_keys.ensure(
-                    profile.host,
-                    port=profile.port or 22,
-                    policy=profile.host_key_policy,
-                    timeout=timeout,
-                )
-                warnings.extend(
-                    f"intermediate host: {warning}"
-                    for warning in self._host_key_warnings(intermediate_host_key)
-                )
+                sock = self._open_jump_channel(jump_client, plan.host, plan.port)
+            elif plan.protocol == "serial":
                 connection = self._connection_factory(
-                    self._ssh_transport_params(
-                        profile.host,
-                        profile.port or 22,
-                        intermediate_credentials,
-                        sock=None,
-                    )
-                )
-                if profile.next_protocol == "telnet":
-                    self._nested_telnet_login(connection, target, credentials, port)
-                else:
-                    self._nested_login(connection, target, credentials, port)
-                host_key = None
-                sock = None
-            elif isinstance(profile, DirectConnection) and profile.protocol == "telnet":
-                self._require_telnet_allowed(target)
-                connection = self._connection_factory(
-                    self._telnet_transport_params(target, credentials, port)
+                    self._serial_transport_params(plan)
                 )
                 host_key = None
-                sock = None
-            elif isinstance(profile, ConsoleConnection):
-                self._require_telnet_allowed(target)
+            elif plan.protocol in ("telnet", "console"):
+                assert credentials is not None
                 connection = self._connection_factory(
-                    self._telnet_transport_params(target, credentials, port)
+                    self._telnet_transport_params(plan, credentials)
                 )
                 host_key = None
-                sock = None
             else:
+                assert plan.port is not None
                 host_key = self._host_keys.ensure(
-                    target.host,
-                    port=port,
-                    policy=profile.host_key_policy,
+                    plan.host,
+                    port=plan.port,
+                    policy=plan.host_key_policy,
                     timeout=timeout,
                 )
-                sock = None
             if host_key is not None:
                 warnings.extend(self._host_key_warnings(host_key))
             if connection is None:
+                assert credentials is not None
+                assert plan.port is not None
                 connection = self._connection_factory(
                     self._ssh_transport_params(
-                        target.host, port, credentials, sock=sock, profile=profile
+                        plan.host, plan.port, credentials, sock=sock, legacy=plan.legacy
                     )
                 )
-            prompt = connection.find_prompt()
+            prompt = ""
+            try:
+                prompt = connection.find_prompt()
+            except TransportError:
+                warnings.append(
+                    "device prompt not detected; inspect output with terminal_read"
+                )
         except Exception as exc:
             try:
                 if connection is not None:
                     connection.disconnect()
             finally:
                 self._close_jump_client(jump_client)
-            message = redactor.redact(str(exc))
+            if isinstance(exc, paramiko.AuthenticationException):
+                message = (
+                    f"authentication failed for final target {username}@"
+                    f"{plan.host}:{plan.port}; the client permission gate was "
+                    "not the problem - check the target credential reference"
+                )
+            else:
+                message = redactor.redact(str(exc))
             self._audit_event(
                 "open_session",
-                target=target,
-                username=credentials.username,
+                plan=plan,
+                username=username,
                 outcome="failed",
                 redactor=redactor,
                 error=message,
@@ -381,17 +311,18 @@ class SessionManager:
             )
             if isinstance(exc, TransportError):
                 raise
-            raise TransportError(f"failed to connect to {target.name}: {message}") from exc
+            if isinstance(exc, paramiko.AuthenticationException):
+                raise TransportError(message) from exc
+            raise TransportError(f"failed to connect to {plan.host}: {message}") from exc
 
         now = self._clock()
         wall_now = datetime.now(UTC)
         session = _ManagedSession(
             session_id=uuid.uuid4().hex,
-            target=target,
+            plan=plan,
             connection=connection,
             jump_client=jump_client,
             prompt=redactor.redact(prompt),
-            raw_prompt=prompt,
             warnings=warnings,
             redactor=redactor,
             created_at=wall_now,
@@ -409,8 +340,8 @@ class SessionManager:
             self._sessions[session.session_id] = session
         self._audit_event(
             "open_session",
-            target=target,
-            username=credentials.username,
+            plan=plan,
+            username=username,
             outcome="completed",
             redactor=redactor,
             session_id=session.session_id,
@@ -420,203 +351,197 @@ class SessionManager:
         )
         return self._session_info(session)
 
-    def run_command(self, session_id: str, command: str) -> CommandResult:
-        """Execute a policy-allowed read-only command in a ready session."""
+    def close_session(self, session_id: str) -> SessionInfo:
+        with self._lock:
+            session = self._sessions.pop(session_id, None)
+        if session is None:
+            raise SessionError(f"unknown or expired session {session_id}")
+        with session.lock:
+            session.state = SessionState.CLOSING
+            self._audit_event(
+                "close_session",
+                plan=session.plan,
+                outcome="started",
+                redactor=session.redactor,
+                session_id=session_id,
+            )
+            try:
+                session.connection.disconnect()
+            finally:
+                self._close_jump_client(session.jump_client)
+                session.jump_client = None
+                session.state = SessionState.CLOSED
+                self._touch(session)
+            self._audit_event(
+                "close_session",
+                plan=session.plan,
+                outcome="completed",
+                redactor=session.redactor,
+                session_id=session_id,
+            )
+            return self._session_info(session)
+
+    def session_status(self, session_id: str) -> SessionInfo:
+        """Return current metadata for an active session."""
+        session = self._get_session(session_id)
+        with session.lock:
+            return self._session_info(session)
+
+    # ------------------------------------------------------------------
+    # Raw terminal I/O
+    # ------------------------------------------------------------------
+
+    def terminal_write(
+        self, session_id: str, data: str, *, enter: bool = True
+    ) -> TerminalWriteResult:
+        """Write exact input to the terminal stream.
+
+        The whole ``data`` string is recorded in the audit (redacted only for
+        secrets the server already knows). Passwords and other secrets must be
+        sent with :meth:`terminal_write_secret` instead.
+        """
         session = self._get_session(session_id)
         with session.lock:
             self._require_ready(session)
-            decision = self._policy.evaluate(command)
-            if decision != "allow":
-                self._audit_command(session, command, decision, "not_executed")
-                if decision == "deny":
-                    raise PolicyError("command is denied by policy")
-                return CommandResult(
-                    session_id=session_id,
-                    command=session.redactor.redact(command),
-                    policy=decision,
-                    executed=False,
-                    confirmation_required=True,
+            payload = data + (self._enter_sequence(session) if enter else "")
+            encoded = payload.encode("utf-8")
+            if len(encoded) > self._config.policy.runtime.max_write_bytes:
+                raise SessionError(
+                    f"input exceeds max_write_bytes "
+                    f"({self._config.policy.runtime.max_write_bytes})"
                 )
-
-            self._audit_command(session, command, decision, "started")
+            self._audit_interaction(
+                session,
+                "terminal_write",
+                "started",
+                data=session.redactor.redact(data),
+                enter=enter,
+                bytes=len(encoded),
+            )
             try:
-                outcome = self._consume_terminal_output(
-                    session, self._send_command_until_terminal(session, command)
-                )
+                session.connection.write_channel(payload)
             except Exception as exc:
                 self._fail_session(session)
                 message = session.redactor.redact(str(exc))
-                self._audit_command(session, command, decision, "failed", error=message)
-                raise TransportError(f"command failed in session {session_id}: {message}") from exc
-
-            output_fields = self._record_terminal_output(session, outcome)
+                self._audit_interaction(
+                    session, "terminal_write", "failed", error=message
+                )
+                raise TransportError(
+                    f"terminal write failed in session {session_id}: {message}"
+                ) from exc
             self._touch(session)
-            self._audit_command(
-                session,
-                command,
-                decision,
-                self._terminal_outcome_label(outcome),
-                output_bytes=self._output_bytes(session, outcome.output),
+            self._audit_interaction(
+                session, "terminal_write", "completed", bytes=len(encoded)
             )
-            return CommandResult(
+            return TerminalWriteResult(
                 session_id=session_id,
-                command=session.redactor.redact(command),
-                policy=decision,
-                executed=True,
-                **output_fields,
+                data=session.redactor.redact(data),
+                bytes_sent=len(encoded),
+                state=session.state,
             )
 
-    def run_commands(self, session_id: str, commands: list[str]) -> list[CommandResult]:
-        """Run commands serially and stop at the first unexecuted command."""
-        session = self._get_session(session_id)
-        with session.lock:
-            results: list[CommandResult] = []
-            for command in commands:
-                result = self.run_command(session_id, command)
-                results.append(result)
-                if not result.executed or result.pager_active or result.response_required:
-                    break
-            return results
+    def terminal_write_secret(
+        self, session_id: str, entry: str
+    ) -> TerminalSecretResult:
+        """Send a ``pass`` entry value at a live password/passphrase prompt.
 
-    def cli_help(self, session_id: str, line: str) -> CliHelpResult:
-        """Read completion help, then cancel the unfinished line before returning."""
+        The secret value is resolved inside the server, written to the stream,
+        and added to redaction. Only the entry name and byte count are
+        audited; the value never appears in tool arguments, results, or audit.
+        """
         session = self._get_session(session_id)
         with session.lock:
             self._require_ready(session)
-            decision = self._policy.evaluate_cli_help(line)
-            if decision != "allow":
-                self._audit_interaction(
-                    session,
-                    "cli_help",
-                    "not_executed",
-                    line=line,
-                    policy=decision,
-                )
-                if decision == "deny":
-                    raise PolicyError("CLI help is denied by policy")
-                return CliHelpResult(
-                    session_id=session_id,
-                    line=session.redactor.redact(line),
-                    policy=decision,
-                    executed=False,
-                    confirmation_required=True,
-                )
-
-            self._audit_interaction(
-                session, "cli_help", "started", line=line, policy=decision
-            )
-            help_timeout = float(self._config.policy.runtime.cli_help_timeout)
             try:
-                raw_output = self._read_help(session, line)
-                visible = _visible_terminal_text(raw_output)
-                if self._ends_with_pager(visible):
-                    session.state = SessionState.PAGING
-                    session.pending_response = None
-                    session.pager_pages = 1
-                    session.pager_is_help = True
-                    outcome = _TerminalOutcome(output=raw_output, pager_active=True)
-                elif self._ends_with_secret_prompt(visible):
-                    raise SessionError("device requested a secret during CLI help")
-                elif self._ends_with_help_prompt(session, visible):
-                    self._clear_help_tail(session)
-                    outcome = _TerminalOutcome(
-                        output=self._strip_help_prompt(session, raw_output)
-                    )
-                else:
-                    self._return_to_prompt(session, timeout=help_timeout)
-                    outcome = _TerminalOutcome(output=raw_output)
+                validate_pass_entry(entry)
+            except ValueError as exc:
+                raise SessionError(f"invalid pass entry: {exc}") from exc
+            value = self._credentials.read_entry(entry)
+            if not value:
+                raise SessionError(f"pass entry {entry!r} resolved to an empty secret")
+            payload = value + self._enter_sequence(session)
+            encoded = payload.encode("utf-8")
+            self._audit_interaction(
+                session,
+                "terminal_write_secret",
+                "started",
+                entry=entry,
+                bytes=len(encoded),
+            )
+            session.redactor.add(value)
+            try:
+                session.connection.write_channel(payload)
             except Exception as exc:
                 self._fail_session(session)
                 message = session.redactor.redact(str(exc))
                 self._audit_interaction(
-                    session, "cli_help", "failed", line=line, policy=decision, error=message
+                    session, "terminal_write_secret", "failed", entry=entry, error=message
                 )
-                raise TransportError(f"CLI help failed in session {session_id}: {message}") from exc
-
-            output_fields = self._record_terminal_output(session, outcome)
+                raise TransportError(
+                    f"secret write failed in session {session_id}: {message}"
+                ) from exc
             self._touch(session)
             self._audit_interaction(
-                session,
-                "cli_help",
-                self._terminal_outcome_label(outcome),
-                line=line,
-                policy=decision,
-                output_bytes=self._output_bytes(session, outcome.output),
+                session, "terminal_write_secret", "completed", entry=entry, bytes=len(encoded)
             )
-            return CliHelpResult(
+            return TerminalSecretResult(
                 session_id=session_id,
-                line=session.redactor.redact(line),
-                policy=decision,
-                executed=True,
-                **output_fields,
+                entry=entry,
+                bytes_sent=len(encoded),
+                state=session.state,
             )
 
-    def send_control(self, session_id: str, action: str) -> ControlResult:
-        """Continue or cancel a pager, or cancel a recognized device prompt."""
+    def terminal_read(
+        self, session_id: str, *, timeout: float | None = None
+    ) -> TerminalOutput:
+        """Read output until the stream is quiet or ``timeout`` expires.
+
+        No prompt shape is required: pager screens, password prompts, banners,
+        and normal output are all returned verbatim. Accumulated output stays
+        available through :meth:`read_output` with offsets.
+        """
         session = self._get_session(session_id)
         with session.lock:
-            if action == "space":
-                self._require_state(session, SessionState.PAGING, action)
-                return self._continue_pager(session, action)
-            if action == "q":
-                self._require_state(session, SessionState.PAGING, action)
-                return self._cancel_interaction(session, action, "pager")
-            if action == "ctrl-c":
-                if session.state not in (SessionState.PAGING, SessionState.AWAITING_RESPONSE):
-                    raise SessionError(
-                        f"control {action!r} is not allowed while session "
-                        f"{session.session_id} is {session.state.value}"
-                    )
-                return self._cancel_interaction(session, action, "interactive prompt")
-            raise SessionError(f"unsupported control action: {action!r}")
-
-    def respond(self, session_id: str, response: str) -> ResponseResult:
-        """Send one allowlisted response to the pending device confirmation prompt."""
-        session = self._get_session(session_id)
-        with session.lock:
-            self._require_state(session, SessionState.AWAITING_RESPONSE, "respond")
-            pending = session.pending_response
-            if pending is None:
-                self._fail_session(session)
-                raise SessionError("session lost its pending response metadata")
-            normalized = response.lower()
-            if normalized not in pending.allowed_responses:
-                self._audit_interaction(
-                    session,
-                    "respond",
-                    "denied",
-                    response=response,
-                    allowed_responses=list(pending.allowed_responses),
-                )
-                raise PolicyError("response is not allowed by the pending device prompt")
-
-            self._audit_interaction(session, "respond", "started", response=normalized)
+            self._require_ready(session)
+            read_timeout = float(
+                timeout if timeout is not None else self._config.policy.runtime.io_timeout
+            )
+            if read_timeout <= 0:
+                raise SessionError("read timeout must be positive")
+            maximum = float(self._config.policy.runtime.max_read_timeout)
+            if read_timeout > maximum:
+                raise SessionError(f"read timeout exceeds max_read_timeout ({maximum:g})")
+            self._audit_interaction(session, "terminal_read", "started", timeout=read_timeout)
             try:
-                outcome = self._consume_terminal_output(
-                    session,
-                    self._send_command_until_terminal(session, normalized, cmd_verify=False),
+                raw = session.connection.read_channel_timing(
+                    last_read=_READ_QUIET_SECONDS,
+                    read_timeout=read_timeout,
                 )
             except Exception as exc:
                 self._fail_session(session)
                 message = session.redactor.redact(str(exc))
-                self._audit_interaction(
-                    session, "respond", "failed", response=normalized, error=message
-                )
-                raise TransportError(f"response failed in session {session_id}: {message}") from exc
-
-            output_fields = self._record_terminal_output(session, outcome)
+                self._audit_interaction(session, "terminal_read", "failed", error=message)
+                raise TransportError(
+                    f"terminal read failed in session {session_id}: {message}"
+                ) from exc
+            output = session.redactor.redact(raw)
+            offset = self._append_output(session, output)
+            inline, truncated = _truncate_utf8(
+                output, self._config.policy.runtime.max_inline_output_bytes
+            )
             self._touch(session)
             self._audit_interaction(
                 session,
-                "respond",
-                self._terminal_outcome_label(outcome),
-                response=normalized,
-                output_bytes=self._output_bytes(session, outcome.output),
+                "terminal_read",
+                "completed",
+                bytes=len(output.encode()),
             )
-            return ResponseResult(
+            return TerminalOutput(
                 session_id=session_id,
-                response=normalized,
-                **output_fields,
+                output=inline,
+                truncated=truncated,
+                output_offset=offset,
+                next_output_offset=offset + len(output) if truncated else None,
             )
 
     def read_output(
@@ -649,510 +574,60 @@ class SessionManager:
                 truncated=session.output_truncated,
             )
 
-    def session_status(self, session_id: str) -> SessionInfo:
-        """Return current metadata for an active session."""
-        session = self._get_session(session_id)
-        with session.lock:
-            return self._session_info(session)
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
 
-    def close_session(self, session_id: str) -> SessionInfo:
-        with self._lock:
-            session = self._sessions.pop(session_id, None)
-        if session is None:
-            raise SessionError(f"unknown or expired session {session_id}")
-        with session.lock:
-            session.state = SessionState.CLOSING
-            self._audit_event(
-                "close_session",
-                target=session.target,
-                outcome="started",
-                redactor=session.redactor,
-                session_id=session_id,
-            )
-            try:
-                session.connection.disconnect()
-            finally:
-                self._close_jump_client(session.jump_client)
-                session.jump_client = None
-                session.state = SessionState.CLOSED
-                self._touch(session)
-            self._audit_event(
-                "close_session",
-                target=session.target,
-                outcome="completed",
-                redactor=session.redactor,
-                session_id=session_id,
-            )
-            return self._session_info(session)
+    @staticmethod
+    def _enter_sequence(session: _ManagedSession) -> str:
+        """Return the line terminator for the session's transport."""
+        return "\r" if session.plan.protocol == "serial" else "\n"
 
-    def run_change(self, session_id: str, commands: list[str]) -> ChangeResult:
-        """Execute policy-allowed configuration change commands immediately.
+    def _resolve_credentials(self, spec: CredentialSpec) -> Credentials:
+        return self._credentials.resolve(spec)
 
-        Commands are validated for structural safety and run in order against
-        the session's device. Any command that raises is fail-closed: the run
-        stops, remaining commands are left unexecuted, and the outcome is
-        recorded in the audit log.
-        """
-        if not commands:
-            raise PolicyError("run_change requires at least one command")
-        session = self._get_session(session_id)
-        results: list[ChangeCommand] = [
-            ChangeCommand(command=command) for command in commands
-        ]
-        with session.lock:
-            self._require_ready(session)
-            for result in results:
-                check_structural_safety(result.command, tool="run_change")
-            output_parts: list[str] = []
-            try:
-                for index, result in enumerate(results):
-                    executed = self._run_change_command(
-                        session, result, output_parts
-                    )
-                    if executed is not result:
-                        results[index] = executed
-            except Exception as exc:
-                message = session.redactor.redact(str(exc))
-                self._audit_event(
-                    "run_change",
-                    target=session.target,
-                    outcome="failed",
-                    redactor=session.redactor,
-                    session_id=session.session_id,
-                    error=message,
-                )
-                return ChangeResult(
-                    session_id=session.session_id,
-                    commands=results,
-                    output="\n".join(output_parts),
-                    error=message,
-                )
-
-            self._touch(session)
-            self._audit_event(
-                "run_change",
-                target=session.target,
-                outcome="completed",
-                redactor=session.redactor,
-                session_id=session.session_id,
-            )
-            return ChangeResult(
-                session_id=session.session_id,
-                commands=results,
-                output="\n".join(output_parts),
-            )
-
-    def _run_change_command(
-        self,
-        session: _ManagedSession,
-        result: ChangeCommand,
-        output_parts: list[str],
-    ) -> ChangeCommand:
-        """Execute one change command, returning it marked executed."""
-        check_structural_safety(result.command, tool="run_change")
-        self._require_ready(session)
-        raw_output = self._send_command_until_terminal(session, result.command)
-        outcome = self._consume_terminal_output(session, raw_output)
-        if outcome.pager_active:
-            raise TransportError(
-                "change command entered a pager; refusing to continue"
-            )
-        if outcome.response_required:
-            raise TransportError(
-                "change command triggered a device confirmation; refusing to "
-                "continue"
-            )
-        output_parts.append(session.redactor.redact(outcome.output))
-        return result.model_copy(update={"executed": True})
-
-    def _continue_pager(self, session: _ManagedSession, action: str) -> ControlResult:
-        if session.pager_pages >= self._config.policy.runtime.max_pager_pages:
-            self._audit_interaction(
-                session,
-                "send_control",
-                "started",
-                action="q",
-                reason="pager_page_limit",
-            )
-            try:
-                if session.pager_is_help:
-                    session.connection.write_channel("q")
-                    output = self._finalize_help_pager(session)
-                else:
-                    output = self._send_control_until_prompt(session, "q")
-            except Exception as exc:
-                self._fail_session(session)
-                message = session.redactor.redact(str(exc))
-                self._audit_interaction(
-                    session,
-                    "send_control",
-                    "failed",
-                    action="q",
-                    error=message,
-                )
+    def _require_connection_allowed(self, plan: ConnectionPlan) -> None:
+        """Apply local hard-deny policy gates to insecure connection options."""
+        defaults = self._config.policy.defaults
+        if plan.protocol in ("telnet", "console"):
+            if not plan.allow_telnet:
                 raise TransportError(
-                    f"pager abort failed in session {session.session_id}: {message}"
-                ) from exc
-            outcome = _TerminalOutcome(output=output)
-            output_fields = self._record_terminal_output(session, outcome)
-            self._touch(session)
-            self._audit_interaction(
-                session,
-                "send_control",
-                "pager_limit_reached",
-                action="q",
-                output_bytes=self._output_bytes(session, output),
-            )
-            return ControlResult(session_id=session.session_id, action="q", **output_fields)
-
-        self._audit_interaction(session, "send_control", "started", action=action)
-        try:
-            session.connection.write_channel(" ")
-            raw_output = self._read_until_terminal(session)
-            if session.pager_is_help:
-                outcome = self._page_help(session, raw_output)
-            else:
-                outcome = self._consume_terminal_output(session, raw_output)
-        except Exception as exc:
-            self._fail_session(session)
-            message = session.redactor.redact(str(exc))
-            self._audit_interaction(
-                session, "send_control", "failed", action=action, error=message
-            )
-            raise TransportError(
-                f"pager continuation failed in session {session.session_id}: {message}"
-            ) from exc
-
-        output_fields = self._record_terminal_output(session, outcome)
-        self._touch(session)
-        self._audit_interaction(
-            session,
-            "send_control",
-            self._terminal_outcome_label(outcome),
-            action=action,
-            output_bytes=self._output_bytes(session, outcome.output),
-        )
-        return ControlResult(session_id=session.session_id, action="space", **output_fields)
-
-    def _page_help(self, session: _ManagedSession, raw_output: str) -> _TerminalOutcome:
-        """Classify one help pager page and finalize on the last one."""
-        visible = _visible_terminal_text(raw_output)
-        if self._ends_with_pager(visible):
-            session.state = SessionState.PAGING
-            session.pager_pages += 1
-            return _TerminalOutcome(output=raw_output, pager_active=True)
-        if self._ends_with_secret_prompt(visible):
-            raise SessionError("device requested a password, passphrase, or secret")
-        if self._ends_with_help_prompt(session, visible):
-            self._finalize_help_pager(session, prompt_already_seen=True)
-            return _TerminalOutcome(output=self._strip_help_prompt(session, raw_output))
-        raise SessionError("help pager did not return to a recognized prompt")
-
-    def _finalize_help_pager(
-        self, session: _ManagedSession, *, prompt_already_seen: bool = False
-    ) -> str:
-        """Wait for the help prompt tail, then clear the residual typed line."""
-        help_timeout = float(self._config.policy.runtime.cli_help_timeout)
-        output = ""
-        if not prompt_already_seen:
-            output = session.connection.read_until_pattern(
-                self._help_prompt_tail_pattern(session),
-                read_timeout=help_timeout,
-            )
-        self._clear_help_tail(session)
-        return self._strip_help_prompt(session, output)
-
-    def _cancel_interaction(
-        self, session: _ManagedSession, action: str, description: str
-    ) -> ControlResult:
-        self._audit_interaction(session, "send_control", "started", action=action)
-        try:
-            if session.pager_is_help:
-                session.connection.write_channel("q" if action == "q" else "\x03")
-                output = self._finalize_help_pager(session)
-            else:
-                output = self._send_control_until_prompt(
-                    session, "q" if action == "q" else "\x03"
+                    f"{plan.protocol} requires allow_telnet=true on the call"
                 )
-        except Exception as exc:
-            self._fail_session(session)
-            message = session.redactor.redact(str(exc))
-            self._audit_interaction(
-                session, "send_control", "failed", action=action, error=message
-            )
+            if not defaults.allow_telnet:
+                raise TransportError("Telnet is disabled by policy defaults")
+        if plan.protocol == "serial":
+            if not plan.allow_serial:
+                raise TransportError("serial requires allow_serial=true on the call")
+            if not defaults.allow_serial:
+                raise TransportError("serial is disabled by policy defaults")
+        if plan.credentials is not None and plan.credentials.backend == "plaintext":
+            if not plan.allow_plaintext_password:
+                raise TransportError(
+                    "plaintext credentials require allow_plaintext_password=true"
+                )
+            if not defaults.allow_plaintext_password:
+                raise TransportError(
+                    "plaintext credentials are disabled by policy defaults"
+                )
+        if plan.legacy is not None and not defaults.allow_legacy_algorithms:
             raise TransportError(
-                f"failed to cancel {description} in session {session.session_id}: {message}"
-            ) from exc
-
-        outcome = _TerminalOutcome(output=output)
-        output_fields = self._record_terminal_output(session, outcome)
-        self._touch(session)
-        self._audit_interaction(
-            session,
-            "send_control",
-            "completed",
-            action=action,
-            output_bytes=self._output_bytes(session, output),
-        )
-        return ControlResult(
-            session_id=session.session_id,
-            action=cast(Literal["space", "q", "ctrl-c"], action),
-            **output_fields,
-        )
-
-    def _send_command_until_terminal(
-        self, session: _ManagedSession, command: str, *, cmd_verify: bool = True
-    ) -> str:
-        return session.connection.send_command(
-            command,
-            expect_string=self._terminal_end_pattern(session),
-            read_timeout=float(self._config.policy.runtime.command_timeout),
-            strip_prompt=False,
-            strip_command=True,
-            cmd_verify=cmd_verify,
-        )
-
-    def _read_until_terminal(self, session: _ManagedSession) -> str:
-        return session.connection.read_until_pattern(
-            self._terminal_end_pattern(session),
-            read_timeout=float(self._config.policy.runtime.command_timeout),
-        )
-
-    def _read_help(self, session: _ManagedSession, line: str) -> str:
-        """Send a non-Enter help request and read the first screen.
-
-        The caller decides whether the output is paged. A failed read still
-        tries to restore the prompt because the line is unsafe to reuse.
-        """
-        help_timeout = float(self._config.policy.runtime.cli_help_timeout)
-        session.connection.write_channel(f"{line}?")
-        try:
-            return session.connection.read_channel_timing(
-                last_read=0.2,
-                read_timeout=help_timeout,
+                "legacy SSH algorithms are disabled by policy defaults"
             )
-        except Exception:
-            self._return_to_prompt(session, timeout=help_timeout)
-            raise
-
-    def _return_to_prompt(self, session: _ManagedSession, *, timeout: float | None = None) -> None:
-        self._send_control_until_prompt(session, "\x03", timeout=timeout)
-
-    @staticmethod
-    def _clear_help_tail(session: _ManagedSession) -> None:
-        """Cancel a line after its prompt has already been observed."""
-        session.connection.write_channel("\x03")
-        # Junos retains the line after Ctrl-C; Ctrl-U clears it without Enter.
-        session.connection.write_channel("\x15")
-        session.state = SessionState.READY
-        session.pending_response = None
-        session.pager_pages = 0
-        session.pager_is_help = False
-
-    def _send_control_until_prompt(
-        self, session: _ManagedSession, control: str, *, timeout: float | None = None
-    ) -> str:
-        session.connection.write_channel(control)
-        output = session.connection.read_until_pattern(
-            self._prompt_end_pattern(session),
-            read_timeout=(
-                timeout
-                if timeout is not None
-                else float(self._config.policy.runtime.command_timeout)
-            ),
-        )
-        session.state = SessionState.READY
-        session.pending_response = None
-        session.pager_pages = 0
-        session.pager_is_help = False
-        return self._strip_prompt(session, output)
-
-    def _consume_terminal_output(
-        self, session: _ManagedSession, raw_output: str
-    ) -> _TerminalOutcome:
-        visible = _visible_terminal_text(raw_output)
-        if self._ends_with_secret_prompt(visible):
-            raise SessionError("device requested a password, passphrase, or secret")
-        if self._ends_with_pager(visible):
-            session.state = SessionState.PAGING
-            session.pending_response = None
-            session.pager_pages += 1
-            return _TerminalOutcome(output=raw_output, pager_active=True)
-        if self._ends_with_confirmation(visible):
-            prompt = _last_terminal_line(raw_output)
-            allowed_responses = _allowed_responses(visible)
-            session.state = SessionState.AWAITING_RESPONSE
-            session.pager_pages = 0
-            session.pending_response = _PendingResponse(prompt, allowed_responses)
-            return _TerminalOutcome(
-                output=raw_output,
-                response_required=True,
-                device_prompt=prompt,
-                allowed_responses=allowed_responses,
-            )
-        if not self._ends_with_prompt(session, visible):
-            raise SessionError("terminal output did not end at a recognized prompt")
-
-        session.state = SessionState.READY
-        session.pending_response = None
-        session.pager_pages = 0
-        return _TerminalOutcome(output=self._strip_prompt(session, raw_output))
-
-    def _record_terminal_output(
-        self, session: _ManagedSession, outcome: _TerminalOutcome
-    ) -> _OutputFields:
-        output = session.redactor.redact(outcome.output)
-        offset = self._append_output(session, output)
-        inline, truncated = _truncate_utf8(
-            output, self._config.policy.runtime.max_inline_output_bytes
-        )
-        return {
-            "output": inline,
-            "truncated": truncated,
-            "output_offset": offset,
-            "next_output_offset": offset + len(output) if truncated else None,
-            "pager_active": outcome.pager_active,
-            "response_required": outcome.response_required,
-            "device_prompt": (
-                session.redactor.redact(outcome.device_prompt)
-                if outcome.device_prompt is not None
-                else None
-            ),
-            "allowed_responses": list(outcome.allowed_responses),
-        }
-
-    @staticmethod
-    def _output_bytes(session: _ManagedSession, output: str) -> int:
-        return len(session.redactor.redact(output).encode())
-
-    @staticmethod
-    def _terminal_outcome_label(outcome: _TerminalOutcome) -> str:
-        if outcome.pager_active:
-            return "paging"
-        if outcome.response_required:
-            return "awaiting_response"
-        return "completed"
-
-    @staticmethod
-    def _require_state(
-        session: _ManagedSession, expected: SessionState, action: str
-    ) -> None:
-        if session.state != expected:
-            raise SessionError(
-                f"control {action!r} requires {expected.value}; session "
-                f"{session.session_id} is {session.state.value}"
-            )
-
-    @staticmethod
-    def _fail_session(session: _ManagedSession) -> None:
-        session.state = SessionState.FAILED
-        session.pending_response = None
-        session.pager_pages = 0
-        session.pager_is_help = False
-
-    def _terminal_end_pattern(self, session: _ManagedSession) -> str:
-        prompt = self._prompt_end_pattern(session)
-        if session.pager_is_help:
-            # During help paging the device returns to the prompt with the
-            # unfinished line still typed (e.g. "switch>show "). Match it.
-            prompt = rf"(?:{prompt}|{self._help_prompt_tail_pattern(session)})"
-        return (
-            rf"(?:{prompt}|(?i:{_PAGER_END.pattern})|"
-            rf"(?i:{_CONFIRMATION_END.pattern})|(?i:{_SECRET_END.pattern}))"
-        )
-
-    @staticmethod
-    def _prompt_end_pattern(session: _ManagedSession) -> str:
-        prompt = session.raw_prompt.rstrip()
-        match = re.search(r"(?P<base>.*?)(?P<term>[#>$%])\s*$", prompt)
-        if match is None:
-            return rf"{re.escape(prompt)}\s*\Z"
-        base = re.escape(match.group("base"))
-        # Vendors decorate the prompt in sub-modes, e.g. switch(config-if)#,
-        # and Junos switches the terminator from > to # in edit mode.
-        return rf"{base}(?:\([^)\r\n]*\))?[#>$%]\s*\Z"
-
-    @staticmethod
-    def _help_prompt_tail_pattern(session: _ManagedSession) -> str:
-        return rf"{re.escape(session.raw_prompt)}\s*[^\r\n]*\Z"
-
-    @staticmethod
-    def _ends_with_pager(output: str) -> bool:
-        return _PAGER_END.search(output) is not None
-
-    @staticmethod
-    def _ends_with_confirmation(output: str) -> bool:
-        return _CONFIRMATION_END.search(output) is not None
-
-    @staticmethod
-    def _ends_with_secret_prompt(output: str) -> bool:
-        return _SECRET_END.search(output) is not None
-
-    @staticmethod
-    def _ends_with_prompt(session: _ManagedSession, output: str) -> bool:
-        return re.search(SessionManager._prompt_end_pattern(session), output) is not None
-
-    @staticmethod
-    def _ends_with_help_prompt(session: _ManagedSession, output: str) -> bool:
-        return re.search(SessionManager._help_prompt_tail_pattern(session), output) is not None
-
-    @staticmethod
-    def _strip_help_prompt(session: _ManagedSession, output: str) -> str:
-        return re.sub(SessionManager._help_prompt_tail_pattern(session), "", output)
-
-    @staticmethod
-    def _strip_prompt(session: _ManagedSession, output: str) -> str:
-        return re.sub(SessionManager._prompt_end_pattern(session), "", output)
-
-    def _audit_interaction(
-        self,
-        session: _ManagedSession,
-        event: str,
-        outcome: str,
-        **details: object,
-    ) -> None:
-        self._audit_event(
-            event,
-            target=session.target,
-            outcome=outcome,
-            redactor=session.redactor,
-            session_id=session.session_id,
-            **details,
-        )
-
-    def _transport_profile(
-        self, target: Target
-    ) -> DirectConnection | ProxyJumpConnection | NestedConnection | ConsoleConnection:
-        profile = self._config.connections.connections[target.connection]
-        if not isinstance(
-            profile, (DirectConnection, ProxyJumpConnection, NestedConnection, ConsoleConnection)
-        ):
-            raise TransportError(
-                f"connection profile {target.connection!r} is {profile.type!r}; "
-                "only direct, proxyjump, nested and console profiles are supported"
-            )
-        if isinstance(profile, NestedConnection) and profile.next_protocol == "telnet":
-            self._require_telnet_allowed(target)
-        return profile
-
-    def _resolve_credentials(self, name: str) -> Credentials:
-        profile = self._config.credentials.credentials[name]
-        return self._credentials.resolve(profile)
 
     def _open_jump_client(
-        self, profile: ProxyJumpConnection, credentials: Credentials
+        self, route: ProxyJumpRoute, credentials: Credentials
     ) -> paramiko.SSHClient:
-        """Authenticate the configured bastion after its key has been checked."""
-        assert profile.jump_host is not None
-        timeout = float(self._config.policy.runtime.command_timeout)
+        """Authenticate the jump host after its key has been checked."""
+        timeout = float(self._config.policy.runtime.io_timeout)
         client = self._jump_client_factory()
         try:
             client.load_host_keys(str(self._host_keys.path))
             client.set_missing_host_key_policy(paramiko.RejectPolicy())
             if credentials.key_file is not None:
                 client.connect(
-                    profile.jump_host,
-                    port=profile.jump_port,
+                    route.host,
+                    port=route.port,
                     username=credentials.username,
                     key_filename=credentials.key_file,
                     passphrase=credentials.key_passphrase,
@@ -1164,8 +639,8 @@ class SessionManager:
                 )
             elif credentials.password is not None:
                 client.connect(
-                    profile.jump_host,
-                    port=profile.jump_port,
+                    route.host,
+                    port=route.port,
                     username=credentials.username,
                     password=credentials.password,
                     timeout=timeout,
@@ -1176,6 +651,14 @@ class SessionManager:
                 )
             else:
                 raise TransportError("jump credential has no password or SSH key")
+        except paramiko.AuthenticationException as exc:
+            client.close()
+            raise TransportError(
+                "jump host authentication failed for "
+                f"{credentials.username}@{route.host}:{route.port}; the client "
+                "permission gate was not the problem - check the jump credential "
+                "reference (key file or pass entry)"
+            ) from exc
         except Exception:
             client.close()
             raise
@@ -1197,7 +680,7 @@ class SessionManager:
             "direct-tcpip",
             (host, port),
             ("127.0.0.1", 0),
-            timeout=float(self._config.policy.runtime.command_timeout),
+            timeout=float(self._config.policy.runtime.io_timeout),
         )
         if channel is None:
             raise TransportError("SSH jump host refused the target forwarding channel")
@@ -1215,9 +698,9 @@ class SessionManager:
         credentials: Credentials,
         *,
         sock: object | None = None,
-        profile: ConnectionProfile | None = None,
+        legacy: LegacyAlgorithms | None = None,
     ) -> dict[str, object]:
-        timeout = float(self._config.policy.runtime.command_timeout)
+        timeout = float(self._config.policy.runtime.io_timeout)
         params: dict[str, object] = {
             "transport": "ssh",
             "host": host,
@@ -1228,8 +711,8 @@ class SessionManager:
             "banner_timeout": timeout,
             "auth_timeout": timeout,
         }
-        if isinstance(profile, DirectConnection):
-            disabled = _disabled_algorithms(profile)
+        if legacy is not None:
+            disabled = _disabled_algorithms(legacy)
             if disabled is not None:
                 params["disabled_algorithms"] = disabled
         if credentials.key_file is not None:
@@ -1245,121 +728,46 @@ class SessionManager:
         return params
 
     def _telnet_transport_params(
-        self, target: Target, credentials: Credentials, port: int
+        self, plan: ConnectionPlan, credentials: Credentials
     ) -> dict[str, object]:
         if credentials.password is None:
             raise TransportError("Telnet target credential has no password")
-        timeout = float(self._config.policy.runtime.command_timeout)
+        assert plan.port is not None
+        timeout = float(self._config.policy.runtime.io_timeout)
         return {
             "transport": "telnet",
-            "host": target.host,
-            "port": port,
+            "host": plan.host,
+            "port": plan.port,
             "username": credentials.username,
             "password": credentials.password,
             "conn_timeout": timeout,
         }
 
-    def _require_telnet_allowed(self, target: Target) -> None:
-        if not target.allow_telnet:
-            raise TransportError(
-                f"Telnet is not enabled for target {target.name!r}; "
-                "set allow_telnet: true on the device"
-            )
-        if self._config.policy.defaults.telnet == "deny":
-            raise TransportError("Telnet is denied by policy defaults")
-
-    def _nested_login(
-        self,
-        connection: TerminalConnection,
-        target: Target,
-        credentials: Credentials,
-        next_port: int,
-    ) -> None:
-        """Reach the final target from the intermediate shell with an ssh command."""
-        timeout = float(self._config.policy.runtime.command_timeout)
-        command = (
-            f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-            f"{credentials.username}@{target.host}"
-        )
-        if next_port != 22:
-            command += f" -p {next_port}"
-        connection.write_channel(command + "\n")
-        connection.read_until_pattern(r"[Pp]assword\s*:", read_timeout=timeout)
-        if credentials.password is None:
-            raise TransportError("nested target credential has no password")
-        connection.write_channel(credentials.password + "\n")
-
-    def _nested_telnet_login(
-        self,
-        connection: TerminalConnection,
-        target: Target,
-        credentials: Credentials,
-        next_port: int,
-    ) -> None:
-        """Reach the final target from the intermediate shell with a telnet command."""
-        timeout = float(self._config.policy.runtime.command_timeout)
-        command = f"telnet {target.host}"
-        if next_port != 23:
-            command += f" {next_port}"
-        connection.write_channel(command + "\n")
-        connection.read_until_pattern(
-            r"(?:[Ll]ogin:|[Uu]sername:|[Pp]assword\s*:)", read_timeout=timeout
-        )
-        if credentials.password is None:
-            raise TransportError("nested Telnet target credential has no password")
-        connection.write_channel(credentials.username + "\n")
-        connection.read_until_pattern(r"[Pp]assword\s*:", read_timeout=timeout)
-        connection.write_channel(credentials.password + "\n")
+    def _serial_transport_params(self, plan: ConnectionPlan) -> dict[str, object]:
+        timeout = float(self._config.policy.runtime.io_timeout)
+        return {
+            "transport": "serial",
+            "device": plan.host,
+            "baudrate": plan.baudrate,
+            "bytesize": plan.bytesize,
+            "parity": plan.parity,
+            "stopbits": plan.stopbits,
+            "conn_timeout": timeout,
+        }
 
     @staticmethod
-    def _transport_warnings(profile: ConnectionProfile) -> list[str]:
-        warnings: list[str] = []
-        if isinstance(profile, DirectConnection) and profile.protocol == "legacy_ssh":
-            warnings.append("legacy SSH profile in use")
-        if isinstance(profile, DirectConnection) and (
-            profile.host_key_algorithms or profile.kex_algorithms or profile.ciphers
-        ):
-            warnings.append("explicit legacy algorithm overrides in use")
-        if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
-            warnings.append("Telnet transmits credentials and traffic in cleartext")
-        if isinstance(profile, ProxyJumpConnection) and profile.socks is not None:
-            warnings.append(
-                "target reached through a local SOCKS proxy; verify trust in the tunnel"
-            )
-        if isinstance(profile, NestedConnection):
-            if profile.next_protocol == "telnet":
-                warnings.append("nested Telnet transmits credentials and traffic in cleartext")
-            else:
-                warnings.append("nested SSH uses the intermediate host's SSH client")
-        if isinstance(profile, ConsoleConnection):
-            warnings.append("console access transmits credentials and traffic in cleartext")
-        return warnings
-
-    @staticmethod
-    def _route_details(profile: ConnectionProfile) -> dict[str, object]:
-        if isinstance(profile, ProxyJumpConnection):
-            if profile.socks is not None:
-                return {
-                    "route": "socks",
-                    "proxy_host": profile.socks.host,
-                    "proxy_port": profile.socks.port,
-                }
-            return {
-                "route": "proxyjump",
-                "jump_host": profile.jump_host,
-                "jump_port": profile.jump_port,
-            }
-        if isinstance(profile, NestedConnection):
-            return {
-                "route": "nested",
-                "intermediate_host": profile.host,
-                "intermediate_port": profile.port or 22,
-            }
-        if isinstance(profile, DirectConnection) and profile.protocol == "telnet":
-            return {"route": "telnet"}
-        if isinstance(profile, ConsoleConnection):
-            return {"route": "console"}
-        return {"route": "direct"}
+    def _route_details(plan: ConnectionPlan) -> dict[str, object]:
+        details: dict[str, object] = {
+            "route": route_label(plan),
+            "protocol": plan.protocol,
+        }
+        if isinstance(plan.route, SocksRoute):
+            details["proxy_host"] = plan.route.host
+            details["proxy_port"] = plan.route.port
+        elif isinstance(plan.route, ProxyJumpRoute):
+            details["jump_host"] = plan.route.host
+            details["jump_port"] = plan.route.port
+        return details
 
     @staticmethod
     def _host_key_warnings(status: HostKeyStatus) -> list[str]:
@@ -1372,7 +780,8 @@ class SessionManager:
                 ]
             return [
                 "host key enrolled with TOFU: "
-                f"{status.algorithm} {status.fingerprint}; switch the profile to strict"
+                f"{status.algorithm} {status.fingerprint}; "
+                "use host_key_policy strict afterwards"
             ]
         return []
 
@@ -1384,11 +793,16 @@ class SessionManager:
             raise SessionError(f"unknown or expired session {session_id}")
         return session
 
-    def _require_ready(self, session: _ManagedSession) -> None:
+    @staticmethod
+    def _require_ready(session: _ManagedSession) -> None:
         if session.state != SessionState.READY:
             raise SessionError(
                 f"session {session.session_id} is not ready: {session.state.value}"
             )
+
+    @staticmethod
+    def _fail_session(session: _ManagedSession) -> None:
+        session.state = SessionState.FAILED
 
     def _cleanup_expired(self) -> None:
         now = self._clock()
@@ -1414,7 +828,7 @@ class SessionManager:
                     self._touch(session)
                 self._audit_event(
                     "close_session",
-                    target=session.target,
+                    plan=session.plan,
                     outcome="expired",
                     redactor=session.redactor,
                     session_id=session.session_id,
@@ -1439,8 +853,8 @@ class SessionManager:
     def _session_info(self, session: _ManagedSession) -> SessionInfo:
         return SessionInfo(
             session_id=session.session_id,
-            target=session.target.name,
-            host=session.target.host,
+            route=route_label(session.plan),
+            host=session.plan.host,
             prompt=session.prompt,
             state=session.state,
             created_at=session.created_at,
@@ -1448,22 +862,19 @@ class SessionManager:
             warnings=list(session.warnings),
         )
 
-    def _audit_command(
+    def _audit_interaction(
         self,
         session: _ManagedSession,
-        command: str,
-        decision: Action,
+        event: str,
         outcome: str,
         **details: object,
     ) -> None:
         self._audit_event(
-            "run_command",
-            target=session.target,
+            event,
+            plan=session.plan,
             outcome=outcome,
             redactor=session.redactor,
             session_id=session.session_id,
-            command=session.redactor.redact(command),
-            policy=decision,
             **details,
         )
 
@@ -1471,7 +882,7 @@ class SessionManager:
         self,
         event: str,
         *,
-        target: Target,
+        plan: ConnectionPlan,
         outcome: str,
         redactor: Redactor,
         **details: object,
@@ -1479,9 +890,9 @@ class SessionManager:
         record: dict[str, object] = {
             "event": event,
             "outcome": outcome,
-            "target": target.name,
-            "host": target.host,
-            "connection_profile": target.connection,
+            "host": plan.host,
+            "route": route_label(plan),
+            "protocol": plan.protocol,
         }
         record.update(details)
         self._audit.write(_redact_record(record, redactor))
@@ -1507,24 +918,3 @@ def _keep_utf8_tail(text: str, max_bytes: int) -> tuple[str, int]:
         return text, 0
     kept = encoded[-max_bytes:].decode(errors="ignore")
     return kept, len(text) - len(kept)
-
-
-def _visible_terminal_text(output: str) -> str:
-    """Remove ANSI styling before matching a terminal marker at output end."""
-    return _ANSI_ESCAPE.sub("", output).replace("\r", "").replace("\x08", "")
-
-
-def _last_terminal_line(output: str) -> str:
-    """Return the last non-empty terminal line for a pending prompt result."""
-    for line in reversed(_visible_terminal_text(output).splitlines()):
-        if line.strip():
-            return line.strip()
-    return ""
-
-
-def _allowed_responses(output: str) -> tuple[str, ...]:
-    """Return the exact finite response set represented by a matched prompt."""
-    normalized = output.lower()
-    if "yes/no" in normalized:
-        return ("yes", "no")
-    return ("y", "n")
