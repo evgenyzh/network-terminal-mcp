@@ -166,23 +166,26 @@ Plaintext-пароль допустим только при явном `allow_pl
 
 ## Запуск MCP
 
-После регистрации в конфигурации OpenCode MCP запускается через stdio:
+MCP-сервер ставится как инструмент и запускается OpenCode через stdio:
 
 ```bash
-uv run network-terminal-mcp
+uv tool install network-terminal-mcp     # команда в ~/.local/bin
+uv tool upgrade network-terminal-mcp     # обновление
 ```
 
-Не запускать его вручную в обычном терминале для диагностики: stdout зарезервирован
-исключительно для MCP protocol. Для OpenCode server регистрируется как local
-MCP с абсолютным `cwd` проекта и timeout не меньше `runtime.io_timeout`:
+Не запускать его вручную в обычном терминале для диагностики: stdout
+зарезервирован исключительно для MCP protocol. `uvx network-terminal-mcp@latest`
+на каждый старт не рекомендуется: сетевой резолвинг `@latest` и общий кэш uv
+дают задержки в несколько секунд, а при нескольких окнах — таймауты
+подключения. В OpenCode сервер регистрируется как local MCP с полным путём к
+бинарю и timeout не меньше `runtime.io_timeout`:
 
 ```json
 {
   "mcp": {
     "network-terminal": {
       "type": "local",
-      "command": ["uv", "run", "network-terminal-mcp"],
-      "cwd": "/absolute/path/to/network-terminal-mcp",
+      "command": ["/home/USER/.local/bin/network-terminal-mcp"],
       "enabled": true,
       "timeout": 65000
     }
@@ -192,6 +195,8 @@ MCP с абсолютным `cwd` проекта и timeout не меньше `r
   }
 }
 ```
+
+Если `~/.local/bin` в `PATH`, достаточно `["network-terminal-mcp"]`.
 
 После изменения global OpenCode config или skill перезапустите OpenCode:
 конфигурация и MCP tools загружаются только при старте.

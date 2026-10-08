@@ -92,24 +92,28 @@ Telnet, console и serial требуют явных per-call флагов и м�
 
 ## Установка
 
+Для постоянной работы MCP-клиента (OpenCode) ставьте пакет как инструмент:
+
 ```bash
-uvx network-terminal-mcp@latest
-# или как постоянный инструмент:
-uv tool install network-terminal-mcp@latest
-# или:
-pip install network-terminal-mcp
+uv tool install network-terminal-mcp
 ```
+
+Команда `network-terminal-mcp` появится в `~/.local/bin`. Обновление:
+`uv tool upgrade network-terminal-mcp`. Разовый запуск без установки:
+`uvx network-terminal-mcp@latest`; также доступен `pip install network-terminal-mcp`.
 
 ## Запуск
 
-Локальный MCP запускается OpenCode через `stdio`, без прослушивания TCP-порта:
+Локальный MCP запускается OpenCode через `stdio`, без прослушивания TCP-порта.
+Указывайте полный путь к установленному бинарю — так клиент не зависит от
+`PATH` и не тратит время на сетевой резолвинг `uvx` при каждом старте:
 
 ```json
 {
   "mcp": {
     "network-terminal": {
       "type": "local",
-      "command": ["uvx", "network-terminal-mcp@latest"],
+      "command": ["/home/USER/.local/bin/network-terminal-mcp"],
       "enabled": true
     }
   },
@@ -118,6 +122,9 @@ pip install network-terminal-mcp
   }
 }
 ```
+
+Замените `USER` на свой логин; если `~/.local/bin` уже в `PATH`, достаточно
+`["network-terminal-mcp"]`.
 
 Конфигурационные файлы не обязательны. Для строгих ограничений (например,
 hard-deny Telnet, serial, legacy-алгоритмов, plaintext) можно положить
@@ -128,7 +135,7 @@ hard-deny Telnet, serial, legacy-алгоритмов, plaintext) можно п�
 Проверка локальной политики до запуска:
 
 ```bash
-uvx network-terminal-mcp check
+network-terminal-mcp check
 # в чекауте проекта:
 uv sync && uv run python -m network_terminal_mcp check
 ```
