@@ -43,12 +43,15 @@ class TerminalOutput(BaseModel):
 
 
 class TerminalWriteResult(BaseModel):
-    """Result of writing raw input to a session."""
+    """Result of writing raw input to a session.
+
+    The written text is recorded in the audit but deliberately not echoed
+    back to the model, so repetitive input does not inflate the context.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     session_id: str
-    data: str
     bytes_sent: int
     state: SessionState
 

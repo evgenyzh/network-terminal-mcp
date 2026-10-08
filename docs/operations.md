@@ -159,8 +159,10 @@ Plaintext-пароль допустим только при явном `allow_pl
 - Если audit недоступен, новая операция не исполняется.
 - `terminal_write` пишет полный ввод (кроме известных серверу секретов),
   `terminal_write_secret` — только entry и размер.
-- `read_output` читает bounded session buffer по offset. При переполнении buffer
-  старый вывод недоступен, а `oldest_offset` сообщает границу.
+- `read_output` без offset продолжает с курсора чтения (только непрочитанный
+  вывод) и аудируется с offset/bytes/cursor; явный offset — осознанное
+  обращение к bounded session buffer. При переполнении буфера старый вывод
+  недоступен, а `oldest_offset` сообщает границу.
 
 ## Запуск MCP
 

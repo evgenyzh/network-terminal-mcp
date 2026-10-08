@@ -21,6 +21,10 @@ network-terminal gives you a raw persistent terminal to network devices.
   No command allowlists, no per-command server approval. terminal_read returns
   output after a brief quiet period; right after a command that starts a new
   connection (e.g. ssh) it may return only the echo - read again.
+- terminal_read returns only NEW output, never history you already saw. If it
+  is truncated, continue with read_output(session_id,
+  offset=next_output_offset) or just read_output(session_id). Do not re-read
+  old output: it wastes context.
 - Secrets typed at any live prompt MUST go through
   terminal_write_secret(session_id, <pass entry>). terminal_write is audited
   verbatim; never type passwords, passphrases, or tokens with it, and never

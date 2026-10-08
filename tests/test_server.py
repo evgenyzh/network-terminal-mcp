@@ -41,7 +41,7 @@ class FakeManager:
     ) -> TerminalWriteResult:
         self.calls.append(("terminal_write", (session_id, data, enter)))
         return TerminalWriteResult(
-            session_id=session_id, data=data, bytes_sent=len(data), state=SessionState.READY
+            session_id=session_id, bytes_sent=len(data), state=SessionState.READY
         )
 
     def terminal_read(self, session_id: str, *, timeout: float | None = None) -> TerminalOutput:
@@ -54,9 +54,11 @@ class FakeManager:
             session_id=session_id, entry=entry, bytes_sent=7, state=SessionState.READY
         )
 
-    def read_output(self, session_id: str, *, offset: int, limit: int | None) -> OutputChunk:
+    def read_output(
+        self, session_id: str, *, offset: int | None, limit: int | None
+    ) -> OutputChunk:
         self.calls.append(("read_output", (session_id, offset, limit)))
-        return OutputChunk(session_id=session_id, offset=offset, output="chunk")
+        return OutputChunk(session_id=session_id, offset=offset or 0, output="chunk")
 
     def session_status(self, session_id: str) -> SessionInfo:
         self.calls.append(("session_status", session_id))
@@ -158,6 +160,7 @@ async def test_terminal_tools_dispatch() -> None:
     )
 
     assert written.structured_content["bytes_sent"] == len("ssh operator@192.0.2.10")
+    assert "data" not in written.structured_content
     assert read.structured_content["output"] == "output"
     assert secret.structured_content["entry"] == "net/device-pass"
     assert manager.calls == [
@@ -187,9 +190,12 @@ async def test_output_and_status_tools() -> None:
     output = await server.call_tool(
         "read_output", {"session_id": "session-1", "offset": 3, "limit": 10}
     )
+    unseen = await server.call_tool("read_output", {"session_id": "session-1"})
     status = await server.call_tool("session_status", {"session_id": "session-1"})
     closed = await server.call_tool("close_session", {"session_id": "session-1"})
     assert output.structured_content["output"] == "chunk"
+    assert unseen.structured_content["output"] == "chunk"
+    assert manager.calls[-3] == ("read_output", ("session-1", None, None))
     assert status.structured_content["state"] == "ready"
     assert closed.structured_content["state"] == "closed"
 
@@ -202,6 +208,7 @@ async def test_server_ships_usage_instructions_and_resource() -> None:
     instructions = server.instructions or ""
     assert "terminal_write_secret" in instructions
     assert "authentication error is NOT a permission popup" in instructions
+    assert "Do not re-read" in instructions
 
     resources = await server.list_resources()
     assert any(str(resource.uri) == "network-terminal://usage" for resource in resources)

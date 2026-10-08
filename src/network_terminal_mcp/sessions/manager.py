@@ -132,6 +132,7 @@ class _ManagedSession:
     output: str = ""
     output_start: int = 0
     output_truncated: bool = False
+    read_cursor: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -435,7 +436,6 @@ class SessionManager:
             )
             return TerminalWriteResult(
                 session_id=session_id,
-                data=session.redactor.redact(data),
                 bytes_sent=len(encoded),
                 state=session.state,
             )
@@ -497,8 +497,10 @@ class SessionManager:
         """Read output until the stream is quiet or ``timeout`` expires.
 
         No prompt shape is required: pager screens, password prompts, banners,
-        and normal output are all returned verbatim. Accumulated output stays
-        available through :meth:`read_output` with offsets.
+        and normal output are all returned verbatim. Only output that arrived
+        since the previous read is returned; when it is too large to inline,
+        ``next_output_offset`` points at the first unread character and
+        :meth:`read_output` continues from there.
         """
         session = self._get_session(session_id)
         with session.lock:
@@ -525,10 +527,18 @@ class SessionManager:
                     f"terminal read failed in session {session_id}: {message}"
                 ) from exc
             output = session.redactor.redact(raw)
-            offset = self._append_output(session, output)
+            offset, fresh = self._append_output(session, output)
             inline, truncated = _truncate_utf8(
-                output, self._config.policy.runtime.max_inline_output_bytes
+                fresh, self._config.policy.runtime.max_inline_output_bytes
             )
+            if truncated:
+                # The model has seen only ``inline``; keep the cursor at the
+                # first unread character so read_output() returns the tail.
+                session.read_cursor = offset + len(inline)
+                next_offset: int | None = session.read_cursor
+            else:
+                session.read_cursor = offset + len(fresh)
+                next_offset = None
             self._touch(session)
             self._audit_interaction(
                 session,
@@ -541,14 +551,21 @@ class SessionManager:
                 output=inline,
                 truncated=truncated,
                 output_offset=offset,
-                next_output_offset=offset + len(output) if truncated else None,
+                next_output_offset=next_offset,
             )
 
     def read_output(
-        self, session_id: str, *, offset: int = 0, limit: int | None = None
+        self, session_id: str, *, offset: int | None = None, limit: int | None = None
     ) -> OutputChunk:
-        """Read a bounded slice of accumulated, redacted session output."""
-        if offset < 0:
+        """Read accumulated, redacted session output.
+
+        Without ``offset`` this continues from the caller's read cursor and
+        returns only output that has not been seen yet; repeated calls cannot
+        duplicate history. An explicit ``offset`` is a deliberate random
+        access into the bounded buffer (for example ``next_output_offset``
+        from a truncated read) and does not move the cursor backwards.
+        """
+        if offset is not None and offset < 0:
             raise SessionError("output offset must be non-negative")
         if limit is None:
             limit = self._config.policy.runtime.max_inline_output_bytes
@@ -556,18 +573,35 @@ class SessionManager:
             raise SessionError("output limit must be positive")
         session = self._get_session(session_id)
         with session.lock:
-            if offset < session.output_start:
-                raise SessionError(
+            start = session.read_cursor if offset is None else offset
+            if start < session.output_start:
+                message = (
                     "output before offset "
                     f"{session.output_start} has expired from the session buffer"
                 )
-            relative_offset = offset - session.output_start
+                self._audit_interaction(
+                    session, "read_output", "failed", offset=start, error=message
+                )
+                raise SessionError(message)
+            relative_offset = start - session.output_start
             chunk = session.output[relative_offset : relative_offset + limit]
-            next_offset = offset + len(chunk)
+            next_offset = start + len(chunk)
             buffer_end = session.output_start + len(session.output)
+            if start <= session.read_cursor:
+                session.read_cursor = max(session.read_cursor, next_offset)
+            self._touch(session)
+            self._audit_interaction(
+                session,
+                "read_output",
+                "completed",
+                offset=start,
+                bytes=len(chunk),
+                next_offset=next_offset if next_offset < buffer_end else None,
+                cursor=session.read_cursor,
+            )
             return OutputChunk(
                 session_id=session_id,
-                offset=offset,
+                offset=start,
                 output=chunk,
                 next_offset=next_offset if next_offset < buffer_end else None,
                 oldest_offset=session.output_start,
@@ -834,8 +868,14 @@ class SessionManager:
                     session_id=session.session_id,
                 )
 
-    def _append_output(self, session: _ManagedSession, output: str) -> int:
-        output_offset = session.output_start + len(session.output)
+    def _append_output(self, session: _ManagedSession, output: str) -> tuple[int, str]:
+        """Append redacted output and return (fresh offset, kept fresh text).
+
+        When the bounded buffer drops leading characters, the returned offset
+        is clamped to the new buffer start so callers never point at evicted
+        data, and the read cursor is pulled forward with the buffer.
+        """
+        previous_end = session.output_start + len(session.output)
         combined = session.output + output
         trimmed, dropped = _keep_utf8_tail(
             combined, self._config.policy.runtime.max_session_buffer_bytes
@@ -844,7 +884,9 @@ class SessionManager:
             session.output_start += dropped
             session.output_truncated = True
         session.output = trimmed
-        return output_offset
+        start = max(previous_end, session.output_start)
+        session.read_cursor = max(session.read_cursor, session.output_start)
+        return start, session.output[start - session.output_start :]
 
     def _touch(self, session: _ManagedSession) -> None:
         session.last_used_monotonic = self._clock()

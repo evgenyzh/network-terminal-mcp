@@ -58,8 +58,14 @@ terminal_read(session_id)
   appears.
 - `session_status().prompt` is only the initial best-effort prompt, not a live
   tracker. Inspect the live stream with `terminal_read`.
-- Older output stays in the bounded buffer; fetch it with
-  `read_output(session_id, offset=...)` using offsets from read results.
+- `terminal_read` returns only output that arrived since your previous read; it
+  never replays what you have already seen. When `truncated=true`, continue
+  from `next_output_offset`: `read_output(session_id,
+  offset=<next_output_offset>)`, or just call `read_output(session_id)` to read
+  on from where you stopped.
+- `read_output` without `offset` returns only unseen buffered output; an
+  explicit `offset` is a deliberate look at older output. Never re-read history
+  you already have: it inflates the context without adding information.
 - `enter=false` sends raw bytes: use it for single keys and controls, e.g.
   `terminal_write(session_id, " ", enter=False)` for pager next page,
   `"q"` to quit a pager, `"\u0003"` for Ctrl-C, `"\u0015"` for Ctrl-U.
@@ -125,7 +131,8 @@ by this server.
 - `terminal_write(session_id, data, enter=True)` — send input; audited.
 - `terminal_read(session_id, timeout=None)` — read available output.
 - `terminal_write_secret(session_id, entry)` — send a `pass` secret; not logged.
-- `read_output(session_id, offset=0, limit=None)` — bounded buffered history.
+- `read_output(session_id, offset=None, limit=None)` — unseen buffered output;
+  pass an explicit `offset` only to revisit older output.
 - `session_status(session_id)` — state, initial prompt, warnings.
 - `close_session(session_id)` — disconnect and drop the session.
 

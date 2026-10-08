@@ -762,7 +762,7 @@ def test_terminal_write_redacts_known_secrets_in_result_and_audit() -> None:
 
     result = manager.terminal_write(info.session_id, "password hunter2", enter=False)
 
-    assert "hunter2" not in result.data
+    assert "hunter2" not in result.model_dump_json()
     write_records = [r for r in audit.records if r["event"] == "terminal_write"]
     assert "hunter2" not in json.dumps(write_records)
 
@@ -813,9 +813,52 @@ def test_terminal_read_truncates_large_inline_output() -> None:
 
     assert result.truncated is True
     assert result.output == "01234567"
-    assert result.next_output_offset == 16
+    assert result.next_output_offset == 8
+    tail = manager.read_output(info.session_id)
+    assert tail.output == "89abcdef"
+    assert tail.next_offset is None
+    assert manager.read_output(info.session_id).output == ""
+    # An explicit offset still reaches the same tail deliberately.
     rest = manager.read_output(info.session_id, offset=8)
     assert rest.output == "89abcdef"
+
+
+def test_read_output_continues_from_cursor_without_repeating() -> None:
+    connection = FakeConnection()
+    manager = _manager(connection, FakeAudit())
+    info = _open(manager)
+    connection.timing_output = "AAAA"
+
+    first = manager.terminal_read(info.session_id, timeout=1.0)
+    assert first.output == "AAAA"
+    assert manager.read_output(info.session_id).output == ""
+
+    connection.timing_output = "BBBB"
+    second = manager.terminal_read(info.session_id, timeout=1.0)
+    assert second.output == "BBBB"
+    assert manager.read_output(info.session_id).output == ""
+
+    # A deliberate historical read returns the buffer; afterwards the cursor
+    # continues where the model left off instead of rewinding.
+    history = manager.read_output(info.session_id, offset=0)
+    assert history.output == "AAAABBBB"
+    assert manager.read_output(info.session_id).output == ""
+
+
+def test_read_output_is_audited_with_offsets() -> None:
+    connection = FakeConnection()
+    audit = FakeAudit()
+    manager = _manager(connection, audit)
+    info = _open(manager)
+    connection.timing_output = "AAAA"
+    manager.terminal_read(info.session_id, timeout=1.0)
+
+    manager.read_output(info.session_id)
+
+    records = [r for r in audit.records if r["event"] == "read_output"]
+    assert records[-1]["offset"] == 4
+    assert records[-1]["bytes"] == 0
+    assert records[-1]["cursor"] == 4
 
 
 def test_terminal_read_validates_timeout_bounds() -> None:

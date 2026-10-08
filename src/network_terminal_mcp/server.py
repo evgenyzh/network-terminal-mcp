@@ -114,11 +114,12 @@ def create_server(
     async def terminal_read(
         session_id: str, timeout: float | None = None
     ) -> TerminalOutput:
-        """Read terminal output until the stream is quiet or timeout expires.
+        """Read new terminal output until the stream is quiet or timeout expires.
 
-        Returns everything received, including pager screens, password
-        prompts, banners and shell output; no prompt shape is required. Use
-        session_status and read_output for offsets and buffered history.
+        Returns only output that arrived since your previous read, including
+        pager screens, password prompts, banners and shell output; no prompt
+        shape is required. If ``truncated=true``, continue from
+        ``next_output_offset`` with read_output.
         """
         return await _run_sync(session_manager.terminal_read, session_id, timeout=timeout)
 
@@ -135,9 +136,15 @@ def create_server(
 
     @server.tool()
     async def read_output(
-        session_id: str, offset: int = 0, limit: int | None = None
+        session_id: str, offset: int | None = None, limit: int | None = None
     ) -> OutputChunk:
-        """Read a bounded slice of accumulated session output by offset."""
+        """Read buffered session output that you have not seen yet.
+
+        Without ``offset`` it continues from your read cursor, so repeated
+        calls never re-inject old output. Pass an explicit ``offset`` only to
+        deliberately revisit older buffered output (for example the
+        ``next_output_offset`` of a truncated read).
+        """
         return await _run_sync(
             session_manager.read_output,
             session_id,
