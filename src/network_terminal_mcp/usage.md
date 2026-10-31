@@ -64,6 +64,37 @@ terminal_read(session_id)
   quit, `"\u0003"` for Ctrl-C, `"\u0015"` for Ctrl-U.
 - The line terminator is `\n` for SSH/Telnet and `\r` for serial.
 
+## Unstable connections
+
+- `ready` describes the local client process, not the remote side. A local
+  `ssh` or `telnet` process can stay alive while the network path is gone.
+- OpenSSH keepalive is disabled by default. For links that may go silent, add
+  explicit liveness options when opening the session:
+
+  ```text
+  ssh -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 operator@192.0.2.10
+  ```
+
+  The client then exits after roughly 45 seconds without a response, and the
+  next `session_status` or `terminal_read` reports `failed`.
+- Telnet has no MCP-level keepalive. If a Telnet session may have lost its
+  connection, close it and open a new one.
+- After laptop sleep, a Wi-Fi/VPN change, or a long pause, treat every open
+  session as suspect. A write into a half-open TCP connection can appear to
+  succeed while the data never reaches the device. Close and reopen, then run a
+  harmless verification command.
+- `terminal_read` is bounded by `timeout` (default 60 seconds, maximum 300).
+  Empty output means no output arrived, not that the peer is healthy. Use a
+  short timeout such as 5 seconds for an interactive liveness check.
+- `terminal_write` is bounded to 10 seconds. If the client stops reading input,
+  the call returns `transport_error: terminal write timed out...` and the
+  session becomes `failed`; `close_session` still works. Part of the input may
+  already have been sent, so verify device state before retrying a command.
+- `session_status` includes `last_output_at` and `idle_seconds`. A large idle
+  time is normal for an idle device; it is a hint, not proof of failure.
+- There is no automatic idle timeout. Close sessions you no longer use; stale
+  `ready` sessions count toward the limit of 10.
+
 ## Reading without repeating history
 
 - `terminal_read` returns only output that arrived since the previous read.
@@ -123,8 +154,8 @@ host-key and authentication rules are that host's rules, not this server's.
 
 ## Sessions and errors
 
-- `session_status` returns the original command, state, timestamps, warnings,
-  exit code, and saved error.
+- `session_status` returns the original command, state, timestamps,
+  `last_output_at`, `idle_seconds`, warnings, exit code, and saved error.
 - `close_session` terminates the client and child process group and retains the
   final status for inspection.
 - A natural process exit sets `closed` for code 0 and `failed` with the exit
@@ -158,7 +189,8 @@ finalizing; that judgment belongs to you, not to the transport.
   exactly one source.
 - `read_output(session_id, offset=None, limit=None)` — unseen buffered output;
   use an explicit offset only to revisit old output.
-- `session_status(session_id)` — state, command, warnings, exit code, error.
+- `session_status(session_id)` — state, command, timestamps, last output, idle
+  seconds, warnings, exit code, error.
 - `close_session(session_id)` — close the terminal and child process.
 
 Always close sessions you are done with. Do not include real addresses,

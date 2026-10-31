@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
@@ -55,6 +56,7 @@ class RuntimeLimits:
 
     io_timeout: float = 60.0
     max_read_timeout: float = 300.0
+    write_timeout: float = 10.0
     max_write_bytes: int = 65_536
     max_inline_output_bytes: int = 65_536
     max_session_buffer_bytes: int = 1_048_576
@@ -75,14 +77,16 @@ def default_audit_path() -> Path:
     return base / _DEFAULT_AUDIT_FILE
 
 
-def _terminal_factory_default(parsed: ParsedCommand) -> TerminalConnection:
+def _terminal_factory_default(
+    parsed: ParsedCommand, *, write_timeout: float = 10.0
+) -> TerminalConnection:
     if parsed.is_serial:
         assert parsed.device is not None
         assert parsed.baudrate is not None
         serial_terminal = SerialTerminal()
         serial_terminal.open(device=parsed.device, baudrate=parsed.baudrate)
         return serial_terminal
-    pty_terminal = PtyTerminal()
+    pty_terminal = PtyTerminal(write_timeout=write_timeout)
     pty_terminal.start(parsed.argv)
     return pty_terminal
 
@@ -96,6 +100,7 @@ class _ManagedSession:
     warnings: list[str]
     created_at: datetime
     last_used_at: datetime
+    last_output_at: datetime | None = None
     state: SessionState = SessionState.READY
     output: str = ""
     output_start: int = 0
@@ -117,7 +122,14 @@ class SessionManager:
         audit_logger: AuditSink | None = None,
     ) -> None:
         self._limits = limits or RuntimeLimits()
-        self._terminal_factory = terminal_factory
+        self._terminal_factory: TerminalFactory = (
+            terminal_factory
+            if terminal_factory is not None
+            else partial(
+                _terminal_factory_default,
+                write_timeout=self._limits.write_timeout,
+            )
+        )
         self._audit: AuditSink = audit_logger or AuditLogger(default_audit_path())
         self._sessions: dict[str, _ManagedSession] = {}
         self._lock = threading.RLock()
@@ -568,6 +580,8 @@ class SessionManager:
         session.exit_code = session.connection.exit_code
 
     def _append_output(self, session: _ManagedSession, output: str) -> tuple[int, str]:
+        if output:
+            session.last_output_at = datetime.now(UTC)
         previous_end = session.output_start + len(session.output)
         combined = session.output + output
         trimmed, dropped = _keep_utf8_tail(
@@ -586,12 +600,17 @@ class SessionManager:
         session.last_used_at = datetime.now(UTC)
 
     def _session_info(self, session: _ManagedSession) -> SessionInfo:
+        now = datetime.now(UTC)
+        idle_since = session.last_output_at or session.created_at
+        idle_seconds = max(0.0, (now - idle_since).total_seconds())
         return SessionInfo(
             session_id=session.session_id,
             command=session.parsed.command,
             state=session.state,
             created_at=session.created_at,
             last_used_at=session.last_used_at,
+            last_output_at=session.last_output_at,
+            idle_seconds=round(idle_seconds, 3),
             warnings=list(session.warnings),
             exit_code=session.exit_code,
             error=session.redactor.redact(session.error) if session.error else None,

@@ -1,4 +1,4 @@
-# Тестирование 0.2.0
+# Тестирование 0.2.1
 
 ## Обязательные проверки
 
@@ -21,7 +21,10 @@ uv run pytest
 - cursor/truncation/bounded buffer;
 - audit offsets и fail-closed logger;
 - переходы `ready/failed/closed`, exit code и shutdown;
-- лимит одновременных сессий.
+- лимит одновременных сессий;
+- `last_output_at`/`idle_seconds`: стартовый вывод, новый вывод, пустое чтение и
+  сессия без вывода;
+- переход сессии в `failed` после ошибки записи без потери `close_session`.
 
 ## PTY integration без реальных устройств
 
@@ -34,6 +37,7 @@ uv run pytest
 - password prompt и `terminal_write_secret`;
 - ранний exit с кодом и stderr;
 - естественный exit после успешной работы;
+- timeout записи при клиенте, который перестал читать stdin;
 - закрытие и освобождение процесса;
 - отсутствие секрета в audit.
 

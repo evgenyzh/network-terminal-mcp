@@ -28,6 +28,21 @@ class SessionInfo(BaseModel):
     state: SessionState
     created_at: datetime
     last_used_at: datetime
+    last_output_at: datetime | None = Field(
+        default=None,
+        description=(
+            "UTC timestamp when output was last received; null if the session "
+            "has not produced any output yet."
+        ),
+    )
+    idle_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "Seconds since the last output, or since session creation when no "
+            "output has arrived yet."
+        ),
+    )
     warnings: list[str] = Field(default_factory=list)
     exit_code: int | None = None
     error: str | None = None

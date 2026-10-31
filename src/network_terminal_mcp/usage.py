@@ -31,6 +31,14 @@ network-terminal gives you a persistent raw terminal opened by a real command.
   and client history.
 - open_session returns ready when the terminal process is running, not when
   authentication or a CLI prompt has completed. Read the live stream.
+- ready does not prove the remote side is reachable. For unstable links, add
+  `-o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3`.
+  After laptop sleep or a network change, close and reopen suspect sessions;
+  a write may appear to succeed while the old TCP connection is dead.
+- session_status includes last_output_at and idle_seconds. terminal_read is
+  bounded by its timeout; terminal_write is bounded to 10 seconds and marks the
+  session failed on timeout. close_session still works afterwards. A timed-out
+  write may have sent part of the input: verify device state before retrying.
 - If the client process exits during startup, open_session raises the real exit
   code and output. If it exits later, session_status reports closed/failed and
   the exit code. Always close_session when done.

@@ -61,6 +61,21 @@ def test_pty_reports_exit_code_and_keeps_final_output() -> None:
         terminal.disconnect()
 
 
+def test_pty_write_timeout_is_validated() -> None:
+    with pytest.raises(ValueError, match="write_timeout"):
+        PtyTerminal(write_timeout=0)
+
+
+def test_pty_write_times_out_when_the_child_stops_reading() -> None:
+    terminal = PtyTerminal(write_timeout=0.2)
+    terminal.start((sys.executable, "-c", "import time; time.sleep(5)"))
+    try:
+        with pytest.raises(TransportError, match="timed out"):
+            terminal.write_channel("x" * 8_000_000)
+    finally:
+        terminal.disconnect()
+
+
 def test_pty_disconnect_is_safe_without_start() -> None:
     terminal = PtyTerminal()
     terminal.disconnect()

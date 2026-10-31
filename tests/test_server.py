@@ -95,6 +95,8 @@ async def test_open_session_tool_accepts_only_a_command() -> None:
 
     assert result.structured_content["session_id"] == "session-1"
     assert result.structured_content["command"] == "ssh operator@192.0.2.1"
+    assert result.structured_content["last_output_at"] is None
+    assert result.structured_content["idle_seconds"] == 0.0
     assert manager.calls == [("open_session", "ssh operator@192.0.2.1")]
 
 
@@ -216,7 +218,7 @@ async def test_server_ships_usage_instructions_and_resource() -> None:
     manager = FakeManager()
     server = create_server(manager=manager)  # type: ignore[arg-type]
 
-    assert server.version == "0.2.0"
+    assert server.version == "0.2.1"
     instructions = server.instructions or ""
     assert "open_session(command)" in instructions
     assert "value, env, or file" in instructions

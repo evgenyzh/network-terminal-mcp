@@ -76,9 +76,10 @@ def create_server(*, manager: SessionManager | None = None) -> MCPServer:
 
         Use this for commands, interactive keystrokes, and further hops such as
         ``ssh user@host``. ``enter`` appends the transport line terminator
-        (newline, or carriage return on serial). The data is audited after
-        known-secret redaction; never type a password here. Use
-        terminal_write_secret for secrets.
+        (newline, or carriage return on serial). A client that stops reading
+        input causes a bounded write timeout and marks the session failed. The
+        data is audited after known-secret redaction; never type a password
+        here. Use terminal_write_secret for secrets.
         """
         return await _run_tool(
             session_manager.terminal_write, session_id, data, enter=enter
@@ -143,7 +144,7 @@ def create_server(*, manager: SessionManager | None = None) -> MCPServer:
 
     @server.tool()
     async def session_status(session_id: str) -> SessionInfo:
-        """Return state, command, exit code, warnings, and saved error."""
+        """Return state, command, timestamps, idle time, warnings, and exit status."""
         return await _run_tool(session_manager.session_status, session_id)
 
     @server.tool()

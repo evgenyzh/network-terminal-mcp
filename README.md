@@ -9,8 +9,9 @@
 поток команды, `?`-подсказки, pager keys и вложенные `ssh`, а читает только
 новый вывод.
 
-Статус: **0.2.0** — command-only API, настоящий OpenSSH/Telnet в POSIX PTY,
-локальный serial, конкретные ошибки и секреты без обязательного `pass`.
+Статус: **0.2.1** — command-only API, настоящий OpenSSH/Telnet в POSIX PTY,
+локальный serial, конкретные ошибки, ограниченная по времени запись, метрики
+простоя и секреты без обязательного `pass`.
 
 ## Открытие сессии
 
@@ -52,6 +53,21 @@ close_session(session_id)
 - Пароли и passphrase вводятся только через `terminal_write_secret` с одним
   источником: `value`, `env` или `file`.
 
+## Нестабильные соединения
+
+`ready` означает, что жив локальный процесс клиента, а не что удалённая
+сторона отвечает. Для SSH добавляйте контроль связи:
+
+```text
+ssh -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 operator@192.0.2.10
+```
+
+После сна ноутбука, смены Wi-Fi/VPN или долгой паузы закройте и переоткройте
+подозрительные сессии: запись в полуразрушенное TCP-соединение может выглядеть
+успешной. `terminal_read` ограничен timeout, `terminal_write` — 10 секундами;
+`session_status` показывает `last_output_at` и `idle_seconds`. Подробнее:
+[эксплуатация](docs/current/operations.md#нестабильные-соединения).
+
 Для одноразового `ssh host 'command'` обычный shell остаётся проще. MCP нужен
 для живого терминала, pager, нескольких команд с сохранением состояния,
 password prompts, вложенных переходов и Serial.
@@ -82,7 +98,8 @@ audit-каталога. Обязательных конфигурационны�
       "network-terminal": {
         "type": "local",
         "command": ["/home/USER/.local/bin/network-terminal-mcp"],
-        "codemode": false
+        "codemode": false,
+        "disabled": false
       }
     }
   }
@@ -95,7 +112,7 @@ tool list. Если `~/.local/bin` уже в `PATH`, достаточно
 
 ## Документация
 
-- [Текущая документация 0.2.0](docs/current/) — архитектура, эксплуатация,
+- [Текущая документация 0.2.1](docs/current/) — архитектура, эксплуатация,
   безопасность, тесты и результаты проверок.
 - [Инструкция для модели](src/network_terminal_mcp/usage.md) — MCP instructions
   и ресурс `network-terminal://usage`.

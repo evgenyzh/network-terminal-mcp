@@ -53,8 +53,11 @@ class _Decoder:
 class PtyTerminal:
     """A real ssh/telnet process attached to a POSIX pseudo-terminal."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, write_timeout: float = 10.0) -> None:
+        if write_timeout <= 0:
+            raise ValueError("write_timeout must be positive")
         self._process: ptyprocess.PtyProcess | None = None
+        self._write_timeout = float(write_timeout)
         self._decoder = _Decoder()
         self._eof = False
         self._closed = False
@@ -85,10 +88,51 @@ class PtyTerminal:
     def write_channel(self, out_data: str) -> None:
         if self._closed or self._process is None:
             raise TransportError("terminal process is not running")
+        data = out_data.encode("utf-8")
+        if not data:
+            return
+        fd = self._process.fd
+        if fd < 0:
+            raise TransportError("terminal process is not running")
+
+        deadline = time.monotonic() + self._write_timeout
+        view = memoryview(data)
         try:
-            self._process.write(out_data.encode("utf-8"))
-        except (EOFError, OSError) as exc:
+            previous_blocking = os.get_blocking(fd)
+            os.set_blocking(fd, False)
+        except OSError as exc:
             raise TransportError(f"terminal write failed: {exc}") from exc
+        try:
+            while view:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TransportError(
+                        "terminal write timed out after "
+                        f"{self._write_timeout:g}s; the client may be blocked "
+                        "or the connection may be dead"
+                    )
+                try:
+                    _, writable, _ = select.select([], [fd], [], remaining)
+                except (OSError, ValueError) as exc:
+                    raise TransportError(f"terminal write failed: {exc}") from exc
+                if not writable:
+                    continue
+                try:
+                    written = os.write(fd, view)
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    raise TransportError(f"terminal write failed: {exc}") from exc
+                if written <= 0:
+                    raise TransportError(
+                        "terminal write failed: the client accepted no bytes"
+                    )
+                view = view[written:]
+        finally:
+            try:
+                os.set_blocking(fd, previous_blocking)
+            except OSError:
+                pass
 
     def read_channel_timing(self, *, last_read: float, read_timeout: float) -> str:
         """Read until output has been quiet for ``last_read`` or time expires."""
@@ -130,7 +174,11 @@ class PtyTerminal:
             return b""
         try:
             data = os.read(process.fd, _READ_CHUNK)
+        except BlockingIOError:
+            return b""
         except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return b""
             if exc.errno == errno.EIO:
                 self._eof = True
                 return b""

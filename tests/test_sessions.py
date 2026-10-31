@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -147,6 +148,52 @@ def test_open_uses_the_parsed_command_and_returns_metadata() -> None:
     assert harness.audit.records[0]["protocol"] == "ssh"
     assert harness.audit.records[-1]["outcome"] == "completed"
     assert harness.manager.read_output(info.session_id).output == "banner\n"
+
+
+def test_open_tracks_startup_output_time_and_idle_seconds() -> None:
+    harness = Harness([FakeTerminal(outputs=["banner\n"])])
+    info = _open(harness)
+
+    assert info.last_output_at is not None
+    assert info.last_output_at >= info.created_at
+    assert info.idle_seconds >= 0
+
+
+def test_session_without_output_is_idle_since_creation() -> None:
+    harness = Harness()
+    info = _open(harness)
+    assert info.last_output_at is None
+    time.sleep(0.02)
+
+    status = harness.manager.session_status(info.session_id)
+
+    assert status.last_output_at is None
+    assert status.idle_seconds > info.idle_seconds
+
+
+def test_empty_read_does_not_refresh_last_output() -> None:
+    harness = Harness()
+    info = _open(harness)
+
+    assert harness.manager.terminal_read(info.session_id, timeout=0.01).output == ""
+    status = harness.manager.session_status(info.session_id)
+
+    assert status.last_output_at is None
+
+
+def test_new_output_refreshes_last_output() -> None:
+    harness = Harness()
+    info = _open(harness)
+    fake = harness.manager._sessions[info.session_id].connection
+    assert isinstance(fake, FakeTerminal)
+    fake.outputs.append("hello\n")
+
+    assert harness.manager.terminal_read(info.session_id, timeout=0.01).output == "hello\n"
+    status = harness.manager.session_status(info.session_id)
+
+    assert status.last_output_at is not None
+    assert status.last_output_at >= info.created_at
+    assert status.idle_seconds < 1.0
 
 
 def test_first_terminal_read_returns_the_startup_output() -> None:
@@ -309,6 +356,22 @@ def test_write_failure_marks_session_failed_and_redacts_secret() -> None:
 # ---------------------------------------------------------------------------
 # terminal_read and read_output
 # ---------------------------------------------------------------------------
+
+
+def test_write_timeout_marks_session_failed_and_can_be_closed() -> None:
+    class TimeoutTerminal(FakeTerminal):
+        def write_channel(self, out_data: str) -> None:
+            raise TransportError("terminal write timed out after 0.1s")
+
+    harness = Harness([TimeoutTerminal()])
+    info = _open(harness)
+
+    with pytest.raises(TransportError, match="timed out"):
+        harness.manager.terminal_write(info.session_id, "show version")
+
+    assert harness.manager.session_status(info.session_id).state is SessionState.FAILED
+    closed = harness.manager.close_session(info.session_id)
+    assert closed.state is SessionState.CLOSED
 
 
 def test_terminal_read_returns_output_and_buffers_it() -> None:

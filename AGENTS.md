@@ -5,8 +5,8 @@
 - `README.md` gives the project overview and release status.
 - `docs/README.md` is the single documentation index and explains document
   statuses.
-- `docs/current/architecture.md` is the technical source of truth for released
-  0.2.0 behavior.
+- `docs/current/architecture.md` is the technical source of truth for current
+  0.2.1 behavior.
 - `docs/current/security.md` defines the current trust model and secret rules.
 - `src/network_terminal_mcp/usage.md` is the model-facing manual shipped as MCP
   `instructions` + the `network-terminal://usage` resource; keep it in sync with
@@ -51,6 +51,12 @@
   vendor-driver abstraction.
 - Sessions are persistent raw terminals. Transport code handles process/device
   I/O, lifecycle, and timeouts only; command knowledge belongs to the model.
+- PTY writes must stay bounded. Keep `write_timeout` and the non-blocking write
+  loop; do not reintroduce an unbounded `ptyprocess.write` that can hold the
+  session lock forever.
+- `SessionInfo.last_output_at` and `idle_seconds` describe output arrival, not
+  read activity. Keep them observable and do not turn them into an automatic
+  failure or idle-kill signal.
 - Keep cursor-based output: a default read returns only unseen output and must
   not replay history into model context. The first read must include a startup
   banner stored by `open_session`.

@@ -4,6 +4,27 @@
 [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии следуют
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-31
+
+### Added
+
+- `SessionInfo.last_output_at` and `SessionInfo.idle_seconds`, so a client can
+  distinguish a quiet device from a session that has never produced output.
+- Bounded PTY writes with a 10-second `write_timeout`; a blocked client now
+  returns `transport_error` instead of holding the session lock indefinitely.
+
+### Changed
+
+- MCP instructions, the packaged manual, the OpenCode skill, and current docs
+  describe SSH keepalive options and the post-suspend/reconnect workflow.
+- A write timeout marks the session `failed`, but `close_session` remains
+  available and closes the child process.
+
+### Fixed
+
+- A PTY write to a client that stopped reading can no longer block the session
+  forever.
+
 ## [0.2.0] - 2026-10-31
 
 Breaking release: structured connection descriptions, local policy, `pass`
