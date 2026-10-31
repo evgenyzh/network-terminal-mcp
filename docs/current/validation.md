@@ -17,6 +17,7 @@ hostnames, usernames, fingerprints и содержимое секретов в �
 | fake SSH/Telnet в PTY | persistent I/O, secret prompt, early exit |
 | Serial transport | unit-тесты с fake pyserial |
 | wheel smoke | wheel 0.2.0 установлен в отдельный venv; `check` прошёл |
+| живой SSH через jump host | вход по ключу, persistent shell, несколько команд, close |
 
 ## Что именно подтверждено
 
@@ -35,12 +36,30 @@ hostnames, usernames, fingerprints и содержимое секретов в �
   `session_error: unknown session ...`, а не общую заглушку.
 - `close_session` и shutdown закрывают дочерние PTY.
 
+## Живая SSH-проверка
+
+С отдельного разрешения выполнена одна проверка через реальный OpenSSH и jump
+host:
+
+- host key prompt обработан; fingerprint сверен с уже известным ключом, в
+  документацию не записан;
+- вход по SSH-ключу без интерактивного пароля;
+- открыт persistent shell на тестовом Linux-хосте;
+- в одной сессии выполнены `hostname`, `whoami`, `pwd`, `uname -sr`;
+- повторное чтение не вернуло старую историю;
+- сессия закрыта через `close_session`.
+
+Ручное закрытие OpenSSH завершилось с кодом 255 из-за SIGHUP; это ожидаемое
+следствие принудительного закрытия PTY, состояние сессии — `closed`.
+
 ## Что не проверялось
 
-- Реальные сетевые устройства, SSH bastion и production credentials.
+- Реальные сетевые устройства и production credentials.
 - Реальный Telnet/TCP console terminal server.
 - Реальный serial-кабель `/dev/ttyUSB*`.
 - Windows PTY.
 - Длительная эксплуатация и ротация audit.
 
-Живые проверки требуют отдельного разрешения на конкретные цели и команды.
+Остальные живые проверки требуют отдельного разрешения на конкретные цели и
+команды. Реальные адреса, hostnames, usernames и fingerprints в документ не
+включаются.
