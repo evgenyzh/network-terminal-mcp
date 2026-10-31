@@ -14,12 +14,12 @@ from network_terminal_mcp.errors import AuditError
 
 def test_write_appends_jsonl(tmp_path: Path) -> None:
     logger = AuditLogger(tmp_path / "audit.jsonl")
-    logger.write({"tool": "run_command", "command": "show version"})
+    logger.write({"tool": "terminal_write", "command": "show version"})
 
     lines = (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     record = json.loads(lines[0])
-    assert record["tool"] == "run_command"
+    assert record["tool"] == "terminal_write"
     assert record["command"] == "show version"
     assert "ts" in record
     assert "correlation_id" in record

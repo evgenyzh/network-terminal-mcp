@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+SecretSource = Literal["value", "env", "file"]
 
 
 class SessionState(StrEnum):
@@ -21,13 +24,13 @@ class SessionInfo(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     session_id: str
-    route: str
-    host: str
-    prompt: str = ""
+    command: str
     state: SessionState
     created_at: datetime
     last_used_at: datetime
     warnings: list[str] = Field(default_factory=list)
+    exit_code: int | None = None
+    error: str | None = None
 
 
 class TerminalOutput(BaseModel):
@@ -57,12 +60,12 @@ class TerminalWriteResult(BaseModel):
 
 
 class TerminalSecretResult(BaseModel):
-    """Result of writing a pass-referenced secret; never contains the secret."""
+    """Result of writing a secret; the value is never included."""
 
     model_config = ConfigDict(frozen=True)
 
     session_id: str
-    entry: str
+    source: SecretSource
     bytes_sent: int
     state: SessionState
 

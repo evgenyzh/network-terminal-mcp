@@ -4,14 +4,63 @@
 [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии следуют
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-31
+
+Breaking release: structured connection descriptions, local policy, `pass`
+integration, and the old transport stack are removed. `open_session` now takes
+one real connection command.
+
+### Added
+
+- Command-only `open_session(command)` for `ssh`, `telnet`, and
+  `serial DEVICE [BAUDRATE]`.
+- `PtyTerminal` running the real OpenSSH/Telnet client in a POSIX PTY, including
+  user config, agent, keys, ProxyJump, ProxyCommand, and arbitrary client
+  options.
+- Short local serial form with pyserial 8N1 and configurable baudrate.
+- `terminal_write_secret` sources `value`, `env`, and `file`, with exactly one
+  source per call.
+- Startup output in the cursor buffer, so the first `terminal_read` returns the
+  banner or password prompt.
+- Process exit tracking with `exit_code`, saved `error`, and `closed`/`failed`
+  states.
+- `network-terminal-mcp check` validates the real runtime prerequisites.
+- Strict generated tool schemas reject removed structured fields.
 
 ### Changed
 
-- Рекомендуемый способ запуска MCP-клиентом — `uv tool install
-  network-terminal-mcp` и полный путь к бинарю вместо `uvx @latest`: при
-  старте исчезают сетевой резолвинг и блокировка общего кэша uv, которые давали
-  задержку «connecting» и таймауты при нескольких окнах.
+- Expected `NetworkMCPError` failures cross the MCP boundary as `ToolError`;
+  the model sees the real code and message instead of a generic tool error.
+- Sessions live until `close_session`, natural process exit, or server
+  shutdown; automatic idle/lifetime expiry is removed.
+- Closed sessions remain available through `session_status`.
+- Documentation is split into `docs/current/` and `docs/history/`; the completed
+  redesign plan is historical.
+- OpenCode documentation recommends `codemode: false` and no mandatory
+  permission popup.
+- CLI startup remains via an installed binary (`uv tool install
+  network-terminal-mcp`) instead of `uvx @latest`, avoiding startup network
+  resolution and uv cache contention.
+
+### Removed
+
+- Structured `open_session` fields: `host`, `port`, `protocol`, `credentials`,
+  `route`, `host_key_policy`, `legacy`, `allow_telnet`,
+  `allow_plaintext_password`, `allow_serial`, and `serial`.
+- Paramiko, telnetlib3, custom SOCKS5 routing, ProxyJump implementation,
+  connection plans, credential resolver, host-key store, inventory, and
+  `policy.yml`.
+- Mandatory `pass` integration and the `terminal_write_secret(entry=...)` form.
+- Mandatory client permission gate for `open_session`.
+- Idle/lifetime session limits and per-call insecure-mode flags.
+- YAML, pydantic-settings, PyYAML, Paramiko, and telnetlib3 dependencies.
+
+### Fixed
+
+- Real connection and I/O errors are no longer replaced by
+  `Error executing tool ...` without a cause.
+- Early client exit during startup now reports its exit code and stderr/stdout.
+- Re-reading old output cannot duplicate history in model context.
 
 ## [0.1.2] - 2026-10-08
 

@@ -1,4 +1,4 @@
-"""Tests for the structured error hierarchy."""
+"""Tests for the expected error hierarchy."""
 
 from __future__ import annotations
 
@@ -6,27 +6,25 @@ import pytest
 
 from network_terminal_mcp.errors import (
     AuditError,
-    ConfigError,
+    CommandError,
     CredentialError,
     NetworkMCPError,
-    PolicyError,
     SessionError,
     TransportError,
 )
 
 
 def test_code_is_in_message() -> None:
-    error = ConfigError("broken")
-    assert error.code == "config_error"
-    assert "config_error: broken" == str(error)
+    error = CommandError("broken")
+    assert error.code == "command_error"
+    assert str(error) == "command_error: broken"
 
 
 @pytest.mark.parametrize(
     "error",
     [
-        ConfigError("x"),
+        CommandError("x"),
         CredentialError("x"),
-        PolicyError("x"),
         SessionError("x"),
         AuditError("x"),
         TransportError("x"),
@@ -38,5 +36,10 @@ def test_subclasses_carry_unique_codes(error: NetworkMCPError) -> None:
 
 
 def test_as_dict_is_json_serializable() -> None:
-    payload = ConfigError("bad config").as_dict()
-    assert payload == {"code": "config_error", "message": "bad config"}
+    payload = CommandError("bad command").as_dict()
+    assert payload == {"code": "command_error", "message": "bad command"}
+
+
+def test_custom_code_can_describe_a_specific_failure() -> None:
+    error = CommandError("ssh missing", code="executable_not_found")
+    assert str(error) == "executable_not_found: ssh missing"

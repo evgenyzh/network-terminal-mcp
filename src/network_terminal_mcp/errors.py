@@ -1,4 +1,9 @@
-"""Structured exception hierarchy for network-terminal-mcp."""
+"""Expected error hierarchy for network-terminal-mcp.
+
+Only errors derived from :class:`NetworkMCPError` are converted to MCP
+``ToolError`` at the server boundary. Anything else is an internal bug and is
+deliberately left to the SDK's crash handling.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +11,11 @@ from typing import NoReturn
 
 
 class NetworkMCPError(Exception):
-    """Base class for all project errors.
+    """Base class for expected, model-readable errors.
 
     Every error carries a stable machine-readable code and a human-readable
-    message. Secrets must never be embedded in either field; use the
-    :mod:`network_terminal_mcp.redaction` helpers before raising.
+    message. Secrets must never be embedded in either field; use the session
+    redactor before raising.
     """
 
     code: str = "network_mcp_error"
@@ -26,26 +31,20 @@ class NetworkMCPError(Exception):
         return {"code": self.code, "message": self.message}
 
 
-class ConfigError(NetworkMCPError):
-    """Configuration is missing, malformed, or fails schema validation."""
+class CommandError(NetworkMCPError):
+    """A connection command is empty, unsupported, or malformed."""
 
-    code = "config_error"
+    code = "command_error"
 
 
 class CredentialError(NetworkMCPError):
-    """A credential profile or the underlying secret backend failed."""
+    """A secret source is missing, unreadable, or empty."""
 
     code = "credential_error"
 
 
-class PolicyError(NetworkMCPError):
-    """A command or action was denied or is not covered by policy."""
-
-    code = "policy_error"
-
-
 class SessionError(NetworkMCPError):
-    """A terminal session is missing, busy, expired, or has failed."""
+    """A terminal session is missing, closed, or otherwise unusable."""
 
     code = "session_error"
 
@@ -57,7 +56,7 @@ class AuditError(NetworkMCPError):
 
 
 class TransportError(NetworkMCPError):
-    """Connection, terminal server hop, or device interaction failed."""
+    """A client process, PTY, serial device, or terminal I/O failed."""
 
     code = "transport_error"
 

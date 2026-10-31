@@ -1,64 +1,77 @@
-"""Tests for the policy health-check CLI."""
+"""Tests for the runtime health-check CLI."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
-import yaml
 
+import network_terminal_mcp.__main__ as cli
 from network_terminal_mcp.__main__ import main
 
 
-@pytest.fixture
-def config_dir(tmp_path: Path) -> Path:
-    directory = tmp_path / "config"
-    directory.mkdir()
-    return directory
+def _which(*available: str):
+    return lambda name: f"/usr/bin/{name}" if name in available else None
 
 
-def _write(directory: Path, name: str, data: object) -> None:
-    (directory / name).write_text(yaml.safe_dump(data), encoding="utf-8")
-
-
-def test_check_summary_with_defaults(
-    config_dir: Path, capsys: pytest.CaptureFixture[str]
+def test_check_reports_runtime_prerequisites(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert main(["--config-dir", str(config_dir), "check"]) == 0
-    out = capsys.readouterr().out
-    assert "config dir" in out
-    assert "known_hosts_file" in out
-    assert "max_open_sessions=10" in out
-
-
-def test_check_reads_the_optional_policy_file(
-    config_dir: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _write(
-        config_dir,
-        "policy.yml",
-        {
-            "defaults": {"allow_telnet": False},
-            "runtime": {"session_idle_timeout": 120},
-        },
+    monkeypatch.setattr(cli.shutil, "which", _which("ssh", "telnet"))
+    monkeypatch.setattr(
+        cli, "default_audit_path", lambda: tmp_path / "state" / "audit.jsonl"
     )
-    assert main(["--config-dir", str(config_dir), "check"]) == 0
+
+    assert main(["check"]) == 0
     out = capsys.readouterr().out
-    assert "session_idle_timeout=120" in out
+    assert "network-terminal-mcp" in out
+    assert "ssh: /usr/bin/ssh" in out
+    assert "telnet: /usr/bin/telnet" in out
+    assert "serial: pyserial" in out
+    assert "audit:" in out
+    assert "config: none required" in out
 
 
-def test_check_invalid_policy_fails(config_dir: Path) -> None:
-    (config_dir / "policy.yml").write_text("::: nope :::", encoding="utf-8")
-    assert main(["--config-dir", str(config_dir), "check"]) == 1
-
-
-def test_check_ignores_removed_inventory_file(
-    config_dir: Path, capsys: pytest.CaptureFixture[str]
+def test_check_does_not_fail_when_only_telnet_is_missing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Old inventory/connection files are ignored, not fatal.
-    _write(config_dir, "inventory.yml", {"devices": {"sw1": {"host": "192.0.2.1"}}})
-    assert main(["--config-dir", str(config_dir), "check"]) == 0
-    assert "known_hosts_file" in capsys.readouterr().out
+    monkeypatch.setattr(cli.shutil, "which", _which("ssh"))
+    monkeypatch.setattr(
+        cli, "default_audit_path", lambda: tmp_path / "state" / "audit.jsonl"
+    )
+
+    assert main(["check"]) == 0
+    assert "telnet: not found" in capsys.readouterr().out
+
+
+def test_check_fails_when_no_client_is_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.shutil, "which", _which())
+    monkeypatch.setattr(
+        cli, "default_audit_path", lambda: tmp_path / "state" / "audit.jsonl"
+    )
+
+    assert main(["check"]) == 1
+
+
+def test_check_fails_when_audit_directory_is_unusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(cli.shutil, "which", _which("ssh", "telnet"))
+    monkeypatch.setattr(
+        cli, "default_audit_path", lambda: blocker / "audit.jsonl"
+    )
+
+    assert main(["check"]) == 1
 
 
 def test_no_command_starts_stdio_server(monkeypatch: pytest.MonkeyPatch) -> None:

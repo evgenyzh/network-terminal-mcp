@@ -1,3 +1,3 @@
-"""Session-oriented MCP server for network device terminals."""
+"""Persistent local terminals for MCP clients."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

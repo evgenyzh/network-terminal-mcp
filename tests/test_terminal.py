@@ -1,180 +1,164 @@
-"""Unit tests for the raw terminal transport layer."""
+"""Tests for the PTY and serial terminal transports."""
 
 from __future__ import annotations
 
 import os
+import stat
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from network_terminal_mcp.errors import TransportError
-from network_terminal_mcp.terminal import SerialTerminal, SshTerminal, _BaseTerminal
+from network_terminal_mcp.terminal import PtyTerminal, SerialTerminal
+
+_RESIDENT_SCRIPT = """\
+import sys
+print("banner", flush=True)
+for line in sys.stdin:
+    line = line.rstrip("\\r\\n")
+    if line == "quit":
+        break
+    print("got:" + line, flush=True)
+print("bye", flush=True)
+"""
 
 
-class ScriptedTerminal(_BaseTerminal):
-    """A _BaseTerminal whose reads come from a scripted chunk queue."""
-
-    _retry_delay = 0.001
-    _prompt_retries = 3
-    _prompt_last_read = 0.001
-    _prompt_read_timeout = 0.1
-
-    def __init__(self, chunks: list[str]) -> None:
-        super().__init__()
-        self._chunks = list(chunks)
-        self.writes: list[bytes] = []
-
-    def _read_channel(self) -> str:
-        if self._chunks:
-            return self._chunks.pop(0)
-        return ""
-
-    def _write_bytes(self, data: bytes) -> None:
-        self.writes.append(data)
+def _start_pty(script: str) -> PtyTerminal:
+    terminal = PtyTerminal()
+    terminal.start((sys.executable, "-u", "-c", script))
+    return terminal
 
 
-def test_read_until_pattern_retains_terminator_and_buffers_overflow() -> None:
-    terminal = ScriptedTerminal(["show version\nline1\n--- more ---rest"])
-    output = terminal.read_until_pattern(r"--- more ---", read_timeout=5.0)
-    assert output == "show version\nline1\n--- more ---"
-    assert terminal._buffer == "rest"
+def test_pty_persistent_write_and_read() -> None:
+    terminal = _start_pty(_RESIDENT_SCRIPT)
+    try:
+        startup = terminal.read_channel_timing(last_read=0.02, read_timeout=1.0)
+        assert "banner" in startup
+        assert terminal.is_alive() is True
+
+        terminal.write_channel("first\n")
+        first = terminal.read_channel_timing(last_read=0.02, read_timeout=1.0)
+        assert first.strip() == "got:first"
+
+        terminal.write_channel("second\n")
+        second = terminal.read_channel_timing(last_read=0.02, read_timeout=1.0)
+        assert second.strip() == "got:second"
+    finally:
+        terminal.disconnect()
 
 
-def test_read_until_pattern_times_out_when_pattern_never_appears() -> None:
-    terminal = ScriptedTerminal(["no prompt here", "still nothing"])
-    with pytest.raises(TransportError, match="not detected"):
-        terminal.read_until_pattern(r"#\s*$", read_timeout=0.05)
+def test_pty_reports_exit_code_and_keeps_final_output() -> None:
+    terminal = _start_pty("import sys; print('fatal', flush=True); sys.exit(7)")
+    try:
+        output = terminal.read_channel_timing(last_read=0.02, read_timeout=1.0)
+        assert "fatal" in output
+        assert terminal.is_alive() is False
+        assert terminal.exit_code == 7
+    finally:
+        terminal.disconnect()
 
 
-def test_read_channel_timing_stops_when_no_new_data() -> None:
-    terminal = ScriptedTerminal(["chunk-one\n", "", "", ""])
-    output = terminal.read_channel_timing(last_read=0.01, read_timeout=2.0)
-    assert output == "chunk-one\n"
-
-
-def test_find_prompt_returns_the_last_line() -> None:
-    terminal = ScriptedTerminal(["\n\nsw1#"])
-    prompt = terminal.find_prompt()
-    assert prompt == "sw1#"
-
-
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        "<SW>", "[SW]", "[SW-bgp]", "[~SW]", "[*SW]", "[~SW-bgp]",
-        "[*SW-GigabitEthernet0/0/1]", "[SW-bgp-af-ipv4]", "<SW-1>",
-        "switch(config-if)#", "operator@router>", "operator@router#",
-    ],
-)
-def test_find_prompt_recognizes_configuration_views(prompt: str) -> None:
-    terminal = ScriptedTerminal([f"Welcome to the device\r\n{prompt} \r\n"])
-
-    assert terminal.find_prompt() == prompt
-    assert terminal.writes == [b"\n"]
-
-
-@pytest.mark.parametrize(
-    "output",
-    [
-        "status [SW]", "[edit protocols bgp]", "Continue? [Y/N]", "[]",
-        "[~]", "[SW]command", "prefix switch#", "progress 100%",
-        "[SW\x03]", "[[SW]]", "[Y/N]", "[yes/no]",
-    ],
-)
-def test_find_prompt_rejects_non_prompt_lines(output: str) -> None:
-    terminal = ScriptedTerminal([output])
-
-    with pytest.raises(TransportError, match="unable to find"):
-        terminal.find_prompt()
-
-
-def test_find_prompt_raises_when_no_prompt() -> None:
-    terminal = ScriptedTerminal([""])
-    with pytest.raises(TransportError, match="unable to find"):
-        terminal.find_prompt()
-
-
-def test_send_command_writes_and_strips_echo() -> None:
-    terminal = ScriptedTerminal(["show version\nCisco IOS 15.2\nsw1#"])
-    output = terminal.send_command(
-        "show version",
-        expect_string=r"#\s*$",
-        read_timeout=5.0,
-        strip_prompt=False,
-        strip_command=True,
-        cmd_verify=True,
-    )
-    assert terminal.writes == [b"show version\n"]
-    assert "Cisco IOS 15.2\nsw1#" in output
-
-
-def test_normalizes_crlf_to_lf() -> None:
-    terminal = ScriptedTerminal([b"line1\r\nline2\r\nsw1#".decode()])
-    output = terminal.read_until_pattern(r"#\s*$", read_timeout=5.0)
-    assert "\r" not in output
-    assert output == "line1\nline2\nsw1#"
-
-
-def test_strips_ansi_codes_from_reads() -> None:
-    terminal = ScriptedTerminal(["\x1b[7m--More--\x1b[m"])
-    output = terminal.read_until_pattern(r"--More--\s*\Z", read_timeout=5.0)
-    assert output == "--More--"
-
-
-def test_ssh_terminal_disconnect_without_connect_is_safe() -> None:
-    terminal = SshTerminal()
+def test_pty_disconnect_is_safe_without_start() -> None:
+    terminal = PtyTerminal()
     terminal.disconnect()
-    assert terminal._channel is None
-    assert terminal._client is None
+    assert terminal.is_alive() is False
+    assert terminal.exit_code is None
 
 
-_SERIAL_KWARGS = {
-    "baudrate": 9600,
-    "bytesize": 8,
-    "parity": "N",
-    "stopbits": 1,
-    "conn_timeout": 1.0,
-}
+def test_pty_disconnect_stops_the_child_process() -> None:
+    terminal = _start_pty("import time; print('ready', flush=True); time.sleep(60)")
+    output = terminal.read_channel_timing(last_read=0.02, read_timeout=1.0)
+    assert "ready" in output
+    process = terminal._process
+    assert process is not None
+    pid = process.pid
 
+    terminal.disconnect()
 
-def test_serial_rejects_relative_paths(tmp_path: Path) -> None:
-    terminal = SerialTerminal()
-    with pytest.raises(TransportError, match="absolute /dev/"):
-        terminal.connect(device="ttyUSB0", **_SERIAL_KWARGS)  # type: ignore[arg-type]
-    with pytest.raises(TransportError, match="absolute /dev/"):
-        terminal.connect(device=str(tmp_path / "ttyUSB0"), **_SERIAL_KWARGS)  # type: ignore[arg-type]
+    assert terminal.is_alive() is False
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_serial_rejects_missing_devices() -> None:
     terminal = SerialTerminal()
     with pytest.raises(TransportError, match="not accessible"):
-        terminal.connect(
-            device="/dev/opencode-network-terminal-mcp-missing",
-            **_SERIAL_KWARGS,  # type: ignore[arg-type]
-        )
+        terminal.open(device="/dev/opencode-network-terminal-mcp-missing", baudrate=9600)
 
 
 def test_serial_rejects_non_character_devices(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import stat as stat_module
-
+    device = tmp_path / "tty-test"
+    device.write_text("", encoding="utf-8")
     monkeypatch.setattr(
         "network_terminal_mcp.terminal.os.stat",
-        lambda path: os.stat_result((stat_module.S_IFREG | 0o644, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
+        lambda _: os.stat_result(
+            (stat.S_IFREG | 0o644, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        ),
     )
-    terminal = SerialTerminal()
     with pytest.raises(TransportError, match="not a character device"):
-        terminal.connect(device="/dev/not-a-char", **_SERIAL_KWARGS)  # type: ignore[arg-type]
+        terminal = SerialTerminal()
+        terminal.open(device=str(device), baudrate=9600)
 
 
-def test_serial_open_failure_is_a_transport_error() -> None:
+class FakeSerial:
+    def __init__(self, **_: Any) -> None:
+        self.is_open = True
+        self.writes: list[bytes] = []
+        self.incoming: list[bytes] = []
+        self.in_waiting = 0
+
+    def read(self, size: int) -> bytes:
+        if self.incoming:
+            data = self.incoming.pop(0)
+            self.in_waiting = sum(len(item) for item in self.incoming)
+            return data
+        return b""
+
+    def write(self, data: bytes) -> int:
+        self.writes.append(data)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.is_open = False
+
+
+def test_serial_read_write_and_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[FakeSerial] = []
+
+    def factory(**kwargs: Any) -> FakeSerial:
+        port = FakeSerial(**kwargs)
+        created.append(port)
+        return port
+
+    fake_module = SimpleNamespace(
+        Serial=factory,
+        EIGHTBITS=8,
+        PARITY_NONE="N",
+        STOPBITS_ONE=1,
+    )
+    monkeypatch.setitem(sys.modules, "serial", fake_module)  # type: ignore[arg-type]
+    monkeypatch.setattr(SerialTerminal, "_validate_device", staticmethod(lambda _: None))
+
     terminal = SerialTerminal()
-    with pytest.raises(TransportError, match="serial open failed"):
-        terminal.connect(device="/dev/null", **_SERIAL_KWARGS)  # type: ignore[arg-type]
+    terminal.open(device="/dev/ttyTEST", baudrate=115200)
+    assert terminal.is_alive() is True
 
+    terminal.write_channel("show version\r")
+    assert created[0].writes == [b"show version\r"]
 
-def test_serial_disconnect_without_connect_is_safe() -> None:
-    terminal = SerialTerminal()
+    created[0].incoming = [b"hello\r\n"]
+    created[0].in_waiting = len(created[0].incoming[0])
+    assert terminal.read_channel_timing(last_read=0.01, read_timeout=1.0) == "hello\r\n"
+
     terminal.disconnect()
-    assert terminal._serial is None
+    assert terminal.is_alive() is False

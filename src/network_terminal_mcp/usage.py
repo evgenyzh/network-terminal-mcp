@@ -1,8 +1,8 @@
 """Model-facing operating instructions shipped with the MCP server.
 
-The concise contract goes into the MCP ``initialize`` result (OpenCode places
-it in the model context). The full manual lives in ``usage.md`` inside this
-package and is exposed as the ``network-terminal://usage`` resource.
+The concise contract goes into the MCP ``initialize`` result. The full manual
+lives in ``usage.md`` inside this package and is exposed as the
+``network-terminal://usage`` resource.
 """
 
 from __future__ import annotations
@@ -12,34 +12,33 @@ from importlib.resources import files
 USAGE_URI = "network-terminal://usage"
 
 INSTRUCTIONS = """\
-network-terminal gives you a raw persistent terminal to network devices.
+network-terminal gives you a persistent raw terminal opened by a real command.
 
-- open_session opens ONE terminal (ssh/telnet/console/serial) and keeps it
-  open. route (socks/proxyjump) covers only the first hop; reach further hosts
-  by typing `ssh`/`telnet` inside the session. Several sessions can stay open.
-- Everything after that is terminal_write (input) and terminal_read (output).
-  No command allowlists, no per-command server approval. terminal_read returns
-  output after a brief quiet period; right after a command that starts a new
-  connection (e.g. ssh) it may return only the echo - read again.
-- terminal_read returns only NEW output, never history you already saw. If it
-  is truncated, continue with read_output(session_id,
+- open_session(command) accepts exactly one command: `ssh ...`, `telnet ...`,
+  or `serial DEVICE [BAUDRATE]`. SSH uses the local OpenSSH client, your config,
+  agent, keys, ProxyJump, and any other ssh options. No shell is involved.
+- Keep using the same session for commands, `?` help, pagers, and further
+  `ssh`/`telnet` hops. terminal_write sends input; terminal_read returns only
+  NEW output. No prompt shape is required.
+- If terminal_read is truncated, continue with read_output(session_id,
   offset=next_output_offset) or just read_output(session_id). Do not re-read
   old output: it wastes context.
-- Secrets typed at any live prompt MUST go through
-  terminal_write_secret(session_id, <pass entry>). terminal_write is audited
-  verbatim; never type passwords, passphrases, or tokens with it, and never
-  guess pass entries or key paths - ask the user.
-- Single keys and controls: terminal_write(..., enter=false), e.g. " " (pager
-  next page), "q", "\\u0003" (Ctrl-C).
-- An authentication error is NOT a permission popup problem. Read the message:
-  it names the jump host or the final target whose credential is wrong.
-- Use host_key_policy=strict (default); accept_new only for the first contact
-  with a host. Telnet/console require allow_telnet=true; serial requires
-  allow_serial=true and an absolute /dev/tty* path.
-- Always close_session when done, including after errors.
+- Use terminal_write(..., enter=false) for a single key or control byte, e.g.
+  " " for the next pager page, "q" to quit, "\\u0003" for Ctrl-C.
+- At any live password/passphrase prompt use terminal_write_secret with exactly
+  one of value, env, or file. Never put a password in terminal_write or in the
+  connection command. Prefer env or file; a plaintext value stays in the model
+  and client history.
+- open_session returns ready when the terminal process is running, not when
+  authentication or a CLI prompt has completed. Read the live stream.
+- If the client process exits during startup, open_session raises the real exit
+  code and output. If it exits later, session_status reports closed/failed and
+  the exit code. Always close_session when done.
+- Do not use this MCP for a simple non-interactive `ssh host 'command'`; the
+  ordinary shell is simpler for one-shot commands.
 
 Full manual: read the MCP resource network-terminal://usage before complex
-work (nested hops, secrets, troubleshooting).
+work (nested hops, secrets, serial, troubleshooting).
 """
 # NOTE: keep this contract in sync with the matching rules in usage.md.
 

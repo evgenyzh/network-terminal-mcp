@@ -1,5 +1,8 @@
 # Эксплуатация
 
+> Статус: инструкция для выпущенного 0.1.x. Актуальная эксплуатация 0.2.0 —
+> в [текущей документации](../../current/operations.md).
+
 ## Границы текущей версии
 
 Сервер поддерживает постоянные direct SSH/Telnet/console/serial-сессии,
@@ -109,8 +112,10 @@ policy может запретить их полностью. Telnet/console п�
 
 Обязательных файлов нет. Единственный необязательный файл —
 `~/.config/network-terminal-mcp/policy.yml` (каталог 0700, файл 0600): posture
-и runtime-лимиты. Без него действуют встроенные defaults. Формат описан в
-[документе конфигурации](configuration.md).
+и runtime-лимиты. Без него действуют встроенные defaults. В нём можно изменить
+`session_idle_timeout`, `session_max_lifetime`, `io_timeout`,
+`max_read_timeout`, размеры ввода/вывода/buffer, `max_open_sessions`, пути
+runtime-файлов и запреты insecure-режимов.
 
 Проверка без сетевых соединений:
 
@@ -180,26 +185,35 @@ uv tool upgrade network-terminal-mcp     # обновление
 подключения. В OpenCode сервер регистрируется как local MCP с полным путём к
 бинарю и timeout не меньше `runtime.io_timeout`:
 
-```json
+```jsonc
 {
+  "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "network-terminal": {
-      "type": "local",
-      "command": ["/home/USER/.local/bin/network-terminal-mcp"],
-      "enabled": true,
-      "timeout": 65000
+    "servers": {
+      "network-terminal": {
+        "type": "local",
+        "command": ["/home/USER/.local/bin/network-terminal-mcp"],
+        "codemode": false,
+        "timeout": {"startup": 65000}
+      }
     }
   },
-  "permission": {
-    "network-terminal_open_session": "ask"
-  }
+  "permissions": [
+    {
+      "action": "network-terminal_open_session",
+      "resource": "*",
+      "effect": "ask"
+    }
+  ]
 }
 ```
 
 Если `~/.local/bin` в `PATH`, достаточно `["network-terminal-mcp"]`.
+`codemode: false` оставляет все инструменты в native tool list.
 
-После изменения global OpenCode config или skill перезапустите OpenCode:
-конфигурация и MCP tools загружаются только при старте.
+OpenCode отслеживает изменения конфигурации и перечитывает её автоматически.
+Для принудительной перезагрузки используйте `/reload`; полный перезапуск не
+требуется.
 
 ### Дублирование MCP-процессов
 

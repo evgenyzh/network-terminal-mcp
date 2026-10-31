@@ -2,53 +2,69 @@
 
 ## Read First
 
-- `README.md` defines the project scope.
-- `docs/architecture.md` is the technical source of truth.
-- `docs/development-plan.md` lists ordered milestones and exit criteria.
-- `docs/security.md` contains mandatory safety requirements.
+- `README.md` gives the project overview and release status.
+- `docs/README.md` is the single documentation index and explains document
+  statuses.
+- `docs/current/architecture.md` is the technical source of truth for released
+  0.2.0 behavior.
+- `docs/current/security.md` defines the current trust model and secret rules.
 - `src/network_terminal_mcp/usage.md` is the model-facing manual shipped as MCP
   `instructions` + the `network-terminal://usage` resource; keep it in sync with
   `usage.py` and the OpenCode skill.
-- There are no example config files: connections are model-described inline. Never commit real
-  addresses, hostnames, or secrets anywhere in the repository.
+
+## Documentation Structure
+
+- `docs/current/`: documentation for the released implementation.
+- `docs/plans/`: only approved target specifications and the post-release
+  backlog.
+- `docs/history/`: historical stages and completed plans only, never current
+  operating guidance.
+- Keep one authoritative description per topic. Do not recreate overlapping
+  configuration, adapter, or development-plan documents.
+- On release, move the completed plan to `docs/history/` and describe only
+  actual behavior in `docs/current/`.
 
 ## Safety Rules
 
-- Never add plaintext passwords, TACACS secrets, enable secrets, API tokens, or real production
-  addresses to this repository.
-- Never run integration tests against real network devices without explicit user approval for the
-  exact targets and commands.
-- Sessions are raw interactive terminals: the model may type any command, including configuration
-  entry. The safety boundary is the client permission gate on `open_session` (and optionally on
-  `terminal_write`), the audited input, and the operator's AAA policy — not command allowlists.
-- Secrets typed at a live prompt must go through `terminal_write_secret` (a `pass` entry reference);
-  its value must never appear in tool arguments, results, or audit. Plain `terminal_write` is
-  logged verbatim and must not be used for secrets.
-- Keep legacy SSH algorithms scoped to explicit per-call host allowlists. Never weaken global
-  SSH settings.
-- Telnet, TCP console, and local serial must be explicitly enabled per call (`allow_telnet=true`,
-  `allow_serial=true`) and clearly marked insecure; policy can hard-deny them.
-- Audit failures are fail-closed: if an action cannot be recorded, it must not be executed.
-- Secret retrieval is internal to the server. MCP tool arguments and results must not contain
-  passwords, except an explicit plaintext opt-in behind `allow_plaintext_password`, which is never
-  stored, never audited, and always marked insecure. References (`pass` entry, key file) are the
-  default.
+- Never add plaintext passwords, TACACS secrets, enable secrets, API tokens,
+  private keys, real production addresses, hostnames, usernames, fingerprints,
+  or production transcripts to this repository. Examples use `192.0.2.0/24` and
+  `example.net`.
+- Never run integration tests against real network devices without explicit
+  user approval for the exact targets and commands.
+- Audit failures are fail-closed: if an action cannot be recorded, it must not
+  be executed.
+- Values sent through `terminal_write_secret` must never appear in tool results
+  or audit. They may be visible in model context when the caller deliberately
+  uses the new `value` source; this is documented behavior, not a hidden leak.
+- Keep the output redactor effective for secrets already registered in a
+  session.
 
 ## Engineering Rules
 
-- Use Python 3.12+ and `uv`.
-- Terminal transport is implemented directly on Paramiko (SSH), telnetlib3
-  (Telnet/TCP console), and pyserial (local serial) in
-  `src/network_terminal_mcp/terminal.py`. Do not reintroduce a vendor-driver
-  abstraction or nested connection routes; the model identifies the device type
-  from output and performs further ssh/telnet hops itself with `terminal_write`.
-- Keep command knowledge out of the transport layer. The transport handles
-  writes, reads, prompt detection, and timeouts only.
-- Validate the connection spec and policy with Pydantic before opening any
-  network connection.
-- Use structured errors and redact secrets before logging or returning failures.
+- Use Python 3.12+ and `uv`; target POSIX/Linux.
+- `open_session` accepts only `command`. Do not retain or recreate structured
+  connection fields, connection plans, inventory, policy gates, credential
+  profiles, a custom host-key store, or nested route models.
+- SSH and Telnet run as real clients in a POSIX PTY. Serial uses pyserial via
+  `serial DEVICE [BAUDRATE]`. Do not reintroduce Paramiko/telnetlib3 or a
+  vendor-driver abstraction.
+- Sessions are persistent raw terminals. Transport code handles process/device
+  I/O, lifecycle, and timeouts only; command knowledge belongs to the model.
+- Keep cursor-based output: a default read returns only unseen output and must
+  not replay history into model context. The first read must include a startup
+  banner stored by `open_session`.
+- Convert expected `NetworkMCPError` failures to `ToolError` with actionable,
+  redacted messages. Never replace them with a generic tool error.
+- Generated tool argument schemas must reject unknown fields. The removed
+  structured connection fields must not be silently accepted.
+- There is no mandatory configuration, `pass` integration, or `open_session`
+  permission gate. The server is a trusted local component, not a sandbox.
+- Do not add a one-shot `run_command` gateway: ordinary shell SSH remains the
+  simpler tool for non-interactive one-off commands.
+- Do not add new restrictions unless a concrete operational need is documented.
 
-## Planned Verification
+## Verification
 
 ```bash
 uv run ruff check .
@@ -56,5 +72,5 @@ uv run mypy src
 uv run pytest
 ```
 
-Add these checks as the corresponding implementation appears. Do not add placeholder tests that
-assert no behavior.
+Add and update meaningful tests with implementation changes. Use fake terminal
+clients for PTY tests; no placeholder tests and no real production identifiers.
