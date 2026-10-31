@@ -66,14 +66,26 @@ def test_pty_write_timeout_is_validated() -> None:
         PtyTerminal(write_timeout=0)
 
 
-def test_pty_write_times_out_when_the_child_stops_reading() -> None:
+def test_pty_write_times_out_when_the_buffer_is_full() -> None:
+    # A full pipe exercises the same non-blocking write loop without depending
+    # on the kernel's PTY buffer size, which varies between runners.
+    read_fd, write_fd = os.pipe()
     terminal = PtyTerminal(write_timeout=0.2)
-    terminal.start((sys.executable, "-c", "import time; time.sleep(5)"))
     try:
+        os.set_blocking(write_fd, False)
+        while True:
+            try:
+                os.write(write_fd, b"x" * 65_536)
+            except BlockingIOError:
+                break
+        terminal._process = SimpleNamespace(fd=write_fd)  # type: ignore[assignment]
+
         with pytest.raises(TransportError, match="timed out"):
-            terminal.write_channel("x" * 8_000_000)
+            terminal.write_channel("x")
     finally:
-        terminal.disconnect()
+        terminal._process = None
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 def test_pty_disconnect_is_safe_without_start() -> None:
