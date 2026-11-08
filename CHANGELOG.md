@@ -4,6 +4,21 @@
 [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии следуют
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-08
+
+Breaking release: MCP output schemas changed. Clients that use fields removed
+from 0.2.1 responses must be updated; use `session_status` for full metadata.
+
+### Changed
+
+- MCP tool responses are compact: opening and closing return essential state,
+  writes return `ok`, and reads omit redundant fields. Warnings, abnormal
+  states, errors, and continuation or buffer-eviction information remain visible;
+  full session metadata is available via `session_status`. This changes the
+  MCP output schemas and may require updates to clients relying on 0.2.1 fields.
+- Shortened the always-present MCP instructions; the full manual remains a
+  resource. The 65,536-byte per-read limit and cursor behavior are unchanged.
+
 ## [0.2.1] - 2026-10-31
 
 ### Added

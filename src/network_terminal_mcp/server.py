@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from functools import partial
+from typing import NotRequired, TypedDict
 
 import anyio
 from mcp.server import MCPServer
@@ -13,14 +14,43 @@ from mcp.server.mcpserver.exceptions import ToolError
 from network_terminal_mcp import __version__
 from network_terminal_mcp.errors import NetworkMCPError
 from network_terminal_mcp.sessions import (
-    OutputChunk,
     SessionInfo,
     SessionManager,
-    TerminalOutput,
-    TerminalSecretResult,
-    TerminalWriteResult,
 )
+from network_terminal_mcp.sessions.models import SessionState
 from network_terminal_mcp.usage import INSTRUCTIONS, USAGE_URI, usage_text
+
+
+class OpenReply(TypedDict):
+    session_id: str
+    state: SessionState
+    warnings: NotRequired[list[str]]
+    error: NotRequired[str]
+
+
+class WriteReply(TypedDict):
+    ok: bool
+    state: NotRequired[SessionState]
+
+
+class ReadReply(TypedDict):
+    output: str
+    truncated: NotRequired[bool]
+    next_output_offset: NotRequired[int]
+
+
+class BufferReply(TypedDict):
+    output: str
+    offset: NotRequired[int]
+    next_offset: NotRequired[int]
+    oldest_offset: NotRequired[int]
+    truncated: NotRequired[bool]
+
+
+class CloseReply(TypedDict):
+    state: SessionState
+    exit_code: NotRequired[int]
+    error: NotRequired[str]
 
 
 def create_server(*, manager: SessionManager | None = None) -> MCPServer:
@@ -55,50 +85,53 @@ def create_server(*, manager: SessionManager | None = None) -> MCPServer:
         return usage_text()
 
     @server.tool()
-    async def open_session(command: str) -> SessionInfo:
-        """Open one persistent terminal from a connection command.
+    async def open_session(command: str) -> OpenReply:
+        """Open a persistent terminal: ssh, telnet, or serial DEVICE [BAUDRATE].
 
-        Use a real client command. SSH examples:
-        ``ssh operator@192.0.2.10``,
-        ``ssh -J operator@bastion.example.net operator@192.0.2.10``,
-        ``ssh -i ~/.ssh/id_ed25519 -p 2222 operator@192.0.2.20``.
-        Telnet: ``telnet 192.0.2.30 23``. Local serial:
-        ``serial /dev/ttyUSB0 115200``. The command is not run through a
-        shell. SSH uses your existing config, agent, keys, and options.
+        No shell is involved. SSH uses the local client, config, agent and keys.
         """
-        return await _run_tool(session_manager.open_session, command)
+        info = await _run_tool(session_manager.open_session, command)
+        reply: OpenReply = {"session_id": info.session_id, "state": info.state}
+        if info.warnings:
+            reply["warnings"] = info.warnings
+        if info.error:
+            reply["error"] = info.error
+        return reply
 
     @server.tool()
     async def terminal_write(
         session_id: str, data: str, enter: bool = True
-    ) -> TerminalWriteResult:
-        """Write exact input to the session's terminal stream.
+    ) -> WriteReply:
+        """Write input, appending a line terminator unless enter=false.
 
-        Use this for commands, interactive keystrokes, and further hops such as
-        ``ssh user@host``. ``enter`` appends the transport line terminator
-        (newline, or carriage return on serial). A client that stops reading
-        input causes a bounded write timeout and marks the session failed. The
-        data is audited after known-secret redaction; never type a password
-        here. Use terminal_write_secret for secrets.
+        Input is audited after known-secret redaction; use terminal_write_secret
+        for passwords. Timeout fails the session and may mean a partial write.
         """
-        return await _run_tool(
+        result = await _run_tool(
             session_manager.terminal_write, session_id, data, enter=enter
         )
+        reply: WriteReply = {"ok": True}
+        if result.state != SessionState.READY:
+            reply["state"] = result.state
+        return reply
 
     @server.tool()
     async def terminal_read(
         session_id: str, timeout: float | None = None
-    ) -> TerminalOutput:
-        """Read new terminal output until the stream is quiet or timeout expires.
+    ) -> ReadReply:
+        """Read only new output until quiet or timeout; no prompt shape required.
 
-        Returns only output that arrived since your previous read, including
-        banners, password prompts, pagers, and command output; no prompt shape
-        is required. If ``truncated=true``, continue from
-        ``next_output_offset`` with read_output.
+        If truncated, continue with read_output or next_output_offset.
         """
-        return await _run_tool(
+        result = await _run_tool(
             session_manager.terminal_read, session_id, timeout=timeout
         )
+        reply: ReadReply = {"output": result.output}
+        if result.truncated:
+            reply["truncated"] = True
+        if result.next_output_offset is not None:
+            reply["next_output_offset"] = result.next_output_offset
+        return reply
 
     @server.tool()
     async def terminal_write_secret(
@@ -106,41 +139,44 @@ def create_server(*, manager: SessionManager | None = None) -> MCPServer:
         value: str | None = None,
         env: str | None = None,
         file: str | None = None,
-    ) -> TerminalSecretResult:
-        """Send a secret at a live prompt from exactly one source.
+    ) -> WriteReply:
+        """Send a secret from exactly one source: value, env, or file.
 
-        Choose one: ``value`` carries a plaintext string, ``env`` names a
-        variable in the MCP process environment, and ``file`` names a local
-        file whose final newline is stripped. The value is never returned or
-        written to audit; only the source kind and byte count are logged.
-        A plaintext ``value`` remains in the model/client history, so prefer
-        ``env`` or ``file`` when available.
+        Prefer env or file; plaintext value remains in client history. The server
+        redacts known secrets and never returns or audits the secret value.
         """
-        return await _run_tool(
+        result = await _run_tool(
             session_manager.terminal_write_secret,
             session_id,
             value=value,
             env=env,
             file=file,
         )
+        reply: WriteReply = {"ok": True}
+        if result.state != SessionState.READY:
+            reply["state"] = result.state
+        return reply
 
     @server.tool()
     async def read_output(
         session_id: str, offset: int | None = None, limit: int | None = None
-    ) -> OutputChunk:
-        """Read buffered session output that you have not seen yet.
-
-        Without ``offset`` it continues from your read cursor, so repeated
-        calls never re-inject old output. Pass an explicit ``offset`` only to
-        deliberately revisit older buffered output (for example the
-        ``next_output_offset`` of a truncated read).
-        """
-        return await _run_tool(
+    ) -> BufferReply:
+        """Read buffered output from the cursor, or a specified historical offset."""
+        result = await _run_tool(
             session_manager.read_output,
             session_id,
             offset=offset,
             limit=limit,
         )
+        reply: BufferReply = {"output": result.output}
+        if offset is not None:
+            reply["offset"] = result.offset
+        if result.next_offset is not None:
+            reply["next_offset"] = result.next_offset
+        if result.truncated:
+            reply["truncated"] = True
+            reply["oldest_offset"] = result.oldest_offset
+        return reply
 
     @server.tool()
     async def session_status(session_id: str) -> SessionInfo:
@@ -148,9 +184,15 @@ def create_server(*, manager: SessionManager | None = None) -> MCPServer:
         return await _run_tool(session_manager.session_status, session_id)
 
     @server.tool()
-    async def close_session(session_id: str) -> SessionInfo:
+    async def close_session(session_id: str) -> CloseReply:
         """Close the terminal and child process, retaining its final status."""
-        return await _run_tool(session_manager.close_session, session_id)
+        info = await _run_tool(session_manager.close_session, session_id)
+        reply: CloseReply = {"state": info.state}
+        if info.exit_code not in (None, 0):
+            reply["exit_code"] = info.exit_code
+        if info.error:
+            reply["error"] = info.error
+        return reply
 
     _forbid_unknown_arguments(server)
     return server

@@ -93,10 +93,7 @@ async def test_open_session_tool_accepts_only_a_command() -> None:
         "open_session", {"command": "ssh operator@192.0.2.1"}
     )
 
-    assert result.structured_content["session_id"] == "session-1"
-    assert result.structured_content["command"] == "ssh operator@192.0.2.1"
-    assert result.structured_content["last_output_at"] is None
-    assert result.structured_content["idle_seconds"] == 0.0
+    assert result.structured_content == {"session_id": "session-1", "state": "ready"}
     assert manager.calls == [("open_session", "ssh operator@192.0.2.1")]
 
 
@@ -171,10 +168,9 @@ async def test_terminal_tools_dispatch() -> None:
         {"session_id": "session-1", "env": "DEVICE_PASSWORD"},
     )
 
-    assert written.structured_content["bytes_sent"] == len("ssh operator@192.0.2.10")
-    assert "data" not in written.structured_content
-    assert read.structured_content["output"] == "output"
-    assert secret.structured_content["source"] == "env"
+    assert written.structured_content == {"ok": True}
+    assert read.structured_content == {"output": "output"}
+    assert secret.structured_content == {"ok": True}
     assert manager.calls == [
         ("terminal_write", ("session-1", "ssh operator@192.0.2.10", True)),
         ("terminal_read", ("session-1", None)),
@@ -205,12 +201,80 @@ async def test_output_and_status_tools() -> None:
     unseen = await server.call_tool("read_output", {"session_id": "session-1"})
     status = await server.call_tool("session_status", {"session_id": "session-1"})
     closed = await server.call_tool("close_session", {"session_id": "session-1"})
-    assert output.structured_content["output"] == "chunk"
-    assert unseen.structured_content["output"] == "chunk"
+    assert output.structured_content == {"output": "chunk", "offset": 3}
+    assert unseen.structured_content == {"output": "chunk"}
     assert manager.calls[-4] == ("read_output", ("session-1", 3, 10))
     assert manager.calls[-3] == ("read_output", ("session-1", None, None))
     assert status.structured_content["state"] == "ready"
-    assert closed.structured_content["state"] == "closed"
+    assert status.structured_content["command"] == "ssh operator@192.0.2.1"
+    assert status.structured_content["last_output_at"] is None
+    assert status.structured_content["idle_seconds"] == 0.0
+    assert closed.structured_content == {"state": "closed"}
+
+
+@pytest.mark.asyncio
+async def test_compact_responses_keep_important_diagnostics() -> None:
+    class DiagnosticManager(FakeManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.info = self.info.model_copy(update={"warnings": ["no initial output"]})
+
+        def terminal_write(
+            self, session_id: str, data: str, *, enter: bool = True
+        ) -> TerminalWriteResult:
+            return TerminalWriteResult(
+                session_id=session_id, bytes_sent=len(data), state=SessionState.FAILED
+            )
+
+        def terminal_write_secret(
+            self, session_id: str, *, value: str | None = None,
+            env: str | None = None, file: str | None = None,
+        ) -> TerminalSecretResult:
+            return TerminalSecretResult(
+                session_id=session_id, source="env", bytes_sent=1, state=SessionState.CLOSED
+            )
+
+        def terminal_read(
+            self, session_id: str, *, timeout: float | None = None
+        ) -> TerminalOutput:
+            return TerminalOutput(
+                session_id=session_id, output="prefix", truncated=True,
+                output_offset=0, next_output_offset=6,
+            )
+
+        def read_output(
+            self, session_id: str, *, offset: int | None, limit: int | None
+        ) -> OutputChunk:
+            return OutputChunk(
+                session_id=session_id, offset=6, output="tail", next_offset=10,
+                oldest_offset=2, truncated=True,
+            )
+
+        def close_session(self, session_id: str) -> SessionInfo:
+            return self.info.model_copy(update={
+                "state": SessionState.CLOSED, "exit_code": 255, "error": "process failed"
+            })
+
+    server = create_server(manager=DiagnosticManager())  # type: ignore[arg-type]
+    opened = await server.call_tool("open_session", {"command": "ssh example.net"})
+    written = await server.call_tool("terminal_write", {"session_id": "s", "data": "x"})
+    secret = await server.call_tool("terminal_write_secret", {"session_id": "s", "env": "X"})
+    read = await server.call_tool("terminal_read", {"session_id": "s"})
+    chunk = await server.call_tool("read_output", {"session_id": "s"})
+    closed = await server.call_tool("close_session", {"session_id": "s"})
+
+    assert opened.structured_content["warnings"] == ["no initial output"]
+    assert written.structured_content == {"ok": True, "state": "failed"}
+    assert secret.structured_content == {"ok": True, "state": "closed"}
+    assert read.structured_content == {
+        "output": "prefix", "truncated": True, "next_output_offset": 6
+    }
+    assert chunk.structured_content == {
+        "output": "tail", "next_offset": 10, "truncated": True, "oldest_offset": 2
+    }
+    assert closed.structured_content == {
+        "state": "closed", "exit_code": 255, "error": "process failed"
+    }
 
 
 @pytest.mark.asyncio
@@ -218,7 +282,7 @@ async def test_server_ships_usage_instructions_and_resource() -> None:
     manager = FakeManager()
     server = create_server(manager=manager)  # type: ignore[arg-type]
 
-    assert server.version == "0.2.1"
+    assert server.version == "0.3.0"
     instructions = server.instructions or ""
     assert "open_session(command)" in instructions
     assert "value, env, or file" in instructions

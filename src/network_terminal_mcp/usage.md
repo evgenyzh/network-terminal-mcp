@@ -63,6 +63,9 @@ terminal_read(session_id)
   Use it for single keys and controls: `" "` for the next pager page, `"q"` to
   quit, `"\u0003"` for Ctrl-C, `"\u0015"` for Ctrl-U.
 - The line terminator is `\n` for SSH/Telnet and `\r` for serial.
+- Successful writes return `ok=true`; a `state` field is included if the client
+  is no longer ready after the write. This confirms local delivery only, not
+  execution by the device. Check `session_status` for diagnostic details.
 
 ## Unstable connections
 
@@ -102,6 +105,10 @@ terminal_read(session_id)
   from `next_output_offset` with `read_output(session_id,
   offset=next_output_offset)` or from the read cursor with
   `read_output(session_id)`.
+- Normal replies omit `truncated` and continuation offsets. A `read_output`
+  reply includes `next_offset` when more buffered output remains; its
+  `truncated` and `oldest_offset` indicate that earlier history was evicted.
+  `terminal_read` still returns up to 65,536 bytes per call.
 - `read_output` without `offset` returns only unseen buffered output. An explicit
   `offset` is a deliberate random access into older output.
 - Never re-read history you already have: it wastes context without adding
@@ -156,6 +163,9 @@ host-key and authentication rules are that host's rules, not this server's.
 
 - `session_status` returns the original command, state, timestamps,
   `last_output_at`, `idle_seconds`, warnings, exit code, and saved error.
+- `open_session` returns the session ID and state, plus any warnings or error;
+  `close_session` returns the state, plus a nonzero exit code or saved error.
+  Use `session_status` when the full metadata is needed.
 - `close_session` terminates the client and child process group and retains the
   final status for inspection.
 - A natural process exit sets `closed` for code 0 and `failed` with the exit

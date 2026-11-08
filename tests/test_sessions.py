@@ -410,6 +410,28 @@ def test_terminal_read_truncates_large_inline_output() -> None:
     assert harness.manager.read_output(info.session_id, offset=8).output == "89abcdef"
 
 
+def test_default_read_limit_keeps_unseen_64k_tail_without_replay() -> None:
+    assert RuntimeLimits().max_inline_output_bytes == 65_536
+    harness = Harness(
+        limits=_limits(max_inline_output_bytes=65_536, max_session_buffer_bytes=100_000)
+    )
+    info = _open(harness)
+    fake = harness.manager._sessions[info.session_id].connection
+    assert isinstance(fake, FakeTerminal)
+    fake.outputs.append("x" * 65_536 + "tail")
+
+    first = harness.manager.terminal_read(info.session_id)
+    second = harness.manager.terminal_read(info.session_id)
+    third = harness.manager.read_output(info.session_id)
+
+    assert first.output == "x" * 65_536
+    assert first.truncated is True
+    assert first.next_output_offset == 65_536
+    assert second.output == "tail"
+    assert second.truncated is False
+    assert third.output == ""
+
+
 def test_read_output_continues_from_cursor_without_repeating() -> None:
     harness = Harness()
     info = _open(harness)

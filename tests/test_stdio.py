@@ -9,6 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
 
 def _message(payload: dict[str, object]) -> str:
     return json.dumps(payload, separators=(",", ":"))
@@ -74,3 +78,45 @@ def test_expected_error_is_visible_over_stdio(tmp_path: Path) -> None:
     )
     assert "Error executing tool session_status" in text
     assert "unknown session missing-session" in text
+
+
+@pytest.mark.asyncio
+async def test_compact_responses_over_stdio(tmp_path: Path) -> None:
+    fake_ssh = tmp_path / "ssh"
+    fake_ssh.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "print('banner', flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    print('response:' + line.strip(), flush=True)\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+    }
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "network_terminal_mcp"], env=env
+    )
+    async with stdio_client(params) as (reader, writer):
+        async with ClientSession(reader, writer) as session:
+            await session.initialize()
+            opened = await session.call_tool("open_session", {"command": "ssh example.net"})
+            assert opened.structured_content is not None
+            session_id = opened.structured_content["session_id"]
+            assert set(opened.structured_content) == {"session_id", "state"}
+            first = await session.call_tool("terminal_read", {"session_id": session_id})
+            assert first.structured_content == {"output": "banner\n"}
+            assert json.loads(first.content[0].text) == {"output": "banner\n"}
+            written = await session.call_tool(
+                "terminal_write", {"session_id": session_id, "data": "hello"}
+            )
+            assert written.structured_content == {"ok": True}
+            read = await session.call_tool("terminal_read", {"session_id": session_id})
+            assert read.structured_content == {"output": "response:hello\n"}
+            empty = await session.call_tool("read_output", {"session_id": session_id})
+            assert empty.structured_content == {"output": ""}
+            closed = await session.call_tool("close_session", {"session_id": session_id})
+            assert closed.structured_content["state"] == "closed"
