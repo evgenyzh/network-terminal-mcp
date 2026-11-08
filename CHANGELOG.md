@@ -4,6 +4,12 @@
 [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии следуют
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-08
+
+### Fixed
+
+- Corrected the current documentation link label in the PyPI README.
+
 ## [0.3.0] - 2026-11-08
 
 Breaking release: MCP output schemas changed. Clients that use fields removed

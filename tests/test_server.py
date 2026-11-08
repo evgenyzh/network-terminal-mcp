@@ -282,7 +282,7 @@ async def test_server_ships_usage_instructions_and_resource() -> None:
     manager = FakeManager()
     server = create_server(manager=manager)  # type: ignore[arg-type]
 
-    assert server.version == "0.3.0"
+    assert server.version == "0.3.1"
     instructions = server.instructions or ""
     assert "open_session(command)" in instructions
     assert "value, env, or file" in instructions
