@@ -49,6 +49,9 @@ class _Decoder:
     def decode(self, data: bytes, *, final: bool = False) -> str:
         return self._decoder.decode(data, final=final)
 
+    def has_pending_bytes(self) -> bool:
+        return bool(self._decoder.getstate()[0])
+
 
 class PtyTerminal:
     """A real ssh/telnet process attached to a POSIX pseudo-terminal."""
@@ -86,11 +89,14 @@ class PtyTerminal:
             raise TransportError(f"cannot execute {argv[0]}: {exc}") from exc
 
     def write_channel(self, out_data: str) -> None:
+        self.write_bytes(out_data.encode("utf-8"))
+
+    def write_bytes(self, data: bytes) -> int:
+        """Write bytes without text conversion, retaining the bounded PTY write."""
         if self._closed or self._process is None:
             raise TransportError("terminal process is not running")
-        data = out_data.encode("utf-8")
         if not data:
-            return
+            return 0
         fd = self._process.fd
         if fd < 0:
             raise TransportError("terminal process is not running")
@@ -133,6 +139,39 @@ class PtyTerminal:
                 os.set_blocking(fd, previous_blocking)
             except OSError:
                 pass
+        return len(data)
+
+    def read_bytes(self, size: int, timeout: float) -> bytes:
+        """One bounded raw read; text-decoder state must be at a boundary."""
+        if size <= 0 or timeout <= 0:
+            raise TransportError("raw read size and timeout must be positive")
+        if self._decoder.has_pending_bytes():
+            raise TransportError("cannot enter binary mode with incomplete text")
+        # _read_once normally uses _READ_CHUNK; constrain it for callers that
+        # consume a protocol frame incrementally.
+        process = self._process
+        if process is None or self._closed or process.fd < 0:
+            raise TransportError("terminal process is not running")
+        try:
+            ready, _, _ = select.select([process.fd], [], [], timeout)
+            if not ready:
+                return b""
+            data = os.read(process.fd, min(size, _READ_CHUNK))
+            if not data:
+                self._eof = True
+                raise TransportError("terminal closed during raw read")
+            return data
+        except BlockingIOError:
+            return b""
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return b""
+            if exc.errno == errno.EIO:
+                self._eof = True
+            raise TransportError(f"terminal raw read failed: {exc}") from exc
+
+    def binary_ready(self) -> bool:
+        return not self._decoder.has_pending_bytes()
 
     def read_channel_timing(self, *, last_read: float, read_timeout: float) -> str:
         """Read until output has been quiet for ``last_read`` or time expires."""
@@ -247,7 +286,16 @@ class SerialTerminal:
         baudrate: int,
         read_timeout: float = 0.1,
         write_timeout: float = 10.0,
+        bytesize: int = 8,
+        parity: str = "N",
+        stopbits: float = 1,
+        flow_control: str = "none",
     ) -> None:
+        if (bytesize not in (5, 6, 7, 8) or parity not in ("N", "E", "O", "M", "S")
+                or stopbits not in (1, 1.5, 2)
+                or flow_control not in ("none", "xonxoff", "rtscts", "dsrdtr")
+                or read_timeout <= 0 or write_timeout <= 0):
+            raise TransportError("invalid serial settings")
         self._validate_device(device)
         try:
             import serial
@@ -259,11 +307,14 @@ class SerialTerminal:
             self._serial = serial.Serial(
                 port=device,
                 baudrate=baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
+                bytesize=bytesize,
+                parity=parity,
+                stopbits=stopbits,
                 timeout=read_timeout,
                 write_timeout=write_timeout,
+                xonxoff=flow_control == "xonxoff",
+                rtscts=flow_control == "rtscts",
+                dsrdtr=flow_control == "dsrdtr",
             )
         except Exception as exc:
             self._serial = None
@@ -279,13 +330,44 @@ class SerialTerminal:
             raise TransportError(f"serial device {device} is not a character device")
 
     def write_channel(self, out_data: str) -> None:
+        self.write_bytes(out_data.encode("utf-8"))
+
+    def write_bytes(self, data: bytes) -> int:
         if self._closed or self._serial is None:
             raise TransportError("serial terminal is not open")
         try:
-            self._serial.write(out_data.encode("utf-8"))
-            self._serial.flush()
+            written = self._serial.write(data)
+            if written != len(data):
+                raise TransportError("serial write was partial; device state is unknown")
+            # flush/tcdrain may block indefinitely even when write_timeout is set.
+            return int(written)
+        except TransportError:
+            raise
         except Exception as exc:
             raise TransportError(f"serial write failed: {exc}") from exc
+
+    def read_bytes(self, size: int, timeout: float) -> bytes:
+        if size <= 0 or timeout <= 0:
+            raise TransportError("raw read size and timeout must be positive")
+        if self._decoder.has_pending_bytes():
+            raise TransportError("cannot enter binary mode with incomplete text")
+        port = self._serial
+        if self._closed or port is None:
+            raise TransportError("serial terminal is not open")
+        old_timeout = port.timeout
+        try:
+            port.timeout = timeout
+            return bytes(port.read(min(size, _READ_CHUNK)))
+        except Exception as exc:
+            raise TransportError(f"serial raw read failed: {exc}") from exc
+        finally:
+            try:
+                port.timeout = old_timeout
+            except Exception as exc:
+                raise TransportError("could not restore serial read timeout") from exc
+
+    def binary_ready(self) -> bool:
+        return not self._decoder.has_pending_bytes()
 
     def read_channel_timing(self, *, last_read: float, read_timeout: float) -> str:
         serial_port = self._serial

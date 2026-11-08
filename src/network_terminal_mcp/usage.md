@@ -111,6 +111,11 @@ terminal_read(session_id)
   `terminal_read` still returns up to 65,536 bytes per call.
 - `read_output` without `offset` returns only unseen buffered output. An explicit
   `offset` is a deliberate random access into older output.
+- Pass a stable `reader_id` to `read_output` for an independent named cursor;
+  this reads only output already collected by `terminal_read`, not directly
+  from the transport. The session retains up to 32 named readers. If a reader
+  falls behind buffer eviction, the error reports the oldest available offset;
+  explicitly pass an available offset to resume after acknowledging the gap.
 - Never re-read history you already have: it wastes context without adding
   information.
 

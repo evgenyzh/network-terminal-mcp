@@ -18,9 +18,11 @@ pagers, and nested hops. Read startup output; ready only means the local client
 is running, not that authentication or the network is healthy.
 
 Reads return only new output. If truncated, continue with read_output without
-an offset. Do not re-read history. Use enter=false for single keys. Send secrets
-only with terminal_write_secret (exactly one of value, env, or file); prefer env
-or file because value remains in client history.
+an offset. A reader_id on read_output has an independent cursor for already
+buffered output; it does not collect the transport. Do not re-read history.
+Use enter=false for single keys. Send secrets only with terminal_write_secret
+(exactly one of value, env, or file); prefer env or file because value remains
+in client history.
 
 After sleep or network changes, reopen suspect sessions. A timed-out write may
 be partial: verify device state before retrying. Close sessions when done. For

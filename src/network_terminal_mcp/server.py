@@ -53,8 +53,17 @@ class CloseReply(TypedDict):
     error: NotRequired[str]
 
 
-def create_server(*, manager: SessionManager | None = None) -> MCPServer:
-    """Build an MCP server, optionally with an injected manager for tests."""
+def create_server(
+    *, manager: SessionManager | None = None, shutdown_manager: bool = True
+) -> MCPServer:
+    """Build an MCP server; an embedding owner may retain a shared manager.
+
+    ``shutdown_manager=False`` requires an injected manager and means its owner
+    is responsible for closing sessions on process shutdown. It does not add
+    authorization to the MCP tools.
+    """
+    if manager is None and not shutdown_manager:
+        raise ValueError("shared manager must be supplied when shutdown_manager is false")
     session_manager = manager or SessionManager()
 
     @asynccontextmanager
@@ -62,7 +71,8 @@ def create_server(*, manager: SessionManager | None = None) -> MCPServer:
         try:
             yield
         finally:
-            await anyio.to_thread.run_sync(session_manager.shutdown)
+            if shutdown_manager:
+                await anyio.to_thread.run_sync(session_manager.shutdown)
 
     server = MCPServer(
         "network-terminal",
@@ -159,15 +169,19 @@ def create_server(*, manager: SessionManager | None = None) -> MCPServer:
 
     @server.tool()
     async def read_output(
-        session_id: str, offset: int | None = None, limit: int | None = None
+        session_id: str, offset: int | None = None, limit: int | None = None,
+        reader_id: str | None = None,
     ) -> BufferReply:
-        """Read buffered output from the cursor, or a specified historical offset."""
-        result = await _run_tool(
-            session_manager.read_output,
-            session_id,
-            offset=offset,
-            limit=limit,
-        )
+        """Read buffered output from the default or an independent named cursor."""
+        if reader_id is None:
+            result = await _run_tool(
+                session_manager.read_output, session_id, offset=offset, limit=limit
+            )
+        else:
+            result = await _run_tool(
+                session_manager.read_output, session_id, offset=offset, limit=limit,
+                reader_id=reader_id,
+            )
         reply: BufferReply = {"output": result.output}
         if offset is not None:
             reply["offset"] = result.offset

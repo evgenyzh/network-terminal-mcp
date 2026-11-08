@@ -7,16 +7,18 @@ commands or known prompt shapes.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from network_terminal_mcp.audit import AuditLogger
 from network_terminal_mcp.commands import ParsedCommand, parse_command
@@ -50,6 +52,12 @@ class AuditSink(Protocol):
     def write(self, record: dict[str, object]) -> None: ...
 
 
+class BinaryTransport(Protocol):
+    def read_bytes(self, size: int, timeout: float) -> bytes: ...
+    def write_bytes(self, data: bytes) -> int: ...
+    def binary_ready(self) -> bool: ...
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeLimits:
     """Built-in runtime defaults; no local configuration file is required."""
@@ -61,6 +69,7 @@ class RuntimeLimits:
     max_inline_output_bytes: int = 65_536
     max_session_buffer_bytes: int = 1_048_576
     max_open_sessions: int = 10
+    max_output_readers: int = 32
     read_quiet_seconds: float = 0.5
     startup_timeout: float = 1.0
     startup_quiet_seconds: float = 0.2
@@ -84,7 +93,9 @@ def _terminal_factory_default(
         assert parsed.device is not None
         assert parsed.baudrate is not None
         serial_terminal = SerialTerminal()
-        serial_terminal.open(device=parsed.device, baudrate=parsed.baudrate)
+        serial_terminal.open(
+            device=parsed.device, baudrate=parsed.baudrate, write_timeout=write_timeout
+        )
         return serial_terminal
     pty_terminal = PtyTerminal(write_timeout=write_timeout)
     pty_terminal.start(parsed.argv)
@@ -106,8 +117,11 @@ class _ManagedSession:
     output_start: int = 0
     output_truncated: bool = False
     read_cursor: int = 0
+    reader_cursors: dict[str, int] = field(default_factory=dict)
     exit_code: int | None = None
     error: str | None = None
+    binary_active: bool = False
+    binary_epoch: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -118,7 +132,7 @@ class SessionManager:
         self,
         *,
         limits: RuntimeLimits | None = None,
-        terminal_factory: TerminalFactory = _terminal_factory_default,
+        terminal_factory: TerminalFactory | None = None,
         audit_logger: AuditSink | None = None,
     ) -> None:
         self._limits = limits or RuntimeLimits()
@@ -232,7 +246,9 @@ class SessionManager:
     def close_session(self, session_id: str) -> SessionInfo:
         """Close a session and retain its final status for inspection."""
         session = self._get_session(session_id)
+        epoch = self._text_epoch(session)
         with session.lock:
+            self._require_text_epoch(session, epoch)
             if session.state == SessionState.CLOSED:
                 return self._session_info(session)
             self._audit_interaction(session, "close_session", "started")
@@ -291,6 +307,53 @@ class SessionManager:
     # Raw terminal I/O
     # ------------------------------------------------------------------
 
+    @contextmanager
+    def exclusive_binary(self, session_id: str) -> Iterator[BinarySession]:
+        """Borrow raw bytes exclusively inside this process, not an MCP tool.
+
+        Callers must establish authorization and a lease themselves. They must
+        confirm protocol completion explicitly; otherwise the session fails
+        closed because the device may still be in binary mode. This primitive
+        does not establish that CLI/prompt recovery has succeeded.
+        """
+        session = self._get_session(session_id)
+        with session.lock:
+            self._refresh_state(session)
+            self._require_ready(session)
+            connection = session.connection
+            if not all(callable(getattr(connection, name, None)) for name in
+                       ("read_bytes", "write_bytes", "binary_ready")):
+                raise SessionError("transport does not support binary access")
+            if not cast(BinaryTransport, connection).binary_ready():
+                raise SessionError("binary access blocked by incomplete text encoding")
+            if session.read_cursor < session.output_start + len(session.output):
+                raise SessionError("consume unread terminal output before binary access")
+            self._audit_interaction(session, "binary_session", "started")
+            session.binary_active = True
+            session.binary_epoch += 1
+            channel = BinarySession(self, session)
+            try:
+                yield channel
+            except BaseException:
+                channel._complete = False
+                raise
+            finally:
+                channel._active = False
+                session.binary_active = False
+                if not channel._complete:
+                    self._fail_session(
+                        session, "binary transfer incomplete; device state is unknown"
+                    )
+                self._touch(session)
+                try:
+                    outcome = "completed" if channel._complete else "failed"
+                    self._audit_interaction(session, "binary_session", outcome)
+                except Exception:
+                    self._fail_session(
+                        session, "binary transfer audit failed; device state is unknown"
+                    )
+                    raise
+
     def terminal_write(
         self, session_id: str, data: str, *, enter: bool = True
     ) -> TerminalWriteResult:
@@ -301,7 +364,9 @@ class SessionManager:
         :meth:`terminal_write_secret` instead.
         """
         session = self._get_session(session_id)
+        epoch = self._text_epoch(session)
         with session.lock:
+            self._require_text_epoch(session, epoch)
             self._refresh_state(session)
             self._require_ready(session)
             payload = data + (self._enter_sequence(session) if enter else "")
@@ -354,7 +419,9 @@ class SessionManager:
         kind and byte count are recorded.
         """
         session = self._get_session(session_id)
+        epoch = self._text_epoch(session)
         with session.lock:
+            self._require_text_epoch(session, epoch)
             self._refresh_state(session)
             self._require_ready(session)
             secret, source = _resolve_secret(value=value, env=env, file=file)
@@ -409,7 +476,9 @@ class SessionManager:
     ) -> TerminalOutput:
         """Read output until the stream is quiet or ``timeout`` expires."""
         session = self._get_session(session_id)
+        epoch = self._text_epoch(session)
         with session.lock:
+            self._require_text_epoch(session, epoch)
             if session.state == SessionState.CLOSING:
                 raise SessionError(f"session {session_id} is closing")
             read_timeout = float(
@@ -476,18 +545,37 @@ class SessionManager:
             )
 
     def read_output(
-        self, session_id: str, *, offset: int | None = None, limit: int | None = None
+        self, session_id: str, *, offset: int | None = None, limit: int | None = None,
+        reader_id: str | None = None,
     ) -> OutputChunk:
-        """Read accumulated, redacted output starting at the read cursor."""
+        """Read buffered output with a default or independent named cursor.
+
+        Named readers do not drive transport reads and do not advance the
+        default MCP cursor. A lagging reader gets an explicit expired-offset
+        error rather than being silently fast-forwarded.
+        """
         if offset is not None and offset < 0:
             raise SessionError("output offset must be non-negative")
+        if reader_id is not None and (
+            not isinstance(reader_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", reader_id)
+        ):
+            raise SessionError("reader_id must be 1..64 ASCII letters, digits, dot, dash or "
+                               "underscore")
         if limit is None:
             limit = self._limits.max_inline_output_bytes
         if limit <= 0:
             raise SessionError("output limit must be positive")
         session = self._get_session(session_id)
         with session.lock:
-            start = session.read_cursor if offset is None else offset
+            if reader_id is None:
+                cursor = session.read_cursor
+            else:
+                if reader_id not in session.reader_cursors:
+                    if len(session.reader_cursors) >= self._limits.max_output_readers:
+                        raise SessionError("maximum number of output readers reached")
+                    session.reader_cursors[reader_id] = session.output_start
+                cursor = session.reader_cursors[reader_id]
+            start = cursor if offset is None else offset
             if start < session.output_start:
                 message = (
                     "output before offset "
@@ -501,8 +589,13 @@ class SessionManager:
             chunk = session.output[relative_offset : relative_offset + limit]
             next_offset = start + len(chunk)
             buffer_end = session.output_start + len(session.output)
-            if start <= session.read_cursor:
-                session.read_cursor = max(session.read_cursor, next_offset)
+            resync = reader_id is not None and offset is not None and cursor < session.output_start
+            if start <= cursor or resync:
+                cursor = max(cursor, next_offset)
+                if reader_id is None:
+                    session.read_cursor = cursor
+                else:
+                    session.reader_cursors[reader_id] = cursor
             self._refresh_state(session)
             self._touch(session)
             self._audit_interaction(
@@ -512,7 +605,8 @@ class SessionManager:
                 offset=start,
                 bytes=len(chunk),
                 next_offset=next_offset if next_offset < buffer_end else None,
-                cursor=session.read_cursor,
+                cursor=cursor,
+                reader_id=reader_id,
             )
             return OutputChunk(
                 session_id=session_id,
@@ -522,6 +616,21 @@ class SessionManager:
                 oldest_offset=session.output_start,
                 truncated=session.output_truncated,
             )
+
+    def release_output_reader(self, session_id: str, reader_id: str) -> bool:
+        """Release a named cursor; the default MCP cursor cannot be removed."""
+        if not isinstance(reader_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", reader_id):
+            raise SessionError("invalid reader_id")
+        session = self._get_session(session_id)
+        with session.lock:
+            self._audit_interaction(
+                session, "release_output_reader", "started", reader_id=reader_id
+            )
+            removed = session.reader_cursors.pop(reader_id, None) is not None
+            self._audit_interaction(
+                session, "release_output_reader", "completed", reader_id=reader_id, removed=removed
+            )
+            return removed
 
     # ------------------------------------------------------------------
     # Internals
@@ -566,12 +675,26 @@ class SessionManager:
 
     @staticmethod
     def _require_ready(session: _ManagedSession) -> None:
+        if session.binary_active:
+            raise SessionError("binary transfer owns this session")
         if session.state != SessionState.READY:
             detail = f": {session.error}" if session.error else ""
             raise SessionError(
                 f"session {session.session_id} is not ready: "
                 f"{session.state.value}{detail}"
             )
+
+    @staticmethod
+    def _text_epoch(session: _ManagedSession) -> int:
+        epoch = session.binary_epoch
+        if session.binary_active:
+            raise SessionError("binary transfer owns this session")
+        return epoch
+
+    @staticmethod
+    def _require_text_epoch(session: _ManagedSession, epoch: int) -> None:
+        if session.binary_active or session.binary_epoch != epoch:
+            raise SessionError("session entered binary transfer; retry only after verifying state")
 
     @staticmethod
     def _fail_session(session: _ManagedSession, message: str) -> None:
@@ -649,6 +772,74 @@ class SessionManager:
         }
         record.update(details)
         self._audit.write(_redact_record(record, redactor))
+
+
+class BinarySession:
+    """A thread-bound, exclusive byte stream; never exposes bytes to MCP/audit."""
+
+    def __init__(self, manager: SessionManager, session: _ManagedSession) -> None:
+        self._manager = manager
+        self._session = session
+        self._owner = threading.get_ident()
+        self._active = True
+        self._complete = False
+        self._failed = False
+
+    def _check(self) -> None:
+        if (not self._active or self._complete or self._failed
+                or threading.get_ident() != self._owner):
+            raise SessionError("binary session is no longer available")
+        if self._session.state != SessionState.READY or not self._session.connection.is_alive():
+            self._failed = True
+            raise SessionError("binary transport is no longer ready")
+
+    def read(self, size: int, timeout: float) -> bytes:
+        self._check()
+        if (not isinstance(size, int) or isinstance(size, bool) or size <= 0 or
+                size > self._manager._limits.max_write_bytes or not math.isfinite(timeout) or
+                timeout <= 0 or timeout > self._manager._limits.max_read_timeout):
+            raise SessionError("invalid binary read limit or timeout")
+        self._manager._audit_interaction(self._session, "binary_read", "started", size=size)
+        try:
+            data = cast(BinaryTransport, self._session.connection).read_bytes(size, timeout)
+            if not isinstance(data, bytes) or len(data) > size:
+                raise TransportError("binary transport returned invalid data")
+            self._manager._audit_interaction(
+                self._session, "binary_read", "completed", bytes=len(data)
+            )
+            return data
+        except Exception as exc:
+            self._failed = True
+            self._manager._fail_session(
+                self._session, "binary read failed; device state is unknown"
+            )
+            raise TransportError("binary read failed; device state is unknown") from exc
+
+    def write(self, data: bytes) -> int:
+        self._check()
+        if (not isinstance(data, bytes) or not data
+                or len(data) > self._manager._limits.max_write_bytes):
+            raise SessionError("invalid binary write size")
+        self._manager._audit_interaction(self._session, "binary_write", "started", bytes=len(data))
+        try:
+            written = cast(BinaryTransport, self._session.connection).write_bytes(data)
+            if written != len(data):
+                raise TransportError("binary write was partial")
+            self._manager._audit_interaction(
+                self._session, "binary_write", "completed", bytes=written
+            )
+            return written
+        except Exception as exc:
+            self._failed = True
+            self._manager._fail_session(
+                self._session, "binary write failed; device state is unknown"
+            )
+            raise TransportError("binary write failed; device state is unknown") from exc
+
+    def complete(self) -> None:
+        """The caller has observed binary protocol completion, not CLI recovery."""
+        self._check()
+        self._complete = True
 
 
 def _resolve_secret(
