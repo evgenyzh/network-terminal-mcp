@@ -1,4 +1,4 @@
-# Эксплуатация 0.4.0
+# Эксплуатация 0.5.0
 
 ## Требования
 
@@ -94,8 +94,9 @@ close_session(session_id)
 - `read_output` без offset не повторяет уже прочитанное.
 - Одиночные клавиши: `terminal_write(..., enter=false)`, например `" "` для
   pager, `"q"` для выхода, `"\u0003"` для Ctrl-C.
-- На serial `enter=true` добавляет `\r`, на SSH/Telnet — `\n`.
-- Если SSH CLI ждёт DSR или требует `\r`, см.
+- `enter=true` добавляет `\r` для всех транспортов. Для точного `\n` отправьте
+  его явно с `enter=false`.
+- О DSR-ответах и их ограничениях см.
   [terminal cursor queries](../../src/network_terminal_mcp/usage.md#terminal-cursor-queries).
 
 Внутри одной сессии можно делать вложенные переходы:

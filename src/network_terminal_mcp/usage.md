@@ -48,7 +48,7 @@ this MCP. This server is for interactive state that must survive between calls.
 ## Core loop
 
 ```text
-terminal_write(session_id, "show version")   # enter=true appends \n
+terminal_write(session_id, "show version")   # enter=true appends \r
 terminal_read(session_id)                    # output until quiet or timeout
 terminal_write(session_id, "show interface brief")
 terminal_read(session_id)
@@ -62,7 +62,8 @@ terminal_read(session_id)
 - `terminal_write(..., enter=false)` sends exact text without a line terminator.
   Use it for single keys and controls: `" "` for the next pager page, `"q"` to
   quit, `"\u0003"` for Ctrl-C, `"\u0015"` for Ctrl-U.
-- The line terminator is `\n` for SSH/Telnet and `\r` for serial.
+- The line terminator is `\r` for SSH, Telnet, and serial. This changed for
+  SSH/Telnet in 0.5.0. For exact LF input send `"\n"` with `enter=false`.
 - Successful writes return `ok=true`; a `state` field is included if the client
   is no longer ready after the write. This confirms local delivery only, not
   execution by the device. Check `session_status` for diagnostic details.
@@ -70,15 +71,11 @@ terminal_read(session_id)
 ## Terminal cursor queries
 
 Some CLIs wait for an ANSI cursor position report (`ESC[6n`) before accepting
-commands. By default the server does not answer terminal queries, and normal
-output strips CSI sequences. If a prompt appears but commands have no result,
-this may be one cause; `ready` and `ok` do not prove the CLI is responsive.
-
-For SSH/Telnet PTYs, an operator can opt in by setting
-`NETWORK_TERMINAL_DSR=1` **in the MCP server process environment** before
-starting it. Restart/reconnect the MCP server after changing its environment;
-putting `env ...` inside `open_session` is not supported. When enabled, during
-text reads only, the PTY tracks common cursor movements and answers `ESC[6n`
+commands. For SSH/Telnet PTYs, during text reads, the server automatically
+tracks common cursor movements and answers `ESC[6n` by default; no setup is
+needed. Normal output strips CSI sequences. `ready` and `ok` do not prove the
+CLI is responsive. Set `NETWORK_TERMINAL_DSR=0` in the server process
+environment before startup to disable automatic responses. The PTY responds
 with a position within the PTY's 24-row, 120-column size. Read after login and
 whenever output may contain queries; there is no background reader. Automatic
 responses are recorded in audit before being written; at most 64 are sent per
@@ -92,10 +89,6 @@ To inspect terminal escapes, start the server with
 `NETWORK_TERMINAL_SHOW_CONTROLS=1`: ESC is displayed as the literal `\\x1b`,
 including on the first read. This is diagnostic text, not raw bytes: UTF-8
 decoding and newline normalization still apply. Known secrets are redacted.
-
-Some SSH CLIs require carriage return instead of the default newline. After
-handling their cursor queries, send a command such as
-`terminal_write(session_id, "show version\r", enter=false)` when appropriate.
 
 ## Unstable connections
 

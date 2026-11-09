@@ -176,7 +176,7 @@ class SessionManager:
         try:
             connection = self._terminal_factory(parsed)
             if (isinstance(connection, PtyTerminal)
-                    and os.environ.get("NETWORK_TERMINAL_DSR") == "1"):
+                    and os.environ.get("NETWORK_TERMINAL_DSR") != "0"):
                 terminal = connection
 
                 def reply_to_dsr(reply: str) -> None:
@@ -675,7 +675,7 @@ class SessionManager:
 
     @staticmethod
     def _enter_sequence(session: _ManagedSession) -> str:
-        return "\r" if session.parsed.is_serial else "\n"
+        return "\r"
 
     def _get_session(self, session_id: str) -> _ManagedSession:
         with self._lock:

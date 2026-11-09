@@ -4,6 +4,16 @@
 [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии следуют
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-09
+
+### Changed
+
+- SSH/Telnet PTYs now respond to cursor position queries by default during text
+  reads. Set `NETWORK_TERMINAL_DSR=0` on the MCP server to disable replies.
+- `enter=true` now sends carriage return (`\r`) to SSH and Telnet, as it already
+  did for serial. Clients needing exact LF can use `enter=false` with `\n`.
+  This changes the bytes sent by existing callers.
+
 ## [0.4.0] - 2026-11-09
 
 ### Added

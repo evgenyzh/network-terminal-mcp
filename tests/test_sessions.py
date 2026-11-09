@@ -304,8 +304,8 @@ def test_terminal_write_appends_enter_and_audits_redacted_input() -> None:
 
     result = harness.manager.terminal_write(info.session_id, "display version")
 
-    assert fake.writes == ["display version\n"]
-    assert result.bytes_sent == len("display version\n")
+    assert fake.writes == ["display version\r"]
+    assert result.bytes_sent == len("display version\r")
     records = [r for r in harness.audit.records if r["event"] == "terminal_write"]
     assert records[0]["data"] == "display version"
     assert records[0]["enter"] is True
@@ -516,9 +516,9 @@ def test_secret_value_is_written_redacted_and_not_audited() -> None:
 
     result = harness.manager.terminal_write_secret(info.session_id, value="typed-secret")
 
-    assert fake.writes == ["typed-secret\n"]
+    assert fake.writes == ["typed-secret\r"]
     assert result.source == "value"
-    assert result.bytes_sent == len("typed-secret\n")
+    assert result.bytes_sent == len("typed-secret\r")
     assert "typed-secret" not in result.model_dump_json()
     assert "typed-secret" not in json.dumps(harness.audit.records)
 
@@ -536,7 +536,7 @@ def test_secret_env_source(monkeypatch: pytest.MonkeyPatch) -> None:
 
     result = harness.manager.terminal_write_secret(info.session_id, env="DEVICE_PASSWORD")
 
-    assert fake.writes == ["env-secret\n"]
+    assert fake.writes == ["env-secret\r"]
     assert result.source == "env"
     assert "DEVICE_PASSWORD" not in json.dumps(harness.audit.records)
     records = [r for r in harness.audit.records if r["event"] == "terminal_write_secret"]
@@ -555,7 +555,7 @@ def test_secret_file_source_strips_one_newline(tmp_path: Path) -> None:
         info.session_id, file=str(secret_file)
     )
 
-    assert fake.writes == ["file-secret\n"]
+    assert fake.writes == ["file-secret\r"]
     assert result.source == "file"
     encoded_audit = json.dumps(harness.audit.records)
     assert "file-secret" not in encoded_audit

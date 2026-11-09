@@ -140,7 +140,7 @@ async def test_dsr_reports_over_stdio(tmp_path: Path) -> None:
         "if reply != b'\\x1b[1;1R': sys.exit(1)\n"
         "os.write(1, b'READY')\n"
         "line = b''\n"
-        "while not line.endswith(b'\\n'):\n"
+        "while not line.endswith(b'\\r'):\n"
         "    line += os.read(0, 1)\n"
         "os.write(1, b'RESULT')\n",
         encoding="utf-8",
@@ -150,8 +150,8 @@ async def test_dsr_reports_over_stdio(tmp_path: Path) -> None:
         **os.environ,
         "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
         "XDG_STATE_HOME": str(tmp_path / "state"),
-        "NETWORK_TERMINAL_DSR": "1",
     }
+    env.pop("NETWORK_TERMINAL_DSR", None)
     params = StdioServerParameters(
         command=sys.executable, args=["-m", "network_terminal_mcp"], env=env
     )

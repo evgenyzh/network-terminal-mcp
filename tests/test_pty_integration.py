@@ -78,7 +78,7 @@ if read_until(b"R") != b"\\x1b[24;120R":
     os.write(1, b"BAD SIZE REPORT")
     sys.exit(1)
 os.write(1, b"\\x1b[uREADY\\r\\n")
-if read_until(b"\\n") == b"show version\\n":
+if read_until(b"\\r") == b"show version\\r":
     os.write(1, b"VERSION OK\\r\\n")
 """
 
@@ -196,7 +196,7 @@ def test_fake_ssh_waits_for_cursor_reports_before_accepting_commands(
 ) -> None:
     _install_client(tmp_path, "ssh", _DSR_CLIENT)
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("NETWORK_TERMINAL_DSR", "1")
+    monkeypatch.delenv("NETWORK_TERMINAL_DSR", raising=False)
     audit = FakeAudit()
     manager = _manager(audit)
     try:
@@ -213,12 +213,12 @@ def test_fake_ssh_waits_for_cursor_reports_before_accepting_commands(
         manager.shutdown()
 
 
-def test_dsr_is_opt_in_and_diagnostics_show_escape_sequences(
+def test_dsr_can_be_disabled_and_diagnostics_show_escape_sequences(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _install_client(tmp_path, "ssh", _DSR_CLIENT)
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.delenv("NETWORK_TERMINAL_DSR", raising=False)
+    monkeypatch.setenv("NETWORK_TERMINAL_DSR", "0")
     monkeypatch.setenv("NETWORK_TERMINAL_SHOW_CONTROLS", "1")
     audit = FakeAudit()
     manager = _manager(audit)

@@ -70,7 +70,7 @@ class PtyTerminal:
         self._closed = False
 
     def enable_cursor_reports(self, reply: Callable[[str], None]) -> None:
-        """Enable limited, opt-in DSR responses during text reads only."""
+        """Enable limited DSR responses during text reads only."""
         def bounded_reply(data: str) -> None:
             self._dsr_replies += 1
             if self._dsr_replies > 64:

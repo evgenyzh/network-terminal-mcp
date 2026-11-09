@@ -1,4 +1,4 @@
-"""Small, bounded cursor tracker for opt-in PTY DSR replies, not a terminal emulator."""
+"""Small, bounded cursor tracker for PTY DSR replies, not a terminal emulator."""
 
 from __future__ import annotations
 
