@@ -4,6 +4,19 @@
 [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии следуют
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-09
+
+### Added
+
+- Opt-in PTY cursor reports for `ESC[6n` via `NETWORK_TERMINAL_DSR=1`, with
+  bounded replies and fail-closed audit. This is a limited cursor tracker, not
+  full terminal emulation; replies are sent only while reading text.
+- Opt-in escaped ESC diagnostics with `NETWORK_TERMINAL_SHOW_CONTROLS=1`.
+- Independent named buffered-output cursors via `read_output(reader_id=...)`.
+- Shared manager ownership and exclusive binary I/O for trusted Python
+  integrations; binary data is not exposed as an MCP tool. Added serial
+  framing and flow-control options for embedded Python users.
+
 ## [0.3.1] - 2026-11-08
 
 ### Fixed

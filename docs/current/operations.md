@@ -1,4 +1,4 @@
-# Эксплуатация 0.3.1
+# Эксплуатация 0.4.0
 
 ## Требования
 
@@ -95,6 +95,8 @@ close_session(session_id)
 - Одиночные клавиши: `terminal_write(..., enter=false)`, например `" "` для
   pager, `"q"` для выхода, `"\u0003"` для Ctrl-C.
 - На serial `enter=true` добавляет `\r`, на SSH/Telnet — `\n`.
+- Если SSH CLI ждёт DSR или требует `\r`, см.
+  [terminal cursor queries](../../src/network_terminal_mcp/usage.md#terminal-cursor-queries).
 
 Внутри одной сессии можно делать вложенные переходы:
 

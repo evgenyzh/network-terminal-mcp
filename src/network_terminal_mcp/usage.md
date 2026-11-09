@@ -67,6 +67,36 @@ terminal_read(session_id)
   is no longer ready after the write. This confirms local delivery only, not
   execution by the device. Check `session_status` for diagnostic details.
 
+## Terminal cursor queries
+
+Some CLIs wait for an ANSI cursor position report (`ESC[6n`) before accepting
+commands. By default the server does not answer terminal queries, and normal
+output strips CSI sequences. If a prompt appears but commands have no result,
+this may be one cause; `ready` and `ok` do not prove the CLI is responsive.
+
+For SSH/Telnet PTYs, an operator can opt in by setting
+`NETWORK_TERMINAL_DSR=1` **in the MCP server process environment** before
+starting it. Restart/reconnect the MCP server after changing its environment;
+putting `env ...` inside `open_session` is not supported. When enabled, during
+text reads only, the PTY tracks common cursor movements and answers `ESC[6n`
+with a position within the PTY's 24-row, 120-column size. Read after login and
+whenever output may contain queries; there is no background reader. Automatic
+responses are recorded in audit before being written; at most 64 are sent per
+read. Failed audit or writes abort the operation. The peer can trigger these
+responses, which become terminal input. Binary access never sends them.
+
+This is not a full terminal emulator: complex cursor modes, scroll regions,
+grapheme clusters, DA (`ESC[c`/`ESC[>c`), and DSR status (`ESC[5n`) are not
+implemented; cursor positions can be approximate. It does not apply to Serial.
+To inspect terminal escapes, start the server with
+`NETWORK_TERMINAL_SHOW_CONTROLS=1`: ESC is displayed as the literal `\\x1b`,
+including on the first read. This is diagnostic text, not raw bytes: UTF-8
+decoding and newline normalization still apply. Known secrets are redacted.
+
+Some SSH CLIs require carriage return instead of the default newline. After
+handling their cursor queries, send a command such as
+`terminal_write(session_id, "show version\r", enter=false)` when appropriate.
+
 ## Unstable connections
 
 - `ready` describes the local client process, not the remote side. A local

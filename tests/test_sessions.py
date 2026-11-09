@@ -98,6 +98,19 @@ class Harness:
         return self.manager.open_session(command)
 
 
+def test_show_controls_does_not_expose_known_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NETWORK_TERMINAL_SHOW_CONTROLS", "1")
+    secret = "secret\x1b[31mword"
+    terminal = FakeTerminal(outputs=["prompt", f"{secret} \x1b[6n"])
+    harness = Harness([terminal])
+    info = harness.open()
+    harness.manager.terminal_read(info.session_id)
+    harness.manager.terminal_write_secret(info.session_id, value=secret)
+    result = harness.manager.terminal_read(info.session_id).output
+    assert result == "<redacted> \\x1b[6n"
+    assert secret not in json.dumps(harness.audit.records)
+
+
 def _limits(**overrides: object) -> RuntimeLimits:
     values: dict[str, object] = {
         "io_timeout": 1.0,
@@ -633,6 +646,80 @@ def test_read_output_rejects_expired_offsets() -> None:
     chunk = harness.manager.read_output(info.session_id, offset=2)
     assert chunk.output == "cdefghij"
     assert chunk.truncated is True
+
+
+def test_named_readers_are_independent_and_releasable() -> None:
+    terminal = FakeTerminal(outputs=["abcdef"])
+    harness = Harness([terminal], limits=_limits(max_output_readers=2))
+    sid = harness.open().session_id
+    assert harness.manager.read_output(sid, reader_id="one", limit=2).output == "ab"
+    assert harness.manager.read_output(sid, reader_id="two", limit=3).output == "abc"
+    assert harness.manager.terminal_read(sid).output == "abcdef"
+    assert harness.manager.read_output(sid, reader_id="one").output == "cdef"
+    assert harness.manager.read_output(sid, reader_id="two").output == "def"
+    with pytest.raises(SessionError, match="maximum number of output readers"):
+        harness.manager.read_output(sid, reader_id="three")
+    assert harness.manager.release_output_reader(sid, "one") is True
+    assert harness.manager.release_output_reader(sid, "one") is False
+    assert harness.manager.read_output(sid, reader_id="three").output == "abcdef"
+
+
+def test_named_reader_reports_eviction_and_can_resync() -> None:
+    terminal = FakeTerminal(outputs=["abcd"])
+    harness = Harness([terminal], limits=_limits(max_session_buffer_bytes=4))
+    sid = harness.open().session_id
+    assert harness.manager.read_output(sid, reader_id="slow", limit=1).output == "a"
+    assert harness.manager.terminal_read(sid).output == "abcd"
+    terminal.outputs.append("efgh")
+    assert harness.manager.terminal_read(sid).output == "efgh"
+    with pytest.raises(SessionError, match="expired"):
+        harness.manager.read_output(sid, reader_id="slow")
+    assert harness.manager.read_output(sid, reader_id="slow", offset=4).output == "efgh"
+    assert harness.manager.read_output(sid, reader_id="slow").output == ""
+
+
+class FakeBinaryTerminal(FakeTerminal):
+    def __init__(self) -> None:
+        super().__init__()
+        self.binary_writes: list[bytes] = []
+
+    def binary_ready(self) -> bool:
+        return True
+
+    def read_bytes(self, size: int, timeout: float) -> bytes:
+        return b"binary-reply"[:size]
+
+    def write_bytes(self, data: bytes) -> int:
+        self.binary_writes.append(data)
+        return len(data)
+
+
+def test_binary_exclusive_complete_and_audit_has_no_payload() -> None:
+    terminal = FakeBinaryTerminal()
+    harness = Harness([terminal])
+    sid = harness.open().session_id
+    with harness.manager.exclusive_binary(sid) as channel:
+        assert channel.write(b"binary-payload") == len(b"binary-payload")
+        assert channel.read(100, 1) == b"binary-reply"
+        with pytest.raises(SessionError, match="binary transfer"):
+            harness.manager.terminal_write(sid, "show")
+        channel.complete()
+    assert harness.manager.session_status(sid).state is SessionState.READY
+    assert "binary-payload" not in json.dumps(harness.audit.records)
+    assert "binary-reply" not in json.dumps(harness.audit.records)
+    with pytest.raises(SessionError, match="no longer available"):
+        channel.write(b"late")
+
+
+def test_binary_incomplete_transfer_fails_session() -> None:
+    harness = Harness([FakeBinaryTerminal()])
+    sid = harness.open().session_id
+    with harness.manager.exclusive_binary(sid) as channel:
+        channel.write(b"payload")
+    assert harness.manager.session_status(sid).state is SessionState.FAILED
+    with pytest.raises(SessionError, match="not ready"):
+        harness.manager.terminal_write(sid, "show")
+    harness.manager.close_session(sid)
 
 
 def test_shutdown_closes_all_open_terminals() -> None:

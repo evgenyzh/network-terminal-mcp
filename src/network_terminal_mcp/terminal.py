@@ -13,10 +13,12 @@ import os
 import select
 import stat
 import time
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import ptyprocess
 
+from network_terminal_mcp.cursor import CursorTracker
 from network_terminal_mcp.errors import TransportError
 
 _READ_CHUNK = 4096
@@ -62,8 +64,25 @@ class PtyTerminal:
         self._process: ptyprocess.PtyProcess | None = None
         self._write_timeout = float(write_timeout)
         self._decoder = _Decoder()
+        self._cursor: CursorTracker | None = None
+        self._dsr_replies = 0
         self._eof = False
         self._closed = False
+
+    def enable_cursor_reports(self, reply: Callable[[str], None]) -> None:
+        """Enable limited, opt-in DSR responses during text reads only."""
+        def bounded_reply(data: str) -> None:
+            self._dsr_replies += 1
+            if self._dsr_replies > 64:
+                raise TransportError("too many cursor report requests in one read")
+            reply(data)
+
+        self._cursor = CursorTracker(24, 120, bounded_reply)
+
+    def reset_cursor_tracking(self) -> None:
+        """Forget cursor state after exclusive binary I/O."""
+        if self._cursor is not None:
+            self._cursor = CursorTracker(24, 120, self._cursor.reply)
 
     def start(
         self,
@@ -181,6 +200,7 @@ class PtyTerminal:
             raise TransportError("terminal read timeout must be positive")
 
         output: list[str] = []
+        self._dsr_replies = 0
         deadline = time.monotonic() + read_timeout
         last_data_at: float | None = None
         while True:
@@ -191,7 +211,10 @@ class PtyTerminal:
                 break
             chunk = self._read_once(min(_POLL_SECONDS, deadline - now))
             if chunk:
-                output.append(self._decoder.decode(chunk))
+                text = self._decoder.decode(chunk)
+                if self._cursor is not None:
+                    self._cursor.feed(text)
+                output.append(text)
                 last_data_at = time.monotonic()
                 continue
             if self._eof:

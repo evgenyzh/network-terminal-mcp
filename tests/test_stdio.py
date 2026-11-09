@@ -110,6 +110,10 @@ async def test_compact_responses_over_stdio(tmp_path: Path) -> None:
             first = await session.call_tool("terminal_read", {"session_id": session_id})
             assert first.structured_content == {"output": "banner\n"}
             assert json.loads(first.content[0].text) == {"output": "banner\n"}
+            independent = await session.call_tool(
+                "read_output", {"session_id": session_id, "reader_id": "observer"}
+            )
+            assert independent.structured_content == {"output": "banner\n"}
             written = await session.call_tool(
                 "terminal_write", {"session_id": session_id, "data": "hello"}
             )
@@ -120,3 +124,47 @@ async def test_compact_responses_over_stdio(tmp_path: Path) -> None:
             assert empty.structured_content == {"output": ""}
             closed = await session.call_tool("close_session", {"session_id": session_id})
             assert closed.structured_content["state"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_dsr_reports_over_stdio(tmp_path: Path) -> None:
+    fake_ssh = tmp_path / "ssh"
+    fake_ssh.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys, tty\n"
+        "tty.setraw(0)\n"
+        "os.write(1, b'\\x1b[6n')\n"
+        "reply = b''\n"
+        "while not reply.endswith(b'R'):\n"
+        "    reply += os.read(0, 1)\n"
+        "if reply != b'\\x1b[1;1R': sys.exit(1)\n"
+        "os.write(1, b'READY')\n"
+        "line = b''\n"
+        "while not line.endswith(b'\\n'):\n"
+        "    line += os.read(0, 1)\n"
+        "os.write(1, b'RESULT')\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+        "NETWORK_TERMINAL_DSR": "1",
+    }
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "network_terminal_mcp"], env=env
+    )
+    async with stdio_client(params) as (reader, writer):
+        async with ClientSession(reader, writer) as session:
+            await session.initialize()
+            opened = await session.call_tool("open_session", {"command": "ssh example.net"})
+            assert opened.structured_content is not None
+            session_id = opened.structured_content["session_id"]
+            first = await session.call_tool("terminal_read", {"session_id": session_id})
+            assert first.structured_content == {"output": "READY"}
+            await session.call_tool("terminal_write", {"session_id": session_id, "data": "show"})
+            result = await session.call_tool("terminal_read", {"session_id": session_id})
+            assert result.structured_content is not None
+            assert result.structured_content["output"] == "RESULT"
+            await session.call_tool("close_session", {"session_id": session_id})

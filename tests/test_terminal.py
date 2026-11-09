@@ -66,6 +66,29 @@ def test_pty_write_timeout_is_validated() -> None:
         PtyTerminal(write_timeout=0)
 
 
+def test_pty_binary_reads_do_not_answer_terminal_queries() -> None:
+    terminal = _start_pty("import os, time; os.write(1, b'\\x1b[6n'); time.sleep(1)")
+    replies: list[str] = []
+    terminal.enable_cursor_reports(replies.append)
+    try:
+        assert terminal.read_bytes(100, 1.0) == b"\x1b[6n"
+        assert replies == []
+    finally:
+        terminal.disconnect()
+
+
+def test_pty_limits_automatic_replies_per_read() -> None:
+    terminal = _start_pty("import os, time; os.write(1, b'\\x1b[6n' * 65); time.sleep(1)")
+    replies: list[str] = []
+    terminal.enable_cursor_reports(replies.append)
+    try:
+        with pytest.raises(TransportError, match="too many cursor report"):
+            terminal.read_channel_timing(last_read=0.1, read_timeout=1)
+        assert len(replies) == 64
+    finally:
+        terminal.disconnect()
+
+
 def test_pty_write_times_out_when_the_buffer_is_full() -> None:
     # A full pipe exercises the same non-blocking write loop without depending
     # on the kernel's PTY buffer size, which varies between runners.

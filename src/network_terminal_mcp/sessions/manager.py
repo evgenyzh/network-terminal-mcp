@@ -136,6 +136,7 @@ class SessionManager:
         audit_logger: AuditSink | None = None,
     ) -> None:
         self._limits = limits or RuntimeLimits()
+        self._show_controls = os.environ.get("NETWORK_TERMINAL_SHOW_CONTROLS") == "1"
         self._terminal_factory: TerminalFactory = (
             terminal_factory
             if terminal_factory is not None
@@ -163,6 +164,7 @@ class SessionManager:
                 )
 
         redactor = Redactor()
+        session_id = uuid.uuid4().hex
         self._audit_event(
             "open_session",
             parsed=parsed,
@@ -173,11 +175,28 @@ class SessionManager:
         exit_code: int | None = None
         try:
             connection = self._terminal_factory(parsed)
+            if (isinstance(connection, PtyTerminal)
+                    and os.environ.get("NETWORK_TERMINAL_DSR") == "1"):
+                terminal = connection
+
+                def reply_to_dsr(reply: str) -> None:
+                    self._audit_event(
+                        "terminal_dsr_reply", parsed=parsed, outcome="started",
+                        redactor=redactor, session_id=session_id,
+                    )
+                    terminal.write_channel(reply)
+                    self._audit_event(
+                        "terminal_dsr_reply", parsed=parsed, outcome="completed",
+                        redactor=redactor, session_id=session_id,
+                    )
+
+                terminal.enable_cursor_reports(reply_to_dsr)
             startup_output = _normalize_output(
                 connection.read_channel_timing(
                     last_read=self._limits.startup_quiet_seconds,
                     read_timeout=self._limits.startup_timeout,
-                )
+                ),
+                show_controls=self._show_controls,
             )
             if not connection.is_alive():
                 exit_code = connection.exit_code
@@ -207,7 +226,7 @@ class SessionManager:
                 "no initial output; use terminal_read to inspect the session"
             )
         session = _ManagedSession(
-            session_id=uuid.uuid4().hex,
+            session_id=session_id,
             parsed=parsed,
             connection=connection,
             redactor=redactor,
@@ -340,6 +359,8 @@ class SessionManager:
             finally:
                 channel._active = False
                 session.binary_active = False
+                if isinstance(connection, PtyTerminal):
+                    connection.reset_cursor_tracking()
                 if not channel._complete:
                     self._fail_session(
                         session, "binary transfer incomplete; device state is unknown"
@@ -514,7 +535,9 @@ class SessionManager:
                     raise TransportError(
                         f"terminal read failed in session {session_id}: {message}"
                     ) from exc
-                output = session.redactor.redact(_normalize_output(raw))
+                output = session.redactor.redact(_normalize_output(
+                    session.redactor.redact(raw), show_controls=self._show_controls
+                ))
                 self._append_output(session, output)
             start = max(session.read_cursor, session.output_start)
             fresh = session.output[start - session.output_start :]
@@ -892,8 +915,12 @@ def _startup_failure(
     return f"{headline}:\n{tail}"
 
 
-def _normalize_output(text: str) -> str:
-    return _ANSI_ESCAPE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+def _normalize_output(text: str, *, show_controls: bool = False) -> str:
+    if show_controls:
+        text = text.replace("\x1b", "\\x1b")
+    else:
+        text = _ANSI_ESCAPE.sub("", text)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _redact_record(record: dict[str, object], redactor: Redactor) -> dict[str, object]:
